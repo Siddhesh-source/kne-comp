@@ -10,11 +10,17 @@ from typing import Sequence
 import pandas as pd
 
 from .config import load_llm_config
+from .consensus import write_consensus_table
 from .constants import ID_COLUMN, LABELS
 from .data import read_metadata, summarize_metadata
 from .experiments import initialize_registry
 from .folds import make_report_grouped_folds, validate_fold_assignments
 from .llm_client import OpenAICompatibleClient
+from .label_quality import (
+    evidence_consistency_sample,
+    primary_quality_report,
+    specialist_quality_report,
+)
 from .metrics import competition_auc
 from .report_labeler import (
     estimate_labeling,
@@ -135,6 +141,28 @@ def build_parser() -> argparse.ArgumentParser:
     specialist_eval.add_argument(
         "--specialist", type=Path, required=True, action="append"
     )
+
+    consensus = commands.add_parser(
+        "build-consensus",
+        help="build a training-ready soft-label table",
+    )
+    consensus.add_argument("--data-dir", type=Path, required=True)
+    consensus.add_argument("--primary", type=Path, required=True)
+    consensus.add_argument(
+        "--specialist", type=Path, required=True, action="append"
+    )
+    consensus.add_argument("--output", type=Path, required=True)
+    consensus.add_argument("--specialist-weight", type=float, default=0.5)
+    consensus.add_argument("--gold-weight", type=float, default=8.0)
+
+    quality = commands.add_parser(
+        "label-quality",
+        help="validate generated label completeness and distributions",
+    )
+    quality.add_argument("--data-dir", type=Path, required=True)
+    quality.add_argument("--primary", type=Path)
+    quality.add_argument("--specialist", type=Path, action="append")
+    quality.add_argument("--evidence-sample", type=int, default=100)
     return parser
 
 
@@ -285,6 +313,40 @@ def main(argv: Sequence[str] | None = None) -> int:
                 indent=2,
             )
         )
+        return 0
+
+    if args.command == "build-consensus":
+        train, _ = read_metadata(args.data_dir)
+        print(
+            json.dumps(
+                write_consensus_table(
+                    train=train,
+                    primary_path=args.primary,
+                    specialist_paths=args.specialist,
+                    output_path=args.output,
+                    specialist_weight=args.specialist_weight,
+                    gold_weight=args.gold_weight,
+                ),
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.command == "label-quality":
+        train, _ = read_metadata(args.data_dir)
+        result: dict[str, object] = {}
+        if args.primary:
+            result["primary"] = primary_quality_report(train, args.primary)
+            result["evidence"] = evidence_consistency_sample(
+                train, args.primary, args.evidence_sample
+            )
+        if args.specialist:
+            result["specialist"] = specialist_quality_report(
+                train, args.specialist
+            )
+        if not result:
+            raise ValueError("provide --primary and/or --specialist")
+        print(json.dumps(result, indent=2))
         return 0
 
     raise AssertionError(f"unhandled command: {args.command}")

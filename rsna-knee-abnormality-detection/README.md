@@ -77,3 +77,23 @@ rsna-knee evaluate-labels `
 ```
 
 These commands are CPU-only and do not process MRI images.
+
+After all primary and specialist passes are complete, validate them and build
+the training target table:
+
+```powershell
+rsna-knee label-quality `
+  --data-dir ..\data\raw `
+  --primary ..\data\derived\llm-labels-v1.jsonl `
+  --specialist ..\data\derived\specialist-v1-pass1.jsonl `
+  --specialist ..\data\derived\specialist-v1-pass2.jsonl `
+  --specialist ..\data\derived\specialist-v1-pass3.jsonl
+
+rsna-knee build-consensus `
+  --data-dir ..\data\raw `
+  --primary ..\data\derived\llm-labels-v1.jsonl `
+  --specialist ..\data\derived\specialist-v1-pass1.jsonl `
+  --specialist ..\data\derived\specialist-v1-pass2.jsonl `
+  --specialist ..\data\derived\specialist-v1-pass3.jsonl `
+  --output ..\data\derived\consensus-labels-v1.csv
+```
