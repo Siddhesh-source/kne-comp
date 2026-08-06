@@ -19,6 +19,17 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
+modal = [
+    "modal==1.5.3",
+]
+gpu = [
+    "pydicom==3.0.1",
+    "pillow==11.3.0",
+    "pylibjpeg==2.0.1",
+    "pylibjpeg-libjpeg==2.3.0",
+    "pylibjpeg-openjpeg==2.4.0",
+    "torch==2.7.1",
+]
 
 [project.scripts]
 rsna-knee = "rsna_knee.cli:main"

@@ -98,6 +98,64 @@ rsna-knee build-consensus `
   --output ..\data\derived\consensus-labels-v1.csv
 ```
 
+## Modal GPU setup
+
+Modal is used for feature extraction and training. Kaggle remains the final
+offline inference and submission environment.
+
+The default GPU is an Nvidia A10 with 24 GiB of GPU memory. This workspace can
+allocate A10, L4, and T4 GPUs without adding a payment method. L40S allocation
+requires billing. A10 is the fastest practical available default for the
+initial 336 px DINOv2 extraction.
+
+This project uses two persistent volumes:
+
+```text
+rsna-knee-data
+  metadata/   Consensus labels, folds, and protocol manifests
+  models/     Pinned DINOv2 checkpoint
+  raw/        Competition DICOM files
+  features/   Fingerprinted DINOv2 feature shards
+
+rsna-knee-artifacts
+  heads/      Fold checkpoints, metadata, and OOF predictions
+  runs/       Run logs and summaries
+```
+
+Use the authenticated Python CLI because the standalone `modal` executable may
+not be on PATH:
+
+```powershell
+py -m pip install -e ".[modal]"
+
+py -m modal volume create rsna-knee-data
+py -m modal volume create rsna-knee-artifacts
+
+py -m modal run modal_app.py::smoke
+py -m modal run modal_app.py::preflight
+```
+
+The smoke command allocates an A10 and runs one CUDA matrix multiplication. It
+does not mount or upload competition data. The preflight command lists only
+whether each expected input exists.
+
+To use an L40S later, change `GPU_TYPE` in `modal_app.py` after enabling billing
+in the Modal workspace. The volume setup does not need to be repeated.
+
+Do not upload the MRI archive until the competition rules permit external
+compute. The local machine currently has only CSV metadata, not the roughly
+265 GB DICOM archive. Once the archive, DINOv2 checkpoint, consensus labels,
+folds, and extracted feature shards are mounted, train the five fold heads:
+
+```powershell
+py -m modal run modal_app.py::train `
+  --fingerprint <feature-fingerprint>
+```
+
+Training writes to `rsna-knee-artifacts` and refuses to overwrite a non-empty
+output directory unless `--overwrite` is passed. Feature shards are checked
+against the supplied fingerprint before training.
+
 ## Kaggle packaging
 
 GPU work is intentionally deferred to Kaggle. Before extraction, verify the
@@ -125,5 +183,5 @@ rsna-knee ensemble-submission `
 The package provides deterministic protocol selection, slice sampling,
 fingerprinted feature shards, a masked soft-label fold head, fold averaging,
 failed-study prior fallback, strict study-ID alignment, and submission
-validation. DICOM extraction and model training must run on Kaggle with local
-offline DINOv2 assets.
+validation. The final Kaggle notebook uses offline DINOv2 assets and trained
+weights produced on Modal or Kaggle.
