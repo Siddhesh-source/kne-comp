@@ -176,3 +176,39 @@ def read_feature_shard(
         "valid_mask": mask,
         "fingerprint": fingerprint,
     }
+
+
+def load_feature_shards(
+    paths: Sequence[str | Path],
+    expected_fingerprint: str | None = None,
+) -> dict[str, np.ndarray | str]:
+    """Load compatible shards into one study-indexed feature collection."""
+    if not paths:
+        raise ValueError("at least one feature shard is required")
+    shards = [
+        read_feature_shard(path, expected_fingerprint) for path in paths
+    ]
+    fingerprints = {str(shard["fingerprint"]) for shard in shards}
+    if len(fingerprints) != 1:
+        raise ValueError("feature shards have mixed fingerprints")
+    embeddings = np.concatenate(
+        [np.asarray(shard["embeddings"]) for shard in shards],
+        axis=0,
+    )
+    masks = np.concatenate(
+        [np.asarray(shard["valid_mask"]) for shard in shards],
+        axis=0,
+    )
+    ids = np.concatenate(
+        [np.asarray(shard["study_ids"]) for shard in shards],
+        axis=0,
+    )
+    if len(set(ids.tolist())) != len(ids):
+        raise ValueError("feature shards contain duplicate study IDs")
+    order = np.argsort(ids, kind="stable")
+    return {
+        "study_ids": ids[order],
+        "embeddings": embeddings[order],
+        "valid_mask": masks[order],
+        "fingerprint": fingerprints.pop(),
+    }

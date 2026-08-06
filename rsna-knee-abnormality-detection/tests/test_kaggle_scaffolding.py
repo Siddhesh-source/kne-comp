@@ -5,6 +5,7 @@ import numpy as np
 from rsna_knee.constants import ID_COLUMN, LABELS
 from rsna_knee.dino_features import (
     feature_config_fingerprint,
+    load_feature_shards,
     read_feature_shard,
     robust_normalize,
     sample_slice_indices,
@@ -130,3 +131,27 @@ def test_feature_shard_round_trip_and_fingerprint_validation(tmp_path):
 
     with pytest.raises(ValueError, match="fingerprint"):
         read_feature_shard(path, "fingerprint-b")
+
+
+def test_multiple_feature_shards_load_in_study_order(tmp_path):
+    first = tmp_path / "first.npz"
+    second = tmp_path / "second.npz"
+    write_feature_shard(
+        first,
+        ["study-b"],
+        np.ones((1, 2, 3)),
+        np.ones((1, 2), dtype=bool),
+        "same",
+    )
+    write_feature_shard(
+        second,
+        ["study-a"],
+        np.zeros((1, 2, 3)),
+        np.ones((1, 2), dtype=bool),
+        "same",
+    )
+
+    loaded = load_feature_shards([first, second], "same")
+
+    assert loaded["study_ids"].tolist() == ["study-a", "study-b"]
+    assert loaded["embeddings"][0].sum() == 0
