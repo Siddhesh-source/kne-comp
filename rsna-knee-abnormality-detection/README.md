@@ -115,9 +115,9 @@ rsna-knee-data
   metadata/   Consensus labels, folds, and protocol manifests
   models/     Pinned DINOv2 checkpoint
   raw/        Competition DICOM files
-  features/   Fingerprinted DINOv2 feature shards
 
 rsna-knee-artifacts
+  features/   Fingerprinted DINOv2 feature shards
   heads/      Fold checkpoints, metadata, and OOF predictions
   runs/       Run logs and summaries
 ```
@@ -133,11 +133,18 @@ py -m modal volume create rsna-knee-artifacts
 
 py -m modal run modal_app.py::smoke
 py -m modal run modal_app.py::preflight
+py -m modal run modal_app.py::extract-one --shard-index 0 --shard-count 256
+py -m modal run modal_app.py::extract --shard-count 256
 ```
 
 The smoke command allocates an A10 and runs one CUDA matrix multiplication. It
 does not mount or upload competition data. The preflight command lists only
-whether each expected input exists.
+whether each expected input exists. Extraction writes small resumable shards
+to `rsna-knee-artifacts` because the unpacked DICOM volume is inode-heavy.
+Workers print progress every five studies. DINO inference uses xFormers,
+CUDA float16 autocast, batches of up to 64 slices, and up to ten A10 workers.
+Only selected DICOM slices are pixel-decoded, and protocol slots are prepared
+concurrently.
 
 To use an L40S later, change `GPU_TYPE` in `modal_app.py` after enabling billing
 in the Modal workspace. The volume setup does not need to be repeated.

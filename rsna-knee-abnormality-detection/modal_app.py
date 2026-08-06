@@ -27,6 +27,7 @@ gpu_image = (
         "pandas==2.3.1",
         "scikit-learn==1.7.1",
         "torch==2.7.1",
+        "xformers==0.0.31",
         "pydicom==3.0.1",
         "pillow==11.3.0",
         "pylibjpeg==2.0.1",
@@ -51,6 +52,7 @@ artifact_volume = modal.Volume.from_name(
     create_if_missing=False,
 )
 kaggle_secret = modal.Secret.from_name("kaggle-rsna")
+_DINO_MODELS: dict[str, object] = {}
 
 app = modal.App(APP_NAME)
 
@@ -69,6 +71,17 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _dino_cache_path() -> Path:
+    candidates = (
+        ARTIFACT_MOUNT / "models" / "torch-hub",
+        DATA_MOUNT / "models" / "torch-hub",
+    )
+    return next(
+        (path for path in candidates if path.is_dir()),
+        candidates[0],
+    )
 
 
 @app.function(
@@ -128,9 +141,11 @@ def volume_preflight() -> dict[str, object]:
         "protocol_manifest": (
             DATA_MOUNT / "metadata" / "train-protocol-manifest-v1.csv"
         ),
-        "dino_cache": DATA_MOUNT / "models" / "torch-hub",
+        "dino_cache": _dino_cache_path(),
         "train_images": DATA_MOUNT / "raw" / "train_series",
-        "train_features": DATA_MOUNT / "features" / "dino336-v1" / "train",
+        "train_features": (
+            ARTIFACT_MOUNT / "features" / "dino336-v1" / "train"
+        ),
     }
     status = {
         name: {
@@ -287,13 +302,16 @@ def validate_unpacked_data() -> dict[str, object]:
     cpu=4,
     memory=8192,
     timeout=1800,
-    volumes={DATA_MOUNT: data_volume},
+    volumes={
+        DATA_MOUNT: data_volume,
+        ARTIFACT_MOUNT: artifact_volume,
+    },
 )
 def prepare_dino_model() -> dict[str, object]:
     """Cache the official DINOv2 ViT-S/14 code and checkpoint."""
     import torch
 
-    cache = DATA_MOUNT / "models" / "torch-hub"
+    cache = ARTIFACT_MOUNT / "models" / "torch-hub"
     cache.mkdir(parents=True, exist_ok=True)
     torch.hub.set_dir(str(cache))
     model = torch.hub.load(
@@ -310,7 +328,7 @@ def prepare_dino_model() -> dict[str, object]:
             f"expected one DINOv2 checkpoint, found {len(checkpoints)}"
         )
     checkpoint = checkpoints[0]
-    data_volume.commit()
+    artifact_volume.commit()
     return {
         "checkpoint": str(checkpoint),
         "checkpoint_sha256": _sha256(checkpoint),
@@ -321,7 +339,10 @@ def prepare_dino_model() -> dict[str, object]:
 def _load_dino_model(device: str):
     import torch
 
-    cache = DATA_MOUNT / "models" / "torch-hub"
+    cached = _DINO_MODELS.get(device)
+    if cached is not None:
+        return cached
+    cache = _dino_cache_path()
     if not cache.is_dir():
         raise FileNotFoundError("run prepare-model before extraction")
     torch.hub.set_dir(str(cache))
@@ -332,23 +353,28 @@ def _load_dino_model(device: str):
         trust_repo=True,
         skip_validation=True,
     )
-    return model.to(device).eval()
+    model = model.to(device).eval()
+    _DINO_MODELS[device] = model
+    return model
 
 
 @app.function(
     image=gpu_image,
     gpu=GPU_TYPE,
-    cpu=8,
-    memory=32768,
+    cpu=4,
+    memory=8192,
     timeout=21600,
     retries=2,
-    max_containers=8,
-    volumes={DATA_MOUNT: data_volume},
+    max_containers=6,
+    volumes={
+        DATA_MOUNT: data_volume,
+        ARTIFACT_MOUNT: artifact_volume,
+    },
 )
 def extract_feature_shard(
     shard_index: int,
     shard_count: int,
-    batch_size: int = 16,
+    batch_size: int = 64,
 ) -> dict[str, object]:
     """Extract one deterministic, disjoint training feature shard."""
     import numpy as np
@@ -379,7 +405,7 @@ def extract_feature_shard(
         shard_count,
     )
     output = (
-        DATA_MOUNT
+        ARTIFACT_MOUNT
         / "features"
         / "dino336-v1"
         / "train"
@@ -392,9 +418,7 @@ def extract_feature_shard(
             "output": str(output),
         }
     checkpoints = sorted(
-        (DATA_MOUNT / "models" / "torch-hub").rglob(
-            "dinov2_vits14_pretrain.pth"
-        )
+        _dino_cache_path().rglob("dinov2_vits14_pretrain.pth")
     )
     if len(checkpoints) != 1:
         raise RuntimeError("cached DINOv2 checkpoint is missing or ambiguous")
@@ -410,7 +434,12 @@ def extract_feature_shard(
     embeddings: list[np.ndarray] = []
     masks: list[np.ndarray] = []
     failures: list[dict[str, str]] = []
-    for study_id in study_ids:
+    print(
+        f"shard {shard_index}/{shard_count}: starting "
+        f"{len(study_ids)} studies",
+        flush=True,
+    )
+    for study_number, study_id in enumerate(study_ids, start=1):
         slot_series: dict[str, list[Path]] = {}
         for row in grouped[study_id].itertuples(index=False):
             series_id = str(row.SeriesInstanceUID)
@@ -433,6 +462,13 @@ def extract_feature_shard(
                     "error": f"{type(exc).__name__}: {exc}",
                 }
             )
+        if study_number % 5 == 0 or study_number == len(study_ids):
+            print(
+                f"shard {shard_index}/{shard_count}: "
+                f"{study_number}/{len(study_ids)} processed, "
+                f"{len(failures)} failed",
+                flush=True,
+            )
     if not completed_ids:
         raise RuntimeError("no studies were extracted successfully")
     metadata = write_feature_shard(
@@ -446,12 +482,123 @@ def extract_feature_shard(
         json.dumps(failures, indent=2) + "\n",
         encoding="utf-8",
     )
-    data_volume.commit()
+    artifact_volume.commit()
     torch.cuda.empty_cache()
     return {
         "shard_index": shard_index,
         "status": "written",
         "failures": len(failures),
+        **metadata,
+    }
+
+
+@app.function(
+    image=gpu_image,
+    gpu=GPU_TYPE,
+    cpu=4,
+    memory=8192,
+    timeout=3600,
+    retries=1,
+    volumes={
+        DATA_MOUNT: data_volume,
+        ARTIFACT_MOUNT: artifact_volume,
+    },
+)
+def extract_test_features(
+    batch_size: int = 64,
+    overwrite: bool = False,
+) -> dict[str, object]:
+    """Extract one reusable feature file for every visible test study."""
+    import numpy as np
+    import pandas as pd
+    import torch
+
+    from rsna_knee.constants import ID_COLUMN
+    from rsna_knee.dicom_extraction import extract_study_features
+    from rsna_knee.dino_features import (
+        feature_config_fingerprint,
+        write_feature_shard,
+    )
+    from rsna_knee.protocols import build_protocol_manifest
+
+    data_volume.reload()
+    series_path = DATA_MOUNT / "raw" / "test_series.csv"
+    test_root = DATA_MOUNT / "raw" / "test_series"
+    output = (
+        ARTIFACT_MOUNT
+        / "features"
+        / "dino336-v1"
+        / "test"
+        / "features-test.npz"
+    )
+    if output.is_file() and not overwrite:
+        return {"status": "already_complete", "output": str(output)}
+    if not series_path.is_file() or not test_root.is_dir():
+        raise FileNotFoundError("test series metadata or images are missing")
+
+    manifest = build_protocol_manifest(pd.read_csv(series_path))
+    study_ids = sorted(manifest[ID_COLUMN].astype(str).unique())
+    grouped = {
+        str(study): frame
+        for study, frame in manifest.groupby(ID_COLUMN, sort=False)
+    }
+    checkpoints = sorted(
+        _dino_cache_path().rglob("dinov2_vits14_pretrain.pth")
+    )
+    if len(checkpoints) != 1:
+        raise RuntimeError("cached DINOv2 checkpoint is missing or ambiguous")
+    fingerprint = feature_config_fingerprint(
+        checkpoint_sha256=_sha256(checkpoints[0])
+    )
+    model = _load_dino_model("cuda")
+    completed_ids: list[str] = []
+    embeddings: list[np.ndarray] = []
+    masks: list[np.ndarray] = []
+    failures: list[dict[str, str]] = []
+    for study_id in study_ids:
+        slot_series: dict[str, list[Path]] = {}
+        for row in grouped[study_id].itertuples(index=False):
+            series_id = str(row.SeriesInstanceUID)
+            if series_id:
+                series_path = test_root / study_id / series_id
+                slot_series[str(row.slot)] = sorted(series_path.glob("*.dcm"))
+        try:
+            features, mask = extract_study_features(
+                slot_series,
+                model,
+                batch_size=batch_size,
+            )
+            completed_ids.append(study_id)
+            embeddings.append(features)
+            masks.append(mask)
+        except Exception as exc:
+            failures.append(
+                {
+                    "study_id": study_id,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    if not completed_ids:
+        raise RuntimeError("no test studies were extracted successfully")
+    metadata = write_feature_shard(
+        output,
+        completed_ids,
+        np.stack(embeddings),
+        np.stack(masks),
+        fingerprint,
+    )
+    failure_path = output.with_suffix(".failures.json")
+    failure_path.write_text(
+        json.dumps(failures, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    artifact_volume.commit()
+    torch.cuda.empty_cache()
+    return {
+        "status": "written",
+        "studies": len(study_ids),
+        "failures": len(failures),
+        "failure_manifest": str(failure_path),
         **metadata,
     }
 
@@ -475,7 +622,21 @@ def train_heads(
     output_directory: str = "heads/dino336-v1/baseline",
     fingerprint: str = "",
     epochs: int = 18,
-    batch_size: int = 32,
+    batch_size: int = 64,
+    hidden_dim: int = 256,
+    learning_rate: float = 3e-4,
+    architecture: str = "legacy",
+    dropout: float = 0.0,
+    hard_target_mix: float = 0.0,
+    early_stopping_patience: int = 0,
+    use_cosine_schedule: bool = False,
+    pairwise_auc_weight: float = 0.0,
+    use_sqrt_class_balance: bool = False,
+    ema_decay: float = 0.0,
+    gradient_clip_norm: float = 0.0,
+    gold_oversample_fraction: float = 0.0,
+    gold_weight_threshold: float = 4.0,
+    seed: int = 20260806,
     overwrite: bool = False,
 ) -> dict[str, object]:
     """Train all five attention heads from mounted DINO feature shards."""
@@ -488,7 +649,7 @@ def train_heads(
 
     if not fingerprint:
         raise ValueError("fingerprint is required")
-    feature_root = _volume_path(DATA_MOUNT, feature_directory)
+    feature_root = _volume_path(ARTIFACT_MOUNT, feature_directory)
     targets = _volume_path(DATA_MOUNT, targets_path)
     folds = _volume_path(DATA_MOUNT, folds_path)
     output = _volume_path(ARTIFACT_MOUNT, output_directory)
@@ -517,12 +678,23 @@ def train_heads(
         output_dir=output,
         feature_fingerprint=fingerprint,
         n_splits=5,
-        hidden_dim=256,
+        hidden_dim=hidden_dim,
         epochs=epochs,
         batch_size=batch_size,
-        learning_rate=3e-4,
+        learning_rate=learning_rate,
         device="cuda",
-        seed=20260806,
+        seed=seed,
+        architecture=architecture,
+        dropout=dropout,
+        hard_target_mix=hard_target_mix,
+        early_stopping_patience=early_stopping_patience,
+        use_cosine_schedule=use_cosine_schedule,
+        pairwise_auc_weight=pairwise_auc_weight,
+        use_sqrt_class_balance=use_sqrt_class_balance,
+        ema_decay=ema_decay,
+        gradient_clip_norm=gradient_clip_norm,
+        gold_oversample_fraction=gold_oversample_fraction,
+        gold_weight_threshold=gold_weight_threshold,
     )
     artifact_volume.commit()
     return {
@@ -531,6 +703,174 @@ def train_heads(
         "feature_shards": len(shards),
         "output": str(output),
         "metadata": metadata,
+    }
+
+
+@app.function(
+    image=gpu_image,
+    cpu=8,
+    memory=32768,
+    timeout=21600,
+    retries=1,
+    volumes={
+        DATA_MOUNT: data_volume,
+        ARTIFACT_MOUNT: artifact_volume,
+    },
+)
+def train_probe(
+    feature_directory: str = "features/dino336-v1/train",
+    targets_path: str = "metadata/consensus-labels-v1.csv",
+    folds_path: str = "metadata/folds-v1.csv",
+    output_directory: str = "probes/dino336-v1/svd-ridge-256",
+    fingerprint: str = "",
+    svd_components: int = 256,
+    alphas: str = "0.1,1,10,100",
+    seed: int = 20260806,
+    overwrite: bool = False,
+) -> dict[str, object]:
+    """Train a fold-safe SVD-Ridge probe from mounted feature shards."""
+    import pandas as pd
+
+    from rsna_knee.dino_features import load_feature_shards
+    from rsna_knee.feature_probes import train_svd_ridge_probe
+    from rsna_knee.training_data import align_training_data
+
+    if not fingerprint:
+        raise ValueError("fingerprint is required")
+    alpha_values = tuple(float(value) for value in alphas.split(","))
+    feature_root = _volume_path(ARTIFACT_MOUNT, feature_directory)
+    targets = _volume_path(DATA_MOUNT, targets_path)
+    folds = _volume_path(DATA_MOUNT, folds_path)
+    output = _volume_path(ARTIFACT_MOUNT, output_directory)
+    shards = sorted(feature_root.glob("*.npz"))
+    if len(shards) != 256:
+        raise ValueError(f"expected 256 feature shards, found {len(shards)}")
+    for path in (targets, folds):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    if output.exists() and any(output.iterdir()) and not overwrite:
+        raise FileExistsError(
+            f"{output} is not empty; choose another output or enable overwrite"
+        )
+
+    features = load_feature_shards(shards, fingerprint)
+    aligned = align_training_data(
+        feature_ids=features["study_ids"],
+        embeddings=features["embeddings"],
+        valid_mask=features["valid_mask"],
+        targets=pd.read_csv(targets),
+        folds=pd.read_csv(folds),
+        n_splits=5,
+    )
+    metadata = train_svd_ridge_probe(
+        data=aligned,
+        output_dir=output,
+        feature_fingerprint=fingerprint,
+        n_splits=5,
+        svd_components=svd_components,
+        alphas=alpha_values,
+        seed=seed,
+    )
+    artifact_volume.commit()
+    return {
+        "studies": len(aligned.study_ids),
+        "feature_shards": len(shards),
+        "output": str(output),
+        "metadata": metadata,
+    }
+
+
+@app.function(
+    image=gpu_image,
+    cpu=4,
+    memory=8192,
+    timeout=900,
+    volumes={
+        DATA_MOUNT: data_volume,
+        ARTIFACT_MOUNT: artifact_volume,
+    },
+)
+def predict_test_ensemble(
+    fingerprint: str,
+    model_directories: str,
+    output_path: str = "submissions/gated-mix50-ensemble.csv",
+) -> dict[str, object]:
+    """Average saved seed/fold heads and build a validated submission."""
+    import numpy as np
+    import pandas as pd
+
+    from rsna_knee.constants import ID_COLUMN, LABELS
+    from rsna_knee.dino_features import load_feature_shards
+    from rsna_knee.fold_heads import predict_saved_heads
+    from rsna_knee.submission import build_submission
+
+    directories = [
+        value.strip() for value in model_directories.split(",") if value.strip()
+    ]
+    if not fingerprint or not directories:
+        raise ValueError("fingerprint and model directories are required")
+    feature_path = (
+        ARTIFACT_MOUNT
+        / "features"
+        / "dino336-v1"
+        / "test"
+        / "features-test.npz"
+    )
+    sample_path = DATA_MOUNT / "raw" / "sample_submission.csv"
+    if not feature_path.is_file() or not sample_path.is_file():
+        raise FileNotFoundError("test features or sample submission are missing")
+    features = load_feature_shards([feature_path], fingerprint)
+    prediction_frames: list[pd.DataFrame] = []
+    priors: dict[str, float] | None = None
+    for directory in directories:
+        model_dir = _volume_path(ARTIFACT_MOUNT, directory)
+        prediction_frames.append(
+            predict_saved_heads(
+                features["study_ids"],
+                features["embeddings"],
+                features["valid_mask"],
+                model_dir,
+                fingerprint,
+                device="cpu",
+                batch_size=64,
+            ).set_index(ID_COLUMN)
+        )
+        metadata = json.loads(
+            (model_dir / "metadata.json").read_text(encoding="utf-8")
+        )
+        if priors is None:
+            priors = {
+                label: float(metadata["priors"][label]) for label in LABELS
+            }
+
+    values = np.stack(
+        [frame.loc[:, LABELS].to_numpy(dtype=float) for frame in prediction_frames]
+    ).mean(axis=0)
+    predictions = pd.DataFrame(values, columns=LABELS)
+    predictions.insert(0, ID_COLUMN, features["study_ids"])
+    sample = pd.read_csv(sample_path)
+    missing = sorted(
+        set(sample[ID_COLUMN].astype(str)).difference(
+            predictions[ID_COLUMN].astype(str)
+        )
+    )
+    if missing:
+        if priors is None:
+            raise RuntimeError("training priors are unavailable")
+        fallback = pd.DataFrame(
+            [{ID_COLUMN: study_id, **priors} for study_id in missing]
+        )
+        predictions = pd.concat([predictions, fallback], ignore_index=True)
+    submission = build_submission(predictions, sample)
+    destination = _volume_path(ARTIFACT_MOUNT, output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    submission.to_csv(destination, index=False)
+    artifact_volume.commit()
+    return {
+        "models": len(directories),
+        "rows": len(submission),
+        "fallback_studies": missing,
+        "output": str(destination),
     }
 
 
@@ -583,16 +923,43 @@ def unpack_data(shard_count: int = 16) -> None:
 
 @app.local_entrypoint()
 def extract(
-    shard_count: int = 32,
-    batch_size: int = 16,
+    shard_count: int = 256,
+    batch_size: int = 64,
+    start_shard: int = 0,
+    end_shard: int = -1,
+    additional_start_shard: int = -1,
+    additional_end_shard: int = -1,
 ) -> None:
     if not 1 <= shard_count <= 256:
         raise ValueError("shard_count must be between 1 and 256")
+    if end_shard == -1:
+        end_shard = shard_count
+    if not 0 <= start_shard < end_shard <= shard_count:
+        raise ValueError(
+            "shard range must satisfy 0 <= start < end <= shard_count"
+        )
+    shard_indices = list(range(start_shard, end_shard))
+    if additional_start_shard != -1 or additional_end_shard != -1:
+        if not (
+            0
+            <= additional_start_shard
+            < additional_end_shard
+            <= shard_count
+        ):
+            raise ValueError(
+                "additional shard range must satisfy "
+                "0 <= start < end <= shard_count"
+            )
+        shard_indices.extend(
+            range(additional_start_shard, additional_end_shard)
+        )
+    if len(shard_indices) != len(set(shard_indices)):
+        raise ValueError("shard ranges must not overlap")
     results = list(
         extract_feature_shard.starmap(
             (
                 (shard_index, shard_count, batch_size)
-                for shard_index in range(shard_count)
+                for shard_index in shard_indices
             ),
             order_outputs=False,
         )
@@ -606,12 +973,57 @@ def extract(
 
 
 @app.local_entrypoint()
+def extract_one(
+    shard_index: int = 0,
+    shard_count: int = 256,
+    batch_size: int = 32,
+) -> None:
+    if not 1 <= shard_count <= 256:
+        raise ValueError("shard_count must be between 1 and 256")
+    if not 0 <= shard_index < shard_count:
+        raise ValueError("shard_index must satisfy 0 <= index < shard_count")
+    result = extract_feature_shard.remote(
+        shard_index,
+        shard_count,
+        batch_size,
+    )
+    print(json.dumps(result, indent=2))
+
+
+@app.local_entrypoint()
+def extract_test(batch_size: int = 64, overwrite: bool = False) -> None:
+    print(
+        json.dumps(
+            extract_test_features.remote(
+                batch_size=batch_size,
+                overwrite=overwrite,
+            ),
+            indent=2,
+        )
+    )
+
+
+@app.local_entrypoint()
 def train(
     fingerprint: str,
     feature_directory: str = "features/dino336-v1/train",
     output_directory: str = "heads/dino336-v1/baseline",
     epochs: int = 18,
     batch_size: int = 32,
+    hidden_dim: int = 256,
+    learning_rate: float = 3e-4,
+    architecture: str = "legacy",
+    dropout: float = 0.0,
+    hard_target_mix: float = 0.0,
+    early_stopping_patience: int = 0,
+    use_cosine_schedule: bool = False,
+    pairwise_auc_weight: float = 0.0,
+    use_sqrt_class_balance: bool = False,
+    ema_decay: float = 0.0,
+    gradient_clip_norm: float = 0.0,
+    gold_oversample_fraction: float = 0.0,
+    gold_weight_threshold: float = 4.0,
+    seed: int = 20260806,
     overwrite: bool = False,
 ) -> None:
     result = train_heads.remote(
@@ -620,6 +1032,64 @@ def train(
         fingerprint=fingerprint,
         epochs=epochs,
         batch_size=batch_size,
+        hidden_dim=hidden_dim,
+        learning_rate=learning_rate,
+        architecture=architecture,
+        dropout=dropout,
+        hard_target_mix=hard_target_mix,
+        early_stopping_patience=early_stopping_patience,
+        use_cosine_schedule=use_cosine_schedule,
+        pairwise_auc_weight=pairwise_auc_weight,
+        use_sqrt_class_balance=use_sqrt_class_balance,
+        ema_decay=ema_decay,
+        gradient_clip_norm=gradient_clip_norm,
+        gold_oversample_fraction=gold_oversample_fraction,
+        gold_weight_threshold=gold_weight_threshold,
+        seed=seed,
         overwrite=overwrite,
     )
     print(json.dumps(result, indent=2))
+
+
+@app.local_entrypoint()
+def probe(
+    fingerprint: str,
+    feature_directory: str = "features/dino336-v1/train",
+    output_directory: str = "probes/dino336-v1/svd-ridge-256",
+    svd_components: int = 256,
+    alphas: str = "0.1,1,10,100",
+    seed: int = 20260806,
+    overwrite: bool = False,
+) -> None:
+    result = train_probe.remote(
+        feature_directory=feature_directory,
+        output_directory=output_directory,
+        fingerprint=fingerprint,
+        svd_components=svd_components,
+        alphas=alphas,
+        seed=seed,
+        overwrite=overwrite,
+    )
+    print(json.dumps(result, indent=2))
+
+
+@app.local_entrypoint()
+def submit(
+    fingerprint: str,
+    model_directories: str = (
+        "heads/dino336-v1/gated-mix50-s28,"
+        "heads/dino336-v1/gated-mix50-s39,"
+        "heads/dino336-v1/gated-mix50-s50"
+    ),
+    output_path: str = "submissions/gated-mix50-ensemble.csv",
+) -> None:
+    print(
+        json.dumps(
+            predict_test_ensemble.remote(
+                fingerprint=fingerprint,
+                model_directories=model_directories,
+                output_path=output_path,
+            ),
+            indent=2,
+        )
+    )

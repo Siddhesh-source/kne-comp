@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 from os import PathLike
 from pathlib import Path
@@ -138,14 +140,7 @@ def _geometry_locations(slices: Sequence[DicomSlice]) -> list[float] | None:
     return locations
 
 
-def load_dicom_slices(
-    items: Sequence[str | PathLike[str] | Any],
-) -> list[DicomSlice]:
-    """Load and order a series by patient geometry, then InstanceNumber."""
-    decoded = [
-        decode_dicom_slice(item, source_index=index)
-        for index, item in enumerate(items)
-    ]
+def _order_dicom_slices(decoded: Sequence[DicomSlice]) -> list[DicomSlice]:
     locations = _geometry_locations(decoded)
     if locations is not None:
         order = sorted(
@@ -174,11 +169,78 @@ def load_dicom_slices(
     return [decoded[index] for index in order]
 
 
+def _read_dicom_header(
+    item: str | PathLike[str],
+    *,
+    source_index: int,
+) -> DicomSlice:
+    path = Path(item)
+    try:
+        import pydicom
+    except ImportError as exc:
+        raise RuntimeError(
+            "pydicom is required to load DICOM files; install the gpu extra"
+        ) from exc
+    try:
+        dataset = pydicom.dcmread(
+            path,
+            stop_before_pixels=True,
+            specific_tags=[
+                "InstanceNumber",
+                "ImagePositionPatient",
+                "ImageOrientationPatient",
+            ],
+        )
+    except Exception as exc:
+        raise ValueError(f"failed to read DICOM header {path}") from exc
+    return DicomSlice(
+        pixels=np.empty((0, 0), dtype=np.float32),
+        instance_number=_optional_float(
+            getattr(dataset, "InstanceNumber", None)
+        ),
+        position=_numeric_vector(
+            getattr(dataset, "ImagePositionPatient", None), 3
+        ),
+        orientation=_numeric_vector(
+            getattr(dataset, "ImageOrientationPatient", None), 6
+        ),
+        source=str(path) or f"dataset-{source_index:08d}",
+    )
+
+
+def load_dicom_slices(
+    items: Sequence[str | PathLike[str] | Any],
+) -> list[DicomSlice]:
+    """Load and order a series by patient geometry, then InstanceNumber."""
+    decoded = [
+        decode_dicom_slice(item, source_index=index)
+        for index, item in enumerate(items)
+    ]
+    return _order_dicom_slices(decoded)
+
+
 def select_slot_slices(
     items: Sequence[str | PathLike[str] | Any],
     slot: ProtocolSlot,
 ) -> list[DicomSlice]:
     """Load a series and apply a protocol slot's fixed window and budget."""
+    if items and all(isinstance(item, (str, PathLike)) for item in items):
+        headers = _order_dicom_slices(
+            [
+                _read_dicom_header(item, source_index=index)
+                for index, item in enumerate(items)
+            ]
+        )
+        indices = sample_slice_indices(
+            len(headers),
+            slot.slice_budget,
+            slot.window_start,
+            slot.window_end,
+        )
+        return [
+            decode_dicom_slice(headers[int(index)].source)
+            for index in indices
+        ]
     ordered = load_dicom_slices(items)
     indices = sample_slice_indices(
         len(ordered),
@@ -288,6 +350,9 @@ def extract_slice_features(
         device = next(model.parameters()).device
     except (AttributeError, StopIteration):
         device = torch.device("cpu")
+    use_cuda_amp = device.type == "cuda"
+    if use_cuda_amp:
+        torch.set_float32_matmul_precision("high")
     was_training = bool(getattr(model, "training", False))
     if hasattr(model, "eval"):
         model.eval()
@@ -295,12 +360,24 @@ def extract_slice_features(
     try:
         with torch.inference_mode():
             for start in range(0, len(images), batch_size):
-                batch = images[start : start + batch_size].to(device)
-                output = (
-                    model.forward_features(batch)
-                    if hasattr(model, "forward_features")
-                    else model(batch)
+                batch = images[start : start + batch_size].to(
+                    device,
+                    non_blocking=use_cuda_amp,
                 )
+                precision = (
+                    torch.autocast(
+                        device_type="cuda",
+                        dtype=torch.float16,
+                    )
+                    if use_cuda_amp
+                    else nullcontext()
+                )
+                with precision:
+                    output = (
+                        model.forward_features(batch)
+                        if hasattr(model, "forward_features")
+                        else model(batch)
+                    )
                 batches.append(
                     pool_dino_output(output).detach().cpu().float()
                 )
@@ -326,11 +403,17 @@ def build_study_images(
         (total_slices, 3, image_size, image_size), dtype=torch.float32
     )
     valid_mask = torch.zeros(total_slices, dtype=torch.bool)
-    offset = 0
-    for slot in slots:
+    def prepare_slot(slot: ProtocolSlot) -> Any:
         items = slot_series.get(slot.name, ())
         selected = select_slot_slices(items, slot) if items else []
-        prepared = preprocess_slices(selected, image_size=image_size)
+        return preprocess_slices(selected, image_size=image_size)
+
+    worker_count = min(4, len(slots))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        prepared_slots = list(executor.map(prepare_slot, slots))
+
+    offset = 0
+    for slot, prepared in zip(slots, prepared_slots, strict=True):
         count = len(prepared)
         images[offset : offset + count] = prepared
         valid_mask[offset : offset + count] = True
