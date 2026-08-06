@@ -30,6 +30,19 @@ def test_safe_config_summary_never_contains_key(monkeypatch):
     assert "secret-value" not in repr(summary)
 
 
+def test_alternate_config_profile(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "openai_compatible")
+    monkeypatch.setenv("LLM_ALTERNATE_MODEL", "alternate-model")
+    monkeypatch.setenv("LLM_ALTERNATE_BASE_URL", "https://alternate.invalid/v1/")
+    monkeypatch.setenv("LLM_ALTERNATE_API_KEY", "alternate-secret")
+
+    config = load_llm_config(profile="alternate")
+
+    assert config.model == "alternate-model"
+    assert config.base_url == "https://alternate.invalid/v1"
+    assert config.api_key == "alternate-secret"
+
+
 def test_report_normalization_and_grouped_folds_are_deterministic():
     train = pd.DataFrame(
         {

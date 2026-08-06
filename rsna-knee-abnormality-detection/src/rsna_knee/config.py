@@ -33,16 +33,26 @@ class LLMConfig:
         }
 
 
-def load_llm_config(env_path: str | Path | None = None) -> LLMConfig:
+def load_llm_config(
+    env_path: str | Path | None = None,
+    profile: str = "primary",
+) -> LLMConfig:
     """Load LLM settings from an explicit path or the current environment."""
     if env_path is not None:
         load_dotenv(Path(env_path), override=False)
 
+    if profile == "primary":
+        prefix = "LLM_"
+    elif profile == "alternate":
+        prefix = "LLM_ALTERNATE_"
+    else:
+        raise ValueError("profile must be 'primary' or 'alternate'")
+
     return LLMConfig(
         provider=os.getenv("LLM_PROVIDER", "").strip(),
-        model=os.getenv("LLM_MODEL", "").strip(),
-        base_url=os.getenv("LLM_BASE_URL", "").strip().rstrip("/"),
-        api_key=os.getenv("LLM_API_KEY", "").strip(),
+        model=os.getenv(f"{prefix}MODEL", "").strip(),
+        base_url=os.getenv(f"{prefix}BASE_URL", "").strip().rstrip("/"),
+        api_key=os.getenv(f"{prefix}API_KEY", "").strip(),
         timeout_seconds=int(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "120")),
         max_retries=int(os.getenv("LLM_MAX_RETRIES", "3")),
     )

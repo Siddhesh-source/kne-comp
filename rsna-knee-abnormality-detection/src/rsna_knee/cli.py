@@ -35,11 +35,17 @@ def build_parser() -> argparse.ArgumentParser:
         "check-config", help="show non-secret LLM configuration"
     )
     config.add_argument("--env-file", type=Path)
+    config.add_argument(
+        "--profile", choices=("primary", "alternate"), default="primary"
+    )
 
     smoke = commands.add_parser(
         "smoke-llm", help="make a tiny non-competition API request"
     )
     smoke.add_argument("--env-file", type=Path, required=True)
+    smoke.add_argument(
+        "--profile", choices=("primary", "alternate"), default="primary"
+    )
 
     inspect = commands.add_parser(
         "inspect-data", help="validate and summarize competition metadata"
@@ -74,6 +80,9 @@ def build_parser() -> argparse.ArgumentParser:
         "label-reports", help="label reports into a resumable JSONL file"
     )
     label.add_argument("--env-file", type=Path, required=True)
+    label.add_argument(
+        "--profile", choices=("primary", "alternate"), default="primary"
+    )
     label.add_argument("--data-dir", type=Path, required=True)
     label.add_argument("--output", type=Path, required=True)
     label.add_argument(
@@ -106,6 +115,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="run the Effusion and Synovitis specialist labeler",
     )
     specialist.add_argument("--env-file", type=Path, required=True)
+    specialist.add_argument(
+        "--profile", choices=("primary", "alternate"), default="primary"
+    )
     specialist.add_argument("--data-dir", type=Path, required=True)
     specialist.add_argument("--output", type=Path, required=True)
     specialist.add_argument(
@@ -130,11 +142,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     if args.command == "check-config":
-        print(json.dumps(load_llm_config(args.env_file).safe_summary(), indent=2))
+        print(
+            json.dumps(
+                load_llm_config(args.env_file, args.profile).safe_summary(),
+                indent=2,
+            )
+        )
         return 0
 
     if args.command == "smoke-llm":
-        client = OpenAICompatibleClient(load_llm_config(args.env_file))
+        client = OpenAICompatibleClient(
+            load_llm_config(args.env_file, args.profile)
+        )
         response = client.complete_json(
             system="Return valid JSON only.",
             user='Return exactly {"status":"ok"}.',
@@ -218,7 +237,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         train, _ = read_metadata(args.data_dir)
         result = label_reports(
             train=train,
-            config=load_llm_config(args.env_file),
+            config=load_llm_config(args.env_file, args.profile),
             output_path=args.output,
             limit=args.limit,
             subset=args.subset,
@@ -243,7 +262,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             json.dumps(
                 label_specialist_reports(
                     train=train,
-                    config=load_llm_config(args.env_file),
+                    config=load_llm_config(args.env_file, args.profile),
                     output_path=args.output,
                     subset=args.subset,
                     workers=args.workers,
