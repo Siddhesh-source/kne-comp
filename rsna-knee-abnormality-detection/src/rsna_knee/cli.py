@@ -22,6 +22,8 @@ from .label_quality import (
     specialist_quality_report,
 )
 from .metrics import competition_auc
+from .model_config import DEFAULT_DINO_CONFIG
+from .protocols import build_protocol_manifest, summarize_protocol_manifest
 from .report_labeler import (
     estimate_labeling,
     evaluate_report_labels,
@@ -31,6 +33,7 @@ from .specialist_labeler import (
     evaluate_specialist_labels,
     label_specialist_reports,
 )
+from .submission import project_runtime, validate_submission
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -163,6 +166,34 @@ def build_parser() -> argparse.ArgumentParser:
     quality.add_argument("--primary", type=Path)
     quality.add_argument("--specialist", type=Path, action="append")
     quality.add_argument("--evidence-sample", type=int, default=100)
+
+    protocol = commands.add_parser(
+        "build-protocol-manifest",
+        help="select deterministic MRI protocol slots from series metadata",
+    )
+    protocol.add_argument("--series-csv", type=Path, required=True)
+    protocol.add_argument("--output", type=Path, required=True)
+
+    model_config = commands.add_parser(
+        "show-model-config",
+        help="print the versioned DINOv2 model configuration",
+    )
+
+    submission = commands.add_parser(
+        "validate-submission",
+        help="validate a competition submission file",
+    )
+    submission.add_argument("--submission", type=Path, required=True)
+    submission.add_argument("--sample", type=Path, required=True)
+
+    runtime = commands.add_parser(
+        "project-runtime",
+        help="project hidden-test runtime from a measured sample",
+    )
+    runtime.add_argument("--studies", type=int, required=True)
+    runtime.add_argument("--seconds", type=float, required=True)
+    runtime.add_argument("--projected-studies", type=int, default=1300)
+    runtime.add_argument("--budget-seconds", type=float, default=32400)
     return parser
 
 
@@ -347,6 +378,40 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not result:
             raise ValueError("provide --primary and/or --specialist")
         print(json.dumps(result, indent=2))
+        return 0
+
+    if args.command == "build-protocol-manifest":
+        series = pd.read_csv(args.series_csv)
+        manifest = build_protocol_manifest(series)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        manifest.to_csv(args.output, index=False)
+        print(json.dumps(summarize_protocol_manifest(manifest), indent=2))
+        return 0
+
+    if args.command == "show-model-config":
+        print(json.dumps(DEFAULT_DINO_CONFIG.as_dict(), indent=2))
+        return 0
+
+    if args.command == "validate-submission":
+        result = validate_submission(
+            pd.read_csv(args.submission),
+            pd.read_csv(args.sample),
+        )
+        print(json.dumps(result, indent=2))
+        return 0
+
+    if args.command == "project-runtime":
+        print(
+            json.dumps(
+                project_runtime(
+                    measured_studies=args.studies,
+                    measured_seconds=args.seconds,
+                    projected_studies=args.projected_studies,
+                    budget_seconds=args.budget_seconds,
+                ).as_dict(),
+                indent=2,
+            )
+        )
         return 0
 
     raise AssertionError(f"unhandled command: {args.command}")
