@@ -3,10 +3,15 @@ import json
 import pandas as pd
 import pytest
 
+from rsna_knee.config import LLMConfig
 from rsna_knee.constants import ID_COLUMN, LABELS, REPORT_COLUMN
 from rsna_knee.folds import report_group
 from rsna_knee.llm_client import LLMResponse
-from rsna_knee.specialist_labeler import _label_one, evaluate_specialist_labels
+from rsna_knee.specialist_labeler import (
+    _label_one,
+    evaluate_specialist_labels,
+    label_specialist_reports,
+)
 from rsna_knee.specialist_schema import SPECIALIST_LABELS, SpecialistLabels
 
 
@@ -55,6 +60,56 @@ def test_specialist_label_one_corrects_invalid_schema():
 
     assert set(labels.labels) == set(SPECIALIST_LABELS)
     assert "Validation error:" in client.prompts[1]
+
+
+def test_specialist_labeling_supports_disjoint_shard_sets(
+    tmp_path, monkeypatch
+):
+    train = pd.DataFrame(
+        {
+            ID_COLUMN: [str(index) for index in range(20)],
+            REPORT_COLUMN: [f"report {index}" for index in range(20)],
+        }
+    )
+    config = LLMConfig(
+        provider="test",
+        model="test-model",
+        base_url="https://example.invalid/v1",
+        api_key="not-a-real-key",
+    )
+    parsed = SpecialistLabels.from_dict(specialist_payload())
+    monkeypatch.setattr(
+        "rsna_knee.specialist_labeler._label_one",
+        lambda client, report: (parsed, "response-id", {}),
+    )
+    navy = tmp_path / "navy.jsonl"
+    alternate = tmp_path / "alternate.jsonl"
+
+    label_specialist_reports(
+        train,
+        config,
+        navy,
+        shard_indices=(0, 1, 2),
+        shard_count=5,
+    )
+    label_specialist_reports(
+        train,
+        config,
+        alternate,
+        shard_indices=(3, 4),
+        shard_count=5,
+    )
+
+    navy_groups = {
+        json.loads(line)["report_group"]
+        for line in navy.read_text(encoding="utf-8").splitlines()
+    }
+    alternate_groups = {
+        json.loads(line)["report_group"]
+        for line in alternate.read_text(encoding="utf-8").splitlines()
+    }
+    assert navy_groups.isdisjoint(alternate_groups)
+    assert len(navy_groups | alternate_groups) == 20
 
 
 def test_specialist_evaluation_compares_blends(tmp_path):

@@ -7,6 +7,7 @@ import os
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Iterable
 
 import pandas as pd
 
@@ -37,6 +38,9 @@ def label_specialist_reports(
     subset: str = "all",
     workers: int = 8,
     limit: int | None = None,
+    shard_indices: Iterable[int] = (0,),
+    shard_count: int = 1,
+    completed_paths: Iterable[str | Path] = (),
 ) -> dict[str, int]:
     if subset == "gold":
         train = train.loc[train.loc[:, LABELS].notna().all(axis=1)].copy()
@@ -44,11 +48,26 @@ def label_specialist_reports(
         raise ValueError("subset must be 'all' or 'gold'")
     if workers < 1:
         raise ValueError("workers must be at least 1")
+    selected_shards = set(shard_indices)
+    if shard_count < 1:
+        raise ValueError("shard_count must be at least 1")
+    if not selected_shards or any(
+        index < 0 or index >= shard_count for index in selected_shards
+    ):
+        raise ValueError("shard indices must be within shard_count")
 
     reports = unique_reports(train)
+    reports = reports.loc[
+        reports["report_group"].map(
+            lambda group: int(str(group)[:16], 16) % shard_count
+            in selected_shards
+        )
+    ].copy()
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     completed = completed_report_groups(output_path)
+    for path in completed_paths:
+        completed.update(completed_report_groups(path))
     scope_groups = set(reports["report_group"])
     completed_in_scope = completed.intersection(scope_groups)
     pending = reports.loc[~reports["report_group"].isin(completed_in_scope)]
@@ -106,6 +125,8 @@ def label_specialist_reports(
         "already_completed": len(completed_in_scope),
         "written": written,
         "remaining": len(reports) - len(completed_in_scope) - written,
+        "shard_indices": sorted(selected_shards),
+        "shard_count": shard_count,
     }
 
 

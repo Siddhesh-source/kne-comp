@@ -150,6 +150,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     specialist.add_argument("--workers", type=int, default=8)
     specialist.add_argument("--limit", type=int)
+    specialist.add_argument(
+        "--shard-index", type=int, action="append", default=[]
+    )
+    specialist.add_argument("--shard-count", type=int, default=1)
+    specialist.add_argument(
+        "--completed", type=Path, action="append", default=[]
+    )
 
     specialist_eval = commands.add_parser(
         "evaluate-specialist",
@@ -393,6 +400,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     subset=args.subset,
                     workers=args.workers,
                     limit=args.limit,
+                    shard_indices=args.shard_index or (0,),
+                    shard_count=args.shard_count,
+                    completed_paths=args.completed,
                 ),
                 indent=2,
             )
