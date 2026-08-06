@@ -21,6 +21,10 @@ from .report_labeler import (
     evaluate_report_labels,
     label_reports,
 )
+from .specialist_labeler import (
+    evaluate_specialist_labels,
+    label_specialist_reports,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -96,6 +100,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     evaluate.add_argument("--data-dir", type=Path, required=True)
     evaluate.add_argument("--labels", type=Path, required=True)
+
+    specialist = commands.add_parser(
+        "label-specialist",
+        help="run the Effusion and Synovitis specialist labeler",
+    )
+    specialist.add_argument("--env-file", type=Path, required=True)
+    specialist.add_argument("--data-dir", type=Path, required=True)
+    specialist.add_argument("--output", type=Path, required=True)
+    specialist.add_argument(
+        "--subset", choices=("all", "gold"), default="all"
+    )
+    specialist.add_argument("--workers", type=int, default=8)
+    specialist.add_argument("--limit", type=int)
+
+    specialist_eval = commands.add_parser(
+        "evaluate-specialist",
+        help="compare specialist labels with the primary report labels",
+    )
+    specialist_eval.add_argument("--data-dir", type=Path, required=True)
+    specialist_eval.add_argument("--primary", type=Path, required=True)
+    specialist_eval.add_argument(
+        "--specialist", type=Path, required=True, action="append"
+    )
     return parser
 
 
@@ -205,6 +232,37 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             json.dumps(
                 evaluate_report_labels(train, args.labels),
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.command == "label-specialist":
+        train, _ = read_metadata(args.data_dir)
+        print(
+            json.dumps(
+                label_specialist_reports(
+                    train=train,
+                    config=load_llm_config(args.env_file),
+                    output_path=args.output,
+                    subset=args.subset,
+                    workers=args.workers,
+                    limit=args.limit,
+                ),
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.command == "evaluate-specialist":
+        train, _ = read_metadata(args.data_dir)
+        print(
+            json.dumps(
+                evaluate_specialist_labels(
+                    train=train,
+                    primary_path=args.primary,
+                    specialist_paths=args.specialist,
+                ),
                 indent=2,
             )
         )
