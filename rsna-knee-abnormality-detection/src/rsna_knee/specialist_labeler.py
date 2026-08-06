@@ -206,13 +206,14 @@ def evaluate_specialist_labels(
 def _label_one(
     client: OpenAICompatibleClient,
     report: str,
-    schema_attempts: int = 2,
+    schema_attempts: int = 3,
 ) -> tuple[SpecialistLabels, str | None, dict[str, object]]:
     last_error: Exception | None = None
-    for _ in range(schema_attempts):
+    user_prompt = build_user_prompt(report)
+    for attempt in range(schema_attempts):
         response = client.complete_json(
             system=SYSTEM_PROMPT,
-            user=build_user_prompt(report),
+            user=user_prompt,
         )
         try:
             return (
@@ -222,4 +223,14 @@ def _label_one(
             )
         except ValueError as exc:
             last_error = exc
+            if attempt + 1 < schema_attempts:
+                user_prompt = (
+                    f"{build_user_prompt(report)}\n\n"
+                    "Your previous JSON failed strict validation. Correct it "
+                    "without changing the report interpretation.\n"
+                    f"Validation error: {exc}\n"
+                    "Previous JSON:\n"
+                    f"{json.dumps(response.content, ensure_ascii=False)}\n"
+                    "Return only one corrected JSON object."
+                )
     raise LLMRequestError("LLM returned an invalid specialist schema") from last_error

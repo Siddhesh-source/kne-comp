@@ -13,9 +13,11 @@ from .config import load_llm_config
 from .consensus import write_consensus_table
 from .constants import ID_COLUMN, LABELS
 from .data import read_metadata, summarize_metadata
+from .dino_features import feature_config_fingerprint, sha256_file
 from .experiments import initialize_registry
 from .folds import make_report_grouped_folds, validate_fold_assignments
 from .llm_client import OpenAICompatibleClient
+from .inference import assemble_ensemble_submission
 from .label_quality import (
     evidence_consistency_sample,
     primary_quality_report,
@@ -203,6 +205,22 @@ def build_parser() -> argparse.ArgumentParser:
     runtime.add_argument("--seconds", type=float, required=True)
     runtime.add_argument("--projected-studies", type=int, default=1300)
     runtime.add_argument("--budget-seconds", type=float, default=32400)
+
+    fingerprint = commands.add_parser(
+        "feature-fingerprint",
+        help="print the DINO feature compatibility fingerprint",
+    )
+    fingerprint.add_argument("--checkpoint", type=Path, required=True)
+
+    ensemble = commands.add_parser(
+        "ensemble-submission",
+        help="average fold prediction CSVs and build a submission",
+    )
+    ensemble.add_argument(
+        "--fold", type=Path, required=True, action="append"
+    )
+    ensemble.add_argument("--sample", type=Path, required=True)
+    ensemble.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -421,6 +439,40 @@ def main(argv: Sequence[str] | None = None) -> int:
                     projected_studies=args.projected_studies,
                     budget_seconds=args.budget_seconds,
                 ).as_dict(),
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.command == "feature-fingerprint":
+        checkpoint_hash = sha256_file(args.checkpoint)
+        print(
+            json.dumps(
+                {
+                    "checkpoint_sha256": checkpoint_hash,
+                    "feature_fingerprint": feature_config_fingerprint(
+                        checkpoint_sha256=checkpoint_hash
+                    ),
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.command == "ensemble-submission":
+        sample = pd.read_csv(args.sample)
+        submission = assemble_ensemble_submission(
+            [pd.read_csv(path) for path in args.fold],
+            sample,
+        )
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        submission.to_csv(args.output, index=False)
+        print(
+            json.dumps(
+                {
+                    "output": str(args.output),
+                    **validate_submission(submission, sample),
+                },
                 indent=2,
             )
         )

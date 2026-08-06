@@ -5,7 +5,8 @@ import pytest
 
 from rsna_knee.constants import ID_COLUMN, LABELS, REPORT_COLUMN
 from rsna_knee.folds import report_group
-from rsna_knee.specialist_labeler import evaluate_specialist_labels
+from rsna_knee.llm_client import LLMResponse
+from rsna_knee.specialist_labeler import _label_one, evaluate_specialist_labels
 from rsna_knee.specialist_schema import SPECIALIST_LABELS, SpecialistLabels
 
 
@@ -34,6 +35,26 @@ def test_specialist_schema_requires_valid_grade():
     payload["labels"]["Effusion"]["grade"] = "huge"
     with pytest.raises(ValueError, match="grade"):
         SpecialistLabels.from_dict(payload)
+
+
+def test_specialist_label_one_corrects_invalid_schema():
+    class CorrectingClient:
+        def __init__(self):
+            self.prompts = []
+
+        def complete_json(self, system, user):
+            self.prompts.append(user)
+            payload = specialist_payload()
+            if len(self.prompts) == 1:
+                payload["labels"]["Effusion"]["grade"] = "huge"
+            return LLMResponse(payload, "response-id", {})
+
+    client = CorrectingClient()
+
+    labels, _, _ = _label_one(client, "normal report")
+
+    assert set(labels.labels) == set(SPECIALIST_LABELS)
+    assert "Validation error:" in client.prompts[1]
 
 
 def test_specialist_evaluation_compares_blends(tmp_path):

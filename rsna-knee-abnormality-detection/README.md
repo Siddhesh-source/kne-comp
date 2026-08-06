@@ -97,3 +97,33 @@ rsna-knee build-consensus `
   --specialist ..\data\derived\specialist-v1-pass3.jsonl `
   --output ..\data\derived\consensus-labels-v1.csv
 ```
+
+## Kaggle packaging
+
+GPU work is intentionally deferred to Kaggle. Before extraction, verify the
+offline DINOv2 checkpoint and compute the feature compatibility fingerprint:
+
+```powershell
+rsna-knee feature-fingerprint `
+  --checkpoint C:\kaggle-input\dinov2_vits14_pretrain.pth
+```
+
+After each fold writes a prediction CSV with `StudyInstanceUID` and the twelve
+label columns, assemble and validate the final submission:
+
+```powershell
+rsna-knee ensemble-submission `
+  --fold fold-0.csv `
+  --fold fold-1.csv `
+  --fold fold-2.csv `
+  --fold fold-3.csv `
+  --fold fold-4.csv `
+  --sample sample_submission.csv `
+  --output submission.csv
+```
+
+The package provides deterministic protocol selection, slice sampling,
+fingerprinted feature shards, a masked soft-label fold head, fold averaging,
+failed-study prior fallback, strict study-ID alignment, and submission
+validation. DICOM extraction and model training must run on Kaggle with local
+offline DINOv2 assets.
