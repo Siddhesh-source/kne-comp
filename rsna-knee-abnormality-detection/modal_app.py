@@ -6,6 +6,7 @@ import hashlib
 import json
 import subprocess
 import sys
+import zipfile
 from pathlib import Path, PurePosixPath
 
 import modal
@@ -193,6 +194,46 @@ def download_competition_data() -> dict[str, object]:
             if train_root.is_dir()
             else 0
         ),
+    }
+
+
+@app.function(
+    image=gpu_image,
+    cpu=16,
+    memory=32768,
+    timeout=21600,
+    retries=1,
+    volumes={DATA_MOUNT: data_volume},
+)
+def unpack_competition_data() -> dict[str, object]:
+    """Unpack the completed archive into the shared data volume."""
+    data_volume.reload()
+    archive = (
+        DATA_MOUNT / "raw" / "rsna-knee-abnormality-detection.zip"
+    )
+    train_root = DATA_MOUNT / "raw" / "train_series"
+    if train_root.is_dir():
+        studies = sum(1 for path in train_root.iterdir() if path.is_dir())
+        if studies == 4407:
+            return {
+                "status": "already_complete",
+                "train_study_directories": studies,
+            }
+    if not archive.is_file():
+        raise FileNotFoundError(archive)
+    if not zipfile.is_zipfile(archive):
+        raise ValueError("competition archive is incomplete or invalid")
+    with zipfile.ZipFile(archive) as handle:
+        handle.extractall(DATA_MOUNT / "raw")
+    studies = sum(1 for path in train_root.iterdir() if path.is_dir())
+    if studies != 4407:
+        raise RuntimeError(
+            f"expected 4407 train study directories, found {studies}"
+        )
+    data_volume.commit()
+    return {
+        "status": "unpacked",
+        "train_study_directories": studies,
     }
 
 
@@ -466,6 +507,11 @@ def download_data() -> None:
 @app.local_entrypoint()
 def prepare_model() -> None:
     print(json.dumps(prepare_dino_model.remote(), indent=2))
+
+
+@app.local_entrypoint()
+def unpack_data() -> None:
+    print(json.dumps(unpack_competition_data.remote(), indent=2))
 
 
 @app.local_entrypoint()
