@@ -24,6 +24,46 @@ class RuntimeProjection:
         return self.__dict__.copy()
 
 
+def build_submission(
+    predictions: pd.DataFrame,
+    sample_submission: pd.DataFrame,
+) -> pd.DataFrame:
+    """Align predictions to sample order and validate exact study coverage."""
+    expected_columns = [ID_COLUMN, *LABELS]
+    if list(sample_submission.columns) != expected_columns:
+        raise ValueError("sample submission has unexpected columns")
+    if list(predictions.columns) != expected_columns:
+        raise ValueError("prediction columns or order are incorrect")
+    if predictions[ID_COLUMN].duplicated().any():
+        raise ValueError("predictions contain duplicate study IDs")
+    if sample_submission[ID_COLUMN].duplicated().any():
+        raise ValueError("sample submission contains duplicate study IDs")
+
+    expected_ids = set(sample_submission[ID_COLUMN])
+    prediction_ids = set(predictions[ID_COLUMN])
+    missing = expected_ids.difference(prediction_ids)
+    unexpected = prediction_ids.difference(expected_ids)
+    if missing or unexpected:
+        raise ValueError(
+            "prediction study IDs do not match sample submission: "
+            f"missing={len(missing)}, unexpected={len(unexpected)}"
+        )
+
+    aligned = sample_submission.loc[:, [ID_COLUMN]].merge(
+        predictions,
+        on=ID_COLUMN,
+        how="left",
+        validate="one_to_one",
+    )
+    values = aligned.loc[:, LABELS].to_numpy(dtype=float)
+    tolerance = 1e-7
+    if ((values < -tolerance) | (values > 1.0 + tolerance)).any():
+        raise ValueError("prediction probabilities must be between 0 and 1")
+    aligned.loc[:, LABELS] = np.clip(values, 0.0, 1.0)
+    validate_submission(aligned, sample_submission)
+    return aligned
+
+
 def validate_submission(
     submission: pd.DataFrame,
     sample_submission: pd.DataFrame,

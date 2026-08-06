@@ -86,6 +86,9 @@ def label_reports(
     limit: int | None = None,
     subset: str = "all",
     workers: int = 1,
+    shard_index: int = 0,
+    shard_count: int = 1,
+    completed_paths: Iterable[str | Path] = (),
 ) -> dict[str, int]:
     """Label unique reports, resuming from records already in output_path."""
     if subset == "gold":
@@ -94,11 +97,23 @@ def label_reports(
         raise ValueError("subset must be 'all' or 'gold'")
     if workers < 1:
         raise ValueError("workers must be at least 1")
+    if shard_count < 1:
+        raise ValueError("shard_count must be at least 1")
+    if not 0 <= shard_index < shard_count:
+        raise ValueError("shard_index must be between 0 and shard_count - 1")
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     completed = completed_report_groups(output_path)
+    for path in completed_paths:
+        completed.update(completed_report_groups(path))
     reports = unique_reports(train)
+    reports = reports.loc[
+        reports["report_group"].map(
+            lambda group: int(str(group)[:16], 16) % shard_count
+            == shard_index
+        )
+    ].copy()
     scope_groups = set(reports["report_group"])
     completed_in_scope = completed.intersection(scope_groups)
     pending = reports.loc[~reports["report_group"].isin(completed_in_scope)]
@@ -168,6 +183,8 @@ def label_reports(
         "already_completed": len(completed_in_scope),
         "written": written,
         "remaining": len(reports) - len(completed_in_scope) - written,
+        "shard_index": shard_index,
+        "shard_count": shard_count,
     }
 
 

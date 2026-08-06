@@ -15,9 +15,17 @@ from rsna_knee.label_quality import (
 from rsna_knee.specialist_schema import SPECIALIST_LABELS
 
 
-def _primary_record(group, probability=0.2, confidence=0.8):
+def _primary_record(
+    group,
+    probability=0.2,
+    confidence=0.8,
+    model="test-model",
+):
     return {
         "report_group": group,
+        "provider": "test-provider",
+        "model": model,
+        "prompt_version": "test-prompt",
         "usage": {
             "prompt_tokens": 10,
             "completion_tokens": 5,
@@ -39,6 +47,9 @@ def _primary_record(group, probability=0.2, confidence=0.8):
 def _specialist_record(group, probability=0.8, confidence=0.6):
     return {
         "report_group": group,
+        "provider": "test-provider",
+        "model": "test-model",
+        "prompt_version": "test-specialist-prompt",
         "usage": {"total_tokens": 20},
         "language": "English",
         "labels": {
@@ -91,6 +102,7 @@ def test_consensus_blends_specialists_and_overrides_gold(tmp_path):
     metadata = write_consensus_table(train, primary, specialists, output)
     assert output.exists()
     assert metadata["rows"] == 2
+    assert metadata["primary_provenance"]["models"] == {"test-model": 2}
     assert Path(metadata["metadata"]).exists()
 
 
@@ -115,6 +127,31 @@ def test_quality_reports_measure_completeness_and_evidence(tmp_path):
     evidence = evidence_consistency_sample(train, primary)
 
     assert primary_report["complete"] is True
+    assert primary_report["provenance"]["mixed_models"] is False
     assert primary_report["usage"]["total_tokens"] == 30
     assert specialist_report["all_complete"] is True
     assert evidence["match_rate"] == 1.0
+
+
+def test_quality_report_flags_mixed_models(tmp_path):
+    train = pd.DataFrame(
+        {
+            ID_COLUMN: ["a", "b"],
+            REPORT_COLUMN: ["report a", "report b"],
+            **{label: [None, None] for label in LABELS},
+        }
+    )
+    groups = [report_group(value) for value in train[REPORT_COLUMN]]
+    primary = tmp_path / "mixed.jsonl"
+    _write_jsonl(
+        primary,
+        [
+            _primary_record(groups[0], model="sol"),
+            _primary_record(groups[1], model="luna"),
+        ],
+    )
+
+    report = primary_quality_report(train, primary)
+
+    assert report["provenance"]["mixed_models"] is True
+    assert report["provenance"]["models"] == {"sol": 1, "luna": 1}

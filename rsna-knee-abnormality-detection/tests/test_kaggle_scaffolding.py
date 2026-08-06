@@ -1,13 +1,23 @@
 import pandas as pd
 import pytest
+import numpy as np
 
 from rsna_knee.constants import ID_COLUMN, LABELS
-from rsna_knee.model_config import DEFAULT_DINO_CONFIG
+from rsna_knee.dino_features import (
+    feature_config_fingerprint,
+    robust_normalize,
+    sample_slice_indices,
+)
+from rsna_knee.model_config import DEFAULT_DINO_CONFIG, DINOModelConfig
 from rsna_knee.protocols import (
     build_protocol_manifest,
     summarize_protocol_manifest,
 )
-from rsna_knee.submission import project_runtime, validate_submission
+from rsna_knee.submission import (
+    build_submission,
+    project_runtime,
+    validate_submission,
+)
 
 
 def test_default_model_configuration_has_expected_resolution():
@@ -56,3 +66,42 @@ def test_submission_validation_and_runtime_projection():
     submission.loc[0, "ACL"] = 2.0
     with pytest.raises(ValueError, match="between 0 and 1"):
         validate_submission(submission, sample)
+
+
+def test_build_submission_reorders_predictions_and_rejects_missing_ids():
+    sample = pd.DataFrame(
+        {
+            ID_COLUMN: ["a", "b"],
+            **{label: [0.5, 0.5] for label in LABELS},
+        }
+    )
+    predictions = sample.iloc[::-1].reset_index(drop=True)
+    predictions.loc[0, "ACL"] = 0.8
+    predictions.loc[1, "ACL"] = 0.2
+
+    result = build_submission(predictions, sample)
+
+    assert result[ID_COLUMN].tolist() == ["a", "b"]
+    assert result["ACL"].tolist() == [0.2, 0.8]
+
+    with pytest.raises(ValueError, match="do not match"):
+        build_submission(predictions.iloc[:1], sample)
+
+
+def test_slice_sampling_normalization_and_fingerprint_are_deterministic():
+    indices = sample_slice_indices(20, 5, 0.2, 0.8)
+    assert indices.tolist() == [4, 7, 10, 12, 15]
+    assert sample_slice_indices(0, 5, 0.0, 1.0).size == 0
+
+    constant = robust_normalize(np.ones((2, 3), dtype=np.float32))
+    assert np.isfinite(constant).all()
+    assert np.count_nonzero(constant) == 0
+
+    first = feature_config_fingerprint(checkpoint_sha256="abc")
+    second = feature_config_fingerprint(checkpoint_sha256="abc")
+    changed = feature_config_fingerprint(
+        DINOModelConfig(image_size=280),
+        checkpoint_sha256="abc",
+    )
+    assert first == second
+    assert first != changed

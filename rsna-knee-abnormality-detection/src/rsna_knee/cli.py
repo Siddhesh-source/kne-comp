@@ -111,6 +111,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=8,
         help="number of concurrent API requests",
     )
+    label.add_argument("--shard-index", type=int, default=0)
+    label.add_argument("--shard-count", type=int, default=1)
+    label.add_argument(
+        "--completed",
+        type=Path,
+        action="append",
+        default=[],
+        help="additional JSONL file whose report groups should be skipped",
+    )
 
     evaluate = commands.add_parser(
         "evaluate-labels",
@@ -301,6 +310,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             limit=args.limit,
             subset=args.subset,
             workers=args.workers,
+            shard_index=args.shard_index,
+            shard_count=args.shard_count,
+            completed_paths=args.completed,
         )
         print(json.dumps(result, indent=2))
         return 0

@@ -135,6 +135,52 @@ def test_output_file_lock_rejects_overlapping_writer(tmp_path):
                 pass
 
 
+def test_label_reports_supports_disjoint_shards_and_completed_files(
+    tmp_path, monkeypatch
+):
+    train = pd.DataFrame(
+        {
+            ID_COLUMN: [str(index) for index in range(12)],
+            REPORT_COLUMN: [f"report {index}" for index in range(12)],
+        }
+    )
+    config = LLMConfig(
+        provider="test",
+        model="test-model",
+        base_url="https://example.invalid/v1",
+        api_key="not-a-real-key",
+    )
+    parsed = ReportLabels.from_dict(valid_payload())
+    monkeypatch.setattr(
+        "rsna_knee.report_labeler._label_one",
+        lambda client, report: (parsed, "response-id", {}),
+    )
+    shard_paths = [tmp_path / f"shard-{index}.jsonl" for index in range(4)]
+
+    for index, path in enumerate(shard_paths):
+        label_reports(
+            train,
+            config,
+            path,
+            shard_index=index,
+            shard_count=4,
+        )
+
+    shard_groups = [completed_report_groups(path) for path in shard_paths]
+    assert len(set.union(*shard_groups)) == 12
+    assert sum(len(groups) for groups in shard_groups) == 12
+
+    skipped = label_reports(
+        train,
+        config,
+        tmp_path / "new-output.jsonl",
+        shard_index=0,
+        shard_count=4,
+        completed_paths=[shard_paths[0]],
+    )
+    assert skipped["written"] == 0
+
+
 def test_evaluate_report_labels_scores_verified_rows(tmp_path):
     reports = ["negative one", "positive one", "negative two", "positive two"]
     train = pd.DataFrame(

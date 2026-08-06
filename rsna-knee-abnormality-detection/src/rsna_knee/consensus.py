@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import Counter
 from pathlib import Path
 
 import pandas as pd
@@ -122,6 +123,10 @@ def write_consensus_table(
         gold_weight=gold_weight,
     )
     table.to_csv(output_path, index=False)
+    primary_provenance = _provenance(primary_path)
+    specialist_provenance = [
+        _provenance(path) for path in specialist_paths
+    ]
 
     metadata = {
         "version": CONSENSUS_VERSION,
@@ -130,6 +135,8 @@ def write_consensus_table(
         "specialist_passes": len(specialist_paths),
         "specialist_weight": specialist_weight,
         "gold_weight": gold_weight,
+        "primary_provenance": primary_provenance,
+        "specialist_provenance": specialist_provenance,
         "primary_sha256": _sha256(primary_path),
         "specialist_sha256": [_sha256(path) for path in specialist_paths],
         "output_sha256": _sha256(output_path),
@@ -148,3 +155,21 @@ def _sha256(path: str | Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _provenance(path: str | Path) -> dict[str, object]:
+    records = list(iter_label_records(path))
+    models = Counter(str(record.get("model", "missing")) for record in records)
+    providers = Counter(
+        str(record.get("provider", "missing")) for record in records
+    )
+    prompts = Counter(
+        str(record.get("prompt_version", "missing")) for record in records
+    )
+    return {
+        "records": len(records),
+        "models": dict(models),
+        "providers": dict(providers),
+        "prompt_versions": dict(prompts),
+        "mixed_models": len(models) > 1,
+    }

@@ -46,6 +46,7 @@ def primary_quality_report(
         for label in LABELS
     }
     usage = _usage_summary(records)
+    provenance = _provenance_summary(records)
 
     return {
         "expected_unique_reports": len(expected),
@@ -58,6 +59,7 @@ def primary_quality_report(
         "status_counts": status_counts,
         "probability_summary": probability_summary,
         "confidence_summary": confidence_summary,
+        "provenance": provenance,
         "usage": usage,
     }
 
@@ -93,6 +95,7 @@ def specialist_quality_report(
                     )
                     for label in SPECIALIST_LABELS
                 },
+                "provenance": _provenance_summary(records),
                 "usage": _usage_summary(records),
             }
         )
@@ -156,4 +159,23 @@ def _usage_summary(records: list[dict[str, object]]) -> dict[str, int]:
         "prompt_tokens": prompt,
         "completion_tokens": completion,
         "total_tokens": total,
+    }
+
+
+def _provenance_summary(
+    records: list[dict[str, object]],
+) -> dict[str, object]:
+    providers = Counter(
+        str(record.get("provider", "missing")) for record in records
+    )
+    models = Counter(str(record.get("model", "missing")) for record in records)
+    prompt_versions = Counter(
+        str(record.get("prompt_version", "missing")) for record in records
+    )
+    return {
+        "providers": dict(providers),
+        "models": dict(models),
+        "prompt_versions": dict(prompt_versions),
+        "mixed_models": len(models) > 1,
+        "mixed_prompt_versions": len(prompt_versions) > 1,
     }
