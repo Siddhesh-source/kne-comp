@@ -9,8 +9,10 @@ from rsna_knee.label_schema import ReportLabels
 from rsna_knee.report_labeler import (
     completed_report_groups,
     estimate_labeling,
+    evaluate_report_labels,
     label_reports,
 )
+from rsna_knee.folds import report_group
 
 
 def valid_payload():
@@ -94,3 +96,41 @@ def test_label_reports_is_append_only_and_resumable(tmp_path, monkeypatch):
     lines = output.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 2
     assert all("report" not in json.loads(line) for line in lines)
+
+
+def test_evaluate_report_labels_scores_verified_rows(tmp_path):
+    reports = ["negative one", "positive one", "negative two", "positive two"]
+    train = pd.DataFrame(
+        {
+            ID_COLUMN: ["a", "b", "c", "d"],
+            REPORT_COLUMN: reports,
+            **{
+                label: [0.0, 1.0, 0.0, 1.0]
+                for label in LABELS
+            },
+        }
+    )
+    output = tmp_path / "gold.jsonl"
+    records = []
+    for index, report in enumerate(reports):
+        payload = valid_payload()
+        probability = 0.1 if index % 2 == 0 else 0.9
+        status = "absent" if index % 2 == 0 else "present"
+        for label in LABELS:
+            payload["labels"][label] = {
+                "probability": probability,
+                "confidence": 0.9,
+                "status": status,
+                "evidence": report,
+            }
+        records.append({"report_group": report_group(report), **payload})
+    output.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+
+    result = evaluate_report_labels(train, output)
+
+    assert result["verified_scored"] == 4
+    assert result["coverage"] == 1.0
+    assert result["macro_auc"] == pytest.approx(1.0)

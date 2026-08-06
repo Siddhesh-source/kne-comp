@@ -11,11 +11,12 @@ from typing import Iterable
 import pandas as pd
 
 from .config import LLMConfig
-from .constants import ID_COLUMN, REPORT_COLUMN
+from .constants import ID_COLUMN, LABELS, REPORT_COLUMN
 from .folds import normalize_report, report_group
 from .label_prompt import PROMPT_VERSION, SYSTEM_PROMPT, build_user_prompt
 from .label_schema import ReportLabels
 from .llm_client import LLMRequestError, OpenAICompatibleClient
+from .metrics import competition_auc
 
 
 def unique_reports(train: pd.DataFrame) -> pd.DataFrame:
@@ -80,8 +81,14 @@ def label_reports(
     config: LLMConfig,
     output_path: str | Path,
     limit: int | None = None,
+    subset: str = "all",
 ) -> dict[str, int]:
     """Label unique reports, resuming from records already in output_path."""
+    if subset == "gold":
+        train = train.loc[train.loc[:, LABELS].notna().all(axis=1)].copy()
+    elif subset != "all":
+        raise ValueError("subset must be 'all' or 'gold'")
+
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     completed = completed_report_groups(output_path)
@@ -126,6 +133,51 @@ def iter_label_records(path: str | Path) -> Iterable[dict[str, object]]:
         for line in handle:
             if line.strip():
                 yield json.loads(line)
+
+
+def evaluate_report_labels(
+    train: pd.DataFrame,
+    labels_path: str | Path,
+) -> dict[str, object]:
+    """Evaluate report-derived probabilities against verified training labels."""
+    gold = train.loc[train.loc[:, LABELS].notna().all(axis=1)].copy()
+    gold["report_group"] = gold[REPORT_COLUMN].map(report_group)
+
+    records: dict[str, ReportLabels] = {}
+    for record in iter_label_records(labels_path):
+        group = str(record["report_group"])
+        records[group] = ReportLabels.from_dict(record)
+
+    available = gold["report_group"].isin(records)
+    scored = gold.loc[available].copy()
+    if scored.empty:
+        raise ValueError("no verified studies have matching LLM labels")
+
+    predictions = pd.DataFrame(
+        [
+            {
+                label: records[row.report_group].labels[label].probability
+                for label in LABELS
+            }
+            for row in scored.itertuples(index=False)
+        ],
+        index=scored.index,
+    )
+    report = competition_auc(scored.loc[:, LABELS], predictions)
+    class_counts = {
+        label: {
+            "positive": int(scored[label].sum()),
+            "negative": int(len(scored) - scored[label].sum()),
+        }
+        for label in LABELS
+    }
+    return {
+        "verified_total": len(gold),
+        "verified_scored": len(scored),
+        "coverage": len(scored) / len(gold),
+        **report.as_dict(),
+        "class_counts": class_counts,
+    }
 
 
 def _label_one(

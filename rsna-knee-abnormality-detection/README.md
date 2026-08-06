@@ -60,4 +60,18 @@ rsna-knee label-reports `
 Label output is append-only and resumable. The source report text is not copied
 into the output. Omitting `--limit` processes every remaining unique report.
 
+Audit the labeler against the 58 verified studies before a full run:
+
+```powershell
+rsna-knee label-reports `
+  --env-file ..\.env `
+  --data-dir ..\data\raw `
+  --output ..\data\derived\llm-labels-gold-v1.jsonl `
+  --subset gold
+
+rsna-knee evaluate-labels `
+  --data-dir ..\data\raw `
+  --labels ..\data\derived\llm-labels-gold-v1.jsonl
+```
+
 These commands are CPU-only and do not process MRI images.

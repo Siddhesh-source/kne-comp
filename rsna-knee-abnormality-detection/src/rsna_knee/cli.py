@@ -16,7 +16,11 @@ from .experiments import initialize_registry
 from .folds import make_report_grouped_folds, validate_fold_assignments
 from .llm_client import OpenAICompatibleClient
 from .metrics import competition_auc
-from .report_labeler import estimate_labeling, label_reports
+from .report_labeler import (
+    estimate_labeling,
+    evaluate_report_labels,
+    label_reports,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -73,6 +77,19 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="maximum new unique reports to label in this run",
     )
+    label.add_argument(
+        "--subset",
+        choices=("all", "gold"),
+        default="all",
+        help="label all reports or only studies with verified labels",
+    )
+
+    evaluate = commands.add_parser(
+        "evaluate-labels",
+        help="score report-derived probabilities against verified labels",
+    )
+    evaluate.add_argument("--data-dir", type=Path, required=True)
+    evaluate.add_argument("--labels", type=Path, required=True)
     return parser
 
 
@@ -171,8 +188,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             config=load_llm_config(args.env_file),
             output_path=args.output,
             limit=args.limit,
+            subset=args.subset,
         )
         print(json.dumps(result, indent=2))
+        return 0
+
+    if args.command == "evaluate-labels":
+        train, _ = read_metadata(args.data_dir)
+        print(
+            json.dumps(
+                evaluate_report_labels(train, args.labels),
+                indent=2,
+            )
+        )
         return 0
 
     raise AssertionError(f"unhandled command: {args.command}")
