@@ -1,0 +1,45 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local data and generated artifacts
+data/*
+!data/.gitkeep
+!data/derived/
+data/derived/*
+!data/derived/.gitkeep
+references/
+artifacts/
+outputs/
+checkpoints/
+models/
+submissions/
+
+# Model weights and large arrays
+*.ckpt
+*.onnx
+*.pt
+*.pth
+*.safetensors
+*.npy
+*.npz
+*.parquet
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
