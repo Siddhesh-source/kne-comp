@@ -11,8 +11,11 @@ from rsna_knee.dicom_extraction import (
     extract_study_features,
     load_dicom_slices,
     partition_study_ids,
+    pool_dino_intermediate_layers,
     pool_dino_output,
+    preprocess_slice_triplets,
     preprocess_slices,
+    select_slot_triplets,
     select_slot_slices,
 )
 from rsna_knee.model_config import DEFAULT_SLOTS, ProtocolSlot
@@ -108,6 +111,29 @@ def test_preprocessing_resizes_and_applies_imagenet_normalization():
     assert not torch.equal(images[:, 0], images[:, 1])
 
 
+def test_triplets_use_adjacent_slices_and_preserve_channel_context():
+    slot = ProtocolSlot("test", "Sagittal", 1, 2, 0.0, 1.0)
+    slices = [
+        dataset(np.full((4, 4), index, dtype=np.float32), instance=index)
+        for index in range(5)
+    ]
+
+    triplets = select_slot_triplets(slices, slot)
+    images = preprocess_slice_triplets(
+        triplets,
+        image_size=8,
+        crop_fraction=0.75,
+    )
+
+    assert [
+        [item.instance_number for item in triplet]
+        for triplet in triplets
+    ] == [[0, 0, 1], [3, 4, 4]]
+    assert images.shape == (2, 3, 8, 8)
+    assert torch.isfinite(images).all()
+    assert not torch.equal(images[:, 0], images[:, 2])
+
+
 def test_dino_output_pooling_concatenates_cls_mean_and_max():
     cls = torch.tensor([[1.0, 2.0]])
     patches = torch.tensor([[[0.0, 4.0], [2.0, 0.0]]])
@@ -127,6 +153,22 @@ def test_dino_output_pooling_concatenates_cls_mean_and_max():
     assert torch.equal(token_pooled, expected)
 
 
+def test_intermediate_pooling_concatenates_each_layer_cls_and_mean():
+    first_patches = torch.tensor([[[1.0, 3.0], [3.0, 5.0]]])
+    second_patches = first_patches + 10
+    pooled = pool_dino_intermediate_layers(
+        [
+            (first_patches, torch.tensor([[7.0, 8.0]])),
+            (second_patches, torch.tensor([[9.0, 10.0]])),
+        ]
+    )
+
+    assert torch.equal(
+        pooled,
+        torch.tensor([[7.0, 8.0, 2.0, 4.0, 9.0, 10.0, 12.0, 14.0]]),
+    )
+
+
 class FakeDino(torch.nn.Module):
     def forward_features(self, images):
         batch = len(images)
@@ -136,6 +178,27 @@ class FakeDino(torch.nn.Module):
             "x_norm_clstoken": cls,
             "x_norm_patchtokens": patches,
         }
+
+
+class FakeIntermediateDino(torch.nn.Module):
+    def get_intermediate_layers(
+        self,
+        images,
+        *,
+        n,
+        return_class_token,
+    ):
+        assert return_class_token is True
+        outputs = []
+        layers = range(n) if isinstance(n, int) else n
+        for layer in layers:
+            cls = torch.full(
+                (len(images), 4),
+                float(layer),
+                device=images.device,
+            )
+            outputs.append((cls[:, None, :] + 1, cls))
+        return outputs
 
 
 def test_study_extraction_pads_to_46_and_preserves_valid_mask():
@@ -164,6 +227,36 @@ def test_study_extraction_pads_to_46_and_preserves_valid_mask():
     assert valid_mask[24]
     assert not valid_mask[3:24].any()
     assert np.count_nonzero(features[~valid_mask]) == 0
+
+
+def test_v2_study_extraction_uses_triplets_and_four_layers():
+    slot = ProtocolSlot("test", "Sagittal", 1, 2, 0.0, 1.0)
+    slot_series = {
+        "test": [
+            dataset(
+                np.arange(16).reshape(4, 4) + index,
+                instance=index,
+            )
+            for index in range(4)
+        ]
+    }
+
+    features, valid_mask = extract_study_features(
+        slot_series,
+        FakeIntermediateDino(),
+        slots=(slot,),
+        image_size=16,
+        batch_size=2,
+        expected_feature_dim=24,
+        input_mode="2p5d",
+        crop_fraction=0.9,
+        intermediate_layers=(8, 11),
+        include_patch_max=True,
+    )
+
+    assert features.shape == (2, 24)
+    assert valid_mask.tolist() == [True, True]
+    assert np.isfinite(features).all()
 
 
 def test_build_study_images_handles_completely_missing_study():

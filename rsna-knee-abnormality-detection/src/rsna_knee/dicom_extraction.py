@@ -251,6 +251,104 @@ def select_slot_slices(
     return [ordered[int(index)] for index in indices]
 
 
+def select_slot_triplets(
+    items: Sequence[str | PathLike[str] | Any],
+    slot: ProtocolSlot,
+) -> list[tuple[DicomSlice, DicomSlice, DicomSlice]]:
+    """Select center slices and return their immediate ordered neighbours."""
+    paths = items and all(isinstance(item, (str, PathLike)) for item in items)
+    ordered = _order_dicom_slices(
+        [
+            _read_dicom_header(item, source_index=index)
+            for index, item in enumerate(items)
+        ]
+    ) if paths else load_dicom_slices(items)
+    centers = sample_slice_indices(
+        len(ordered),
+        slot.slice_budget,
+        slot.window_start,
+        slot.window_end,
+    )
+    neighbour_indices = [
+        (
+            max(0, int(center) - 1),
+            int(center),
+            min(len(ordered) - 1, int(center) + 1),
+        )
+        for center in centers
+    ]
+    if paths:
+        needed = sorted({index for group in neighbour_indices for index in group})
+        decoded = {
+            index: decode_dicom_slice(ordered[index].source)
+            for index in needed
+        }
+    else:
+        decoded = {index: item for index, item in enumerate(ordered)}
+    return [
+        tuple(decoded[index] for index in group)
+        for group in neighbour_indices
+    ]
+
+
+def _center_crop_channels(
+    values: np.ndarray,
+    fraction: float,
+) -> np.ndarray:
+    if not 0 < fraction <= 1:
+        raise ValueError("crop fraction must be between zero and one")
+    height, width = values.shape[-2:]
+    crop_height = max(1, int(round(height * fraction)))
+    crop_width = max(1, int(round(width * fraction)))
+    top = (height - crop_height) // 2
+    left = (width - crop_width) // 2
+    return values[..., top : top + crop_height, left : left + crop_width]
+
+
+def preprocess_slice_triplets(
+    triplets: Sequence[tuple[DicomSlice, DicomSlice, DicomSlice]],
+    *,
+    image_size: int = DEFAULT_DINO_CONFIG.image_size,
+    crop_fraction: float = 0.9,
+) -> Any:
+    """Normalize adjacent slices as RGB channels for 2.5D DINO input."""
+    if image_size < 1:
+        raise ValueError("image_size must be positive")
+    try:
+        import torch
+        import torch.nn.functional as functional
+    except ImportError as exc:
+        raise RuntimeError("torch is required for DINO preprocessing") from exc
+    if not triplets:
+        return torch.empty((0, 3, image_size, image_size), dtype=torch.float32)
+    shapes = {
+        item.pixels.shape
+        for triplet in triplets
+        for item in triplet
+    }
+    if len(shapes) != 1:
+        raise ValueError("selected DICOM slices must have matching pixel dimensions")
+    normalized = np.stack(
+        [
+            robust_normalize(
+                np.stack([item.pixels for item in triplet], axis=0)
+            )
+            for triplet in triplets
+        ],
+        axis=0,
+    )
+    normalized = _center_crop_channels(normalized, crop_fraction)
+    tensor = functional.interpolate(
+        torch.from_numpy(normalized),
+        size=(image_size, image_size),
+        mode="bilinear",
+        align_corners=False,
+    )
+    mean = tensor.new_tensor(IMAGENET_MEAN).view(1, 3, 1, 1)
+    std = tensor.new_tensor(IMAGENET_STD).view(1, 3, 1, 1)
+    return (tensor - mean) / std
+
+
 def preprocess_slices(
     slices: Sequence[DicomSlice],
     *,
@@ -328,15 +426,63 @@ def pool_dino_output(output: Any) -> Any:
     )
 
 
+def pool_dino_intermediate_layers(
+    outputs: Sequence[Any],
+    *,
+    include_patch_max: bool = False,
+) -> Any:
+    """Concatenate CLS and patch-mean embeddings from multiple DINO blocks."""
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError("torch is required to pool DINO output") from exc
+    if not outputs:
+        raise ValueError("at least one intermediate layer is required")
+    pooled = []
+    for output in outputs:
+        if (
+            not isinstance(output, (tuple, list))
+            or len(output) != 2
+        ):
+            raise ValueError(
+                "intermediate output must contain patch and CLS tensors"
+            )
+        patches, cls = output
+        if cls.ndim != 2 or patches.ndim != 3:
+            raise ValueError("intermediate DINO tensors have invalid ranks")
+        if (
+            cls.shape[0] != patches.shape[0]
+            or cls.shape[-1] != patches.shape[-1]
+            or patches.shape[1] < 1
+        ):
+            raise ValueError("intermediate DINO tensors are incompatible")
+        pooled.extend((cls, patches.mean(dim=1)))
+        if include_patch_max:
+            pooled.append(patches.max(dim=1).values)
+    return torch.cat(pooled, dim=-1)
+
+
 def extract_slice_features(
     model: Any,
     images: Any,
     *,
     batch_size: int = 16,
+    intermediate_layers: int | Sequence[int] = 0,
+    include_patch_max: bool = False,
+    output_dim: int = DEFAULT_FEATURE_DIM,
 ) -> Any:
     """Run deterministic batched inference and pool DINO token outputs."""
-    if batch_size < 1:
-        raise ValueError("batch_size must be positive")
+    invalid_layers = (
+        isinstance(intermediate_layers, int) and intermediate_layers < 0
+    ) or (
+        not isinstance(intermediate_layers, int)
+        and (
+            not intermediate_layers
+            or any(index < 0 for index in intermediate_layers)
+        )
+    )
+    if batch_size < 1 or invalid_layers or output_dim < 1:
+        raise ValueError("batch, layer, and output dimensions must be valid")
     try:
         import torch
     except ImportError as exc:
@@ -344,7 +490,7 @@ def extract_slice_features(
     if images.ndim != 4 or images.shape[1] != 3:
         raise ValueError("images must have shape [slices, 3, height, width]")
     if len(images) == 0:
-        return torch.empty((0, DEFAULT_FEATURE_DIM), dtype=torch.float32)
+        return torch.empty((0, output_dim), dtype=torch.float32)
 
     try:
         device = next(model.parameters()).device
@@ -373,13 +519,28 @@ def extract_slice_features(
                     else nullcontext()
                 )
                 with precision:
-                    output = (
-                        model.forward_features(batch)
-                        if hasattr(model, "forward_features")
-                        else model(batch)
-                    )
+                    if intermediate_layers:
+                        if not hasattr(model, "get_intermediate_layers"):
+                            raise ValueError(
+                                "model does not expose intermediate layers"
+                            )
+                        output = pool_dino_intermediate_layers(
+                            model.get_intermediate_layers(
+                                batch,
+                                n=intermediate_layers,
+                                return_class_token=True,
+                            ),
+                            include_patch_max=include_patch_max,
+                        )
+                    else:
+                        raw_output = (
+                            model.forward_features(batch)
+                            if hasattr(model, "forward_features")
+                            else model(batch)
+                        )
+                        output = pool_dino_output(raw_output)
                 batches.append(
-                    pool_dino_output(output).detach().cpu().float()
+                    output.detach().cpu().float()
                 )
     finally:
         if was_training and hasattr(model, "train"):
@@ -392,12 +553,16 @@ def build_study_images(
     *,
     slots: Sequence[ProtocolSlot] = DEFAULT_SLOTS,
     image_size: int = DEFAULT_DINO_CONFIG.image_size,
+    input_mode: str = "single",
+    crop_fraction: float = 1.0,
 ) -> tuple[Any, Any]:
     """Build a fixed slot-aligned image tensor and valid-slice mask."""
     try:
         import torch
     except ImportError as exc:
         raise RuntimeError("torch is required for DINO preprocessing") from exc
+    if input_mode not in {"single", "2p5d"}:
+        raise ValueError("input_mode must be single or 2p5d")
     total_slices = sum(slot.slice_budget for slot in slots)
     images = torch.zeros(
         (total_slices, 3, image_size, image_size), dtype=torch.float32
@@ -405,8 +570,18 @@ def build_study_images(
     valid_mask = torch.zeros(total_slices, dtype=torch.bool)
     def prepare_slot(slot: ProtocolSlot) -> Any:
         items = slot_series.get(slot.name, ())
-        selected = select_slot_slices(items, slot) if items else []
-        return preprocess_slices(selected, image_size=image_size)
+        if not items:
+            return preprocess_slices([], image_size=image_size)
+        if input_mode == "2p5d":
+            return preprocess_slice_triplets(
+                select_slot_triplets(items, slot),
+                image_size=image_size,
+                crop_fraction=crop_fraction,
+            )
+        return preprocess_slices(
+            select_slot_slices(items, slot),
+            image_size=image_size,
+        )
 
     worker_count = min(4, len(slots))
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
@@ -429,15 +604,28 @@ def extract_study_features(
     image_size: int = DEFAULT_DINO_CONFIG.image_size,
     batch_size: int = 16,
     expected_feature_dim: int = DEFAULT_FEATURE_DIM,
+    input_mode: str = "single",
+    crop_fraction: float = 1.0,
+    intermediate_layers: int | Sequence[int] = 0,
+    include_patch_max: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Extract a fixed-size study tensor, preserving protocol slot offsets."""
     if expected_feature_dim < 1:
         raise ValueError("expected_feature_dim must be positive")
     images, mask = build_study_images(
-        slot_series, slots=slots, image_size=image_size
+        slot_series,
+        slots=slots,
+        image_size=image_size,
+        input_mode=input_mode,
+        crop_fraction=crop_fraction,
     )
     valid_features = extract_slice_features(
-        model, images[mask], batch_size=batch_size
+        model,
+        images[mask],
+        batch_size=batch_size,
+        intermediate_layers=intermediate_layers,
+        include_patch_max=include_patch_max,
+        output_dim=expected_feature_dim,
     )
     if len(valid_features) and valid_features.shape[1] != expected_feature_dim:
         raise ValueError(

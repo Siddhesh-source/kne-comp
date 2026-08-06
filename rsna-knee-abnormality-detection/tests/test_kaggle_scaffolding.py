@@ -11,7 +11,11 @@ from rsna_knee.dino_features import (
     sample_slice_indices,
     write_feature_shard,
 )
-from rsna_knee.model_config import DEFAULT_DINO_CONFIG, DINOModelConfig
+from rsna_knee.model_config import (
+    DEFAULT_DINO_CONFIG,
+    DINO_2P5D_L9L12_CONFIG,
+    DINOModelConfig,
+)
 from rsna_knee.protocols import (
     build_protocol_manifest,
     summarize_protocol_manifest,
@@ -26,6 +30,8 @@ from rsna_knee.submission import (
 def test_default_model_configuration_has_expected_resolution():
     assert DEFAULT_DINO_CONFIG.image_size == 336
     assert DEFAULT_DINO_CONFIG.tokens_per_slice == 576
+    assert DINO_2P5D_L9L12_CONFIG.version == "dino336-2p5d-l9l12-v2"
+    assert len(DINO_2P5D_L9L12_CONFIG.embedding_parts) == 6
 
 
 def test_protocol_manifest_selects_expected_slots():
@@ -106,8 +112,13 @@ def test_slice_sampling_normalization_and_fingerprint_are_deterministic():
         DINOModelConfig(image_size=280),
         checkpoint_sha256="abc",
     )
+    v2 = feature_config_fingerprint(
+        DINO_2P5D_L9L12_CONFIG,
+        checkpoint_sha256="abc",
+    )
     assert first == second
     assert first != changed
+    assert first != v2
 
 
 def test_feature_shard_round_trip_and_fingerprint_validation(tmp_path):

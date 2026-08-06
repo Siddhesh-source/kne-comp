@@ -18,6 +18,7 @@ from .model_config import (
 )
 
 PREPROCESSING_VERSION = "dicom-v1"
+V2_PREPROCESSING_VERSION = "dicom-2p5d-center90-v2"
 
 
 def sample_slice_indices(
@@ -69,7 +70,11 @@ def feature_config_fingerprint(
 ) -> str:
     """Hash all settings that affect extracted feature compatibility."""
     payload = {
-        "preprocessing_version": PREPROCESSING_VERSION,
+        "preprocessing_version": (
+            V2_PREPROCESSING_VERSION
+            if config.version == "dino336-2p5d-l9l12-v2"
+            else PREPROCESSING_VERSION
+        ),
         "model": config.as_dict(),
         "slots": [
             {

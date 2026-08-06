@@ -375,8 +375,11 @@ def extract_feature_shard(
     shard_index: int,
     shard_count: int,
     batch_size: int = 64,
+    feature_version: str = "dino336-v1",
 ) -> dict[str, object]:
     """Extract one deterministic, disjoint training feature shard."""
+    import time
+
     import numpy as np
     import pandas as pd
     import torch
@@ -390,6 +393,19 @@ def extract_feature_shard(
         feature_config_fingerprint,
         write_feature_shard,
     )
+    from rsna_knee.model_config import (
+        DEFAULT_DINO_CONFIG,
+        DINO_2P5D_L9L12_CONFIG,
+    )
+
+    configs = {
+        DEFAULT_DINO_CONFIG.version: DEFAULT_DINO_CONFIG,
+        DINO_2P5D_L9L12_CONFIG.version: DINO_2P5D_L9L12_CONFIG,
+    }
+    if feature_version not in configs:
+        raise ValueError(f"unsupported feature version: {feature_version}")
+    config = configs[feature_version]
+    v2 = feature_version == DINO_2P5D_L9L12_CONFIG.version
 
     data_volume.reload()
     manifest_path = (
@@ -407,7 +423,7 @@ def extract_feature_shard(
     output = (
         ARTIFACT_MOUNT
         / "features"
-        / "dino336-v1"
+        / feature_version
         / "train"
         / f"features-{shard_index:03d}-of-{shard_count:03d}.npz"
     )
@@ -423,7 +439,8 @@ def extract_feature_shard(
     if len(checkpoints) != 1:
         raise RuntimeError("cached DINOv2 checkpoint is missing or ambiguous")
     fingerprint = feature_config_fingerprint(
-        checkpoint_sha256=_sha256(checkpoints[0])
+        config=config,
+        checkpoint_sha256=_sha256(checkpoints[0]),
     )
     model = _load_dino_model("cuda")
     grouped = {
@@ -434,6 +451,7 @@ def extract_feature_shard(
     embeddings: list[np.ndarray] = []
     masks: list[np.ndarray] = []
     failures: list[dict[str, str]] = []
+    started_at = time.perf_counter()
     print(
         f"shard {shard_index}/{shard_count}: starting "
         f"{len(study_ids)} studies",
@@ -450,7 +468,13 @@ def extract_feature_shard(
             features, mask = extract_study_features(
                 slot_series,
                 model,
+                image_size=config.image_size,
                 batch_size=batch_size,
+                expected_feature_dim=2304 if v2 else 1152,
+                input_mode="2p5d" if v2 else "single",
+                crop_fraction=0.9 if v2 else 1.0,
+                intermediate_layers=(8, 11) if v2 else 0,
+                include_patch_max=v2,
             )
             completed_ids.append(study_id)
             embeddings.append(features)
@@ -484,10 +508,17 @@ def extract_feature_shard(
     )
     artifact_volume.commit()
     torch.cuda.empty_cache()
+    elapsed_seconds = time.perf_counter() - started_at
     return {
         "shard_index": shard_index,
+        "feature_version": feature_version,
         "status": "written",
         "failures": len(failures),
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "seconds_per_study": round(
+            elapsed_seconds / len(study_ids),
+            3,
+        ),
         **metadata,
     }
 
@@ -507,6 +538,7 @@ def extract_feature_shard(
 def extract_test_features(
     batch_size: int = 64,
     overwrite: bool = False,
+    feature_version: str = "dino336-v1",
 ) -> dict[str, object]:
     """Extract one reusable feature file for every visible test study."""
     import numpy as np
@@ -519,7 +551,20 @@ def extract_test_features(
         feature_config_fingerprint,
         write_feature_shard,
     )
+    from rsna_knee.model_config import (
+        DEFAULT_DINO_CONFIG,
+        DINO_2P5D_L9L12_CONFIG,
+    )
     from rsna_knee.protocols import build_protocol_manifest
+
+    configs = {
+        DEFAULT_DINO_CONFIG.version: DEFAULT_DINO_CONFIG,
+        DINO_2P5D_L9L12_CONFIG.version: DINO_2P5D_L9L12_CONFIG,
+    }
+    if feature_version not in configs:
+        raise ValueError(f"unsupported feature version: {feature_version}")
+    config = configs[feature_version]
+    v2 = feature_version == DINO_2P5D_L9L12_CONFIG.version
 
     data_volume.reload()
     series_path = DATA_MOUNT / "raw" / "test_series.csv"
@@ -527,7 +572,7 @@ def extract_test_features(
     output = (
         ARTIFACT_MOUNT
         / "features"
-        / "dino336-v1"
+        / feature_version
         / "test"
         / "features-test.npz"
     )
@@ -548,7 +593,8 @@ def extract_test_features(
     if len(checkpoints) != 1:
         raise RuntimeError("cached DINOv2 checkpoint is missing or ambiguous")
     fingerprint = feature_config_fingerprint(
-        checkpoint_sha256=_sha256(checkpoints[0])
+        config=config,
+        checkpoint_sha256=_sha256(checkpoints[0]),
     )
     model = _load_dino_model("cuda")
     completed_ids: list[str] = []
@@ -566,7 +612,13 @@ def extract_test_features(
             features, mask = extract_study_features(
                 slot_series,
                 model,
+                image_size=config.image_size,
                 batch_size=batch_size,
+                expected_feature_dim=2304 if v2 else 1152,
+                input_mode="2p5d" if v2 else "single",
+                crop_fraction=0.9 if v2 else 1.0,
+                intermediate_layers=(8, 11) if v2 else 0,
+                include_patch_max=v2,
             )
             completed_ids.append(study_id)
             embeddings.append(features)
@@ -925,6 +977,7 @@ def unpack_data(shard_count: int = 16) -> None:
 def extract(
     shard_count: int = 256,
     batch_size: int = 64,
+    feature_version: str = "dino336-v1",
     start_shard: int = 0,
     end_shard: int = -1,
     additional_start_shard: int = -1,
@@ -958,7 +1011,7 @@ def extract(
     results = list(
         extract_feature_shard.starmap(
             (
-                (shard_index, shard_count, batch_size)
+                (shard_index, shard_count, batch_size, feature_version)
                 for shard_index in shard_indices
             ),
             order_outputs=False,
@@ -977,6 +1030,7 @@ def extract_one(
     shard_index: int = 0,
     shard_count: int = 256,
     batch_size: int = 32,
+    feature_version: str = "dino336-v1",
 ) -> None:
     if not 1 <= shard_count <= 256:
         raise ValueError("shard_count must be between 1 and 256")
@@ -986,17 +1040,23 @@ def extract_one(
         shard_index,
         shard_count,
         batch_size,
+        feature_version,
     )
     print(json.dumps(result, indent=2))
 
 
 @app.local_entrypoint()
-def extract_test(batch_size: int = 64, overwrite: bool = False) -> None:
+def extract_test(
+    batch_size: int = 64,
+    overwrite: bool = False,
+    feature_version: str = "dino336-v1",
+) -> None:
     print(
         json.dumps(
             extract_test_features.remote(
                 batch_size=batch_size,
                 overwrite=overwrite,
+                feature_version=feature_version,
             ),
             indent=2,
         )
