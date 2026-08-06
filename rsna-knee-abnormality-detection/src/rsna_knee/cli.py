@@ -245,6 +245,19 @@ def build_parser() -> argparse.ArgumentParser:
     train_heads.add_argument("--learning-rate", type=float, default=3e-4)
     train_heads.add_argument("--device", default="cuda")
     train_heads.add_argument("--seed", type=int, default=20260806)
+
+    predict_heads = commands.add_parser(
+        "predict-fold-heads",
+        help="predict a feature set with saved fold heads",
+    )
+    predict_heads.add_argument(
+        "--feature-shard", type=Path, required=True, action="append"
+    )
+    predict_heads.add_argument("--models", type=Path, required=True)
+    predict_heads.add_argument("--fingerprint", required=True)
+    predict_heads.add_argument("--output", type=Path, required=True)
+    predict_heads.add_argument("--device", default="cuda")
+    predict_heads.add_argument("--batch-size", type=int, default=32)
     return parser
 
 
@@ -531,6 +544,37 @@ def main(argv: Sequence[str] | None = None) -> int:
                     device=args.device,
                     seed=args.seed,
                 ),
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.command == "predict-fold-heads":
+        from .fold_heads import predict_saved_heads
+
+        features = load_feature_shards(
+            args.feature_shard,
+            args.fingerprint,
+        )
+        predictions = predict_saved_heads(
+            study_ids=features["study_ids"],
+            embeddings=features["embeddings"],
+            valid_mask=features["valid_mask"],
+            model_dir=args.models,
+            feature_fingerprint=args.fingerprint,
+            device=args.device,
+            batch_size=args.batch_size,
+        )
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        predictions.to_csv(args.output, index=False)
+        print(
+            json.dumps(
+                {
+                    "output": str(args.output),
+                    "rows": len(predictions),
+                    "models": str(args.models),
+                    "feature_fingerprint": args.fingerprint,
+                },
                 indent=2,
             )
         )

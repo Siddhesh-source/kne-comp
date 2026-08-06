@@ -6,6 +6,7 @@ torch = pytest.importorskip("torch")
 from rsna_knee.constants import LABELS
 from rsna_knee.fold_heads import (
     MaskedAttentionHead,
+    predict_saved_heads,
     train_fold_heads,
     weighted_soft_bce,
 )
@@ -84,3 +85,26 @@ def test_tiny_fold_training_writes_models_oof_and_metadata(tmp_path):
     assert (tmp_path / "fold-1.pt").exists()
     assert (tmp_path / "oof.csv").exists()
     assert (tmp_path / "metadata.json").exists()
+
+    predictions = predict_saved_heads(
+        data.study_ids,
+        data.embeddings,
+        data.valid_mask,
+        tmp_path,
+        "fingerprint",
+        device="cpu",
+        batch_size=2,
+    )
+    assert predictions.shape == (4, len(LABELS) + 1)
+    assert predictions.loc[:, LABELS].to_numpy().min() >= 0
+    assert predictions.loc[:, LABELS].to_numpy().max() <= 1
+
+    with pytest.raises(ValueError, match="fingerprints"):
+        predict_saved_heads(
+            data.study_ids,
+            data.embeddings,
+            data.valid_mask,
+            tmp_path,
+            "wrong",
+            device="cpu",
+        )

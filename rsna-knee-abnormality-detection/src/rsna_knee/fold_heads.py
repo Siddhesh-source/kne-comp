@@ -235,6 +235,64 @@ def train_fold_heads(
     return metadata
 
 
+def predict_saved_heads(
+    study_ids: np.ndarray,
+    embeddings: np.ndarray,
+    valid_mask: np.ndarray,
+    model_dir: str | Path,
+    feature_fingerprint: str,
+    *,
+    device: str = "cuda",
+    batch_size: int = 32,
+) -> pd.DataFrame:
+    """Load compatible fold heads and average their probabilities."""
+    model_dir = Path(model_dir)
+    metadata_path = model_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if metadata.get("feature_fingerprint") != feature_fingerprint:
+        raise ValueError("model and feature fingerprints do not match")
+    if metadata.get("labels") != list(LABELS):
+        raise ValueError("model label order does not match competition labels")
+    if embeddings.ndim != 3 or valid_mask.shape != embeddings.shape[:2]:
+        raise ValueError("feature arrays have incompatible shapes")
+    if len(study_ids) != len(embeddings):
+        raise ValueError("study IDs and feature rows do not match")
+
+    torch_device = torch.device(device)
+    probabilities: list[np.ndarray] = []
+    for fold in metadata.get("folds", []):
+        checkpoint = torch.load(
+            model_dir / str(fold["model"]),
+            map_location=torch_device,
+            weights_only=True,
+        )
+        if checkpoint.get("feature_fingerprint") != feature_fingerprint:
+            raise ValueError("fold checkpoint fingerprint does not match")
+        if checkpoint.get("labels") != list(LABELS):
+            raise ValueError("fold checkpoint label order does not match")
+        model = MaskedAttentionHead(
+            feature_dim=int(checkpoint["feature_dim"]),
+            hidden_dim=int(checkpoint["hidden_dim"]),
+            label_count=len(LABELS),
+        ).to(torch_device)
+        model.load_state_dict(checkpoint["state_dict"])
+        probabilities.append(
+            _predict_probabilities(
+                model,
+                embeddings,
+                valid_mask,
+                batch_size,
+                torch_device,
+            )
+        )
+    if not probabilities:
+        raise ValueError("model metadata contains no fold checkpoints")
+    averaged = np.stack(probabilities).mean(axis=0)
+    result = pd.DataFrame(averaged, columns=LABELS)
+    result.insert(0, ID_COLUMN, np.asarray(study_ids, dtype=str))
+    return result
+
+
 def _predict_probabilities(
     model: MaskedAttentionHead,
     embeddings: np.ndarray,
