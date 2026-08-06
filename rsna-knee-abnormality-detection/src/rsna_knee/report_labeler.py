@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Iterable
@@ -82,18 +83,23 @@ def label_reports(
     output_path: str | Path,
     limit: int | None = None,
     subset: str = "all",
+    workers: int = 1,
 ) -> dict[str, int]:
     """Label unique reports, resuming from records already in output_path."""
     if subset == "gold":
         train = train.loc[train.loc[:, LABELS].notna().all(axis=1)].copy()
     elif subset != "all":
         raise ValueError("subset must be 'all' or 'gold'")
+    if workers < 1:
+        raise ValueError("workers must be at least 1")
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     completed = completed_report_groups(output_path)
     reports = unique_reports(train)
-    pending = reports.loc[~reports["report_group"].isin(completed)]
+    scope_groups = set(reports["report_group"])
+    completed_in_scope = completed.intersection(scope_groups)
+    pending = reports.loc[~reports["report_group"].isin(completed_in_scope)]
     if limit is not None:
         if limit < 1:
             raise ValueError("limit must be at least 1")
@@ -101,30 +107,65 @@ def label_reports(
 
     client = OpenAICompatibleClient(config)
     written = 0
+    failures: list[tuple[str, Exception]] = []
+
+    def write_result(
+        handle: object,
+        row: object,
+        result: tuple[ReportLabels, str | None, dict[str, object]],
+    ) -> None:
+        nonlocal written
+        labels, response_id, usage = result
+        record = {
+            "report_group": row.report_group,
+            "study_count": int(row.study_count),
+            "prompt_version": PROMPT_VERSION,
+            "provider": config.provider,
+            "model": config.model,
+            "response_id": response_id,
+            "usage": usage,
+            "created_at": datetime.now(UTC).isoformat(),
+            **labels.as_dict(),
+        }
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+        written += 1
+
     with output_path.open("a", encoding="utf-8") as handle:
-        for row in pending.itertuples(index=False):
-            labels, response_id, usage = _label_one(client, row.report)
-            record = {
-                "report_group": row.report_group,
-                "study_count": int(row.study_count),
-                "prompt_version": PROMPT_VERSION,
-                "provider": config.provider,
-                "model": config.model,
-                "response_id": response_id,
-                "usage": usage,
-                "created_at": datetime.now(UTC).isoformat(),
-                **labels.as_dict(),
-            }
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-            written += 1
+        rows = list(pending.itertuples(index=False))
+        if workers == 1:
+            for row in rows:
+                try:
+                    write_result(handle, row, _label_one(client, row.report))
+                except Exception as exc:
+                    failures.append((row.report_group, exc))
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures: dict[Future[object], object] = {
+                    executor.submit(_label_one, client, row.report): row
+                    for row in rows
+                }
+                for future in as_completed(futures):
+                    row = futures[future]
+                    try:
+                        write_result(handle, row, future.result())
+                    except Exception as exc:
+                        failures.append((row.report_group, exc))
+
+    if failures:
+        first_group, first_error = failures[0]
+        raise LLMRequestError(
+            f"{len(failures)} report requests failed; successful records were "
+            f"saved. First failure group={first_group}, "
+            f"error={type(first_error).__name__}: {first_error}"
+        ) from first_error
 
     return {
         "total_unique_reports": len(reports),
-        "already_completed": len(completed),
+        "already_completed": len(completed_in_scope),
         "written": written,
-        "remaining": len(reports) - len(completed) - written,
+        "remaining": len(reports) - len(completed_in_scope) - written,
     }
 
 

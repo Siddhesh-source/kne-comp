@@ -83,6 +83,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="all",
         help="label all reports or only studies with verified labels",
     )
+    label.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="number of concurrent API requests",
+    )
 
     evaluate = commands.add_parser(
         "evaluate-labels",
@@ -189,6 +195,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_path=args.output,
             limit=args.limit,
             subset=args.subset,
+            workers=args.workers,
         )
         print(json.dumps(result, indent=2))
         return 0

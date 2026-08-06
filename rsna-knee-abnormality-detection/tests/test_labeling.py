@@ -98,6 +98,33 @@ def test_label_reports_is_append_only_and_resumable(tmp_path, monkeypatch):
     assert all("report" not in json.loads(line) for line in lines)
 
 
+def test_label_reports_supports_parallel_workers(tmp_path, monkeypatch):
+    train = pd.DataFrame(
+        {
+            ID_COLUMN: ["a", "b", "c"],
+            REPORT_COLUMN: ["ACL intact", "Effusion", "No fracture"],
+        }
+    )
+    output = tmp_path / "parallel.jsonl"
+    config = LLMConfig(
+        provider="test",
+        model="test-model",
+        base_url="https://example.invalid/v1",
+        api_key="not-a-real-key",
+    )
+    parsed = ReportLabels.from_dict(valid_payload())
+    monkeypatch.setattr(
+        "rsna_knee.report_labeler._label_one",
+        lambda client, report: (parsed, "response-id", {"total_tokens": 10}),
+    )
+
+    result = label_reports(train, config, output, workers=3)
+
+    assert result["written"] == 3
+    assert result["remaining"] == 0
+    assert len(completed_report_groups(output)) == 3
+
+
 def test_evaluate_report_labels_scores_verified_rows(tmp_path):
     reports = ["negative one", "positive one", "negative two", "positive two"]
     train = pd.DataFrame(

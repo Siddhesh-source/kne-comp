@@ -54,11 +54,13 @@ rsna-knee label-reports `
   --env-file ..\.env `
   --data-dir ..\data\raw `
   --output ..\data\derived\llm-labels-v1.jsonl `
+  --workers 8 `
   --limit 5
 ```
 
 Label output is append-only and resumable. The source report text is not copied
-into the output. Omitting `--limit` processes every remaining unique report.
+into the output. Independent requests run concurrently. Omitting `--limit`
+processes every remaining unique report.
 
 Audit the labeler against the 58 verified studies before a full run:
 
