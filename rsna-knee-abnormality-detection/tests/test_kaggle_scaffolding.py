@@ -5,8 +5,10 @@ import numpy as np
 from rsna_knee.constants import ID_COLUMN, LABELS
 from rsna_knee.dino_features import (
     feature_config_fingerprint,
+    read_feature_shard,
     robust_normalize,
     sample_slice_indices,
+    write_feature_shard,
 )
 from rsna_knee.model_config import DEFAULT_DINO_CONFIG, DINOModelConfig
 from rsna_knee.protocols import (
@@ -105,3 +107,26 @@ def test_slice_sampling_normalization_and_fingerprint_are_deterministic():
     )
     assert first == second
     assert first != changed
+
+
+def test_feature_shard_round_trip_and_fingerprint_validation(tmp_path):
+    path = tmp_path / "features-000.npz"
+    embeddings = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
+    mask = np.array([[True, True, False], [True, False, False]])
+
+    metadata = write_feature_shard(
+        path,
+        ["study-a", "study-b"],
+        embeddings,
+        mask,
+        "fingerprint-a",
+    )
+    loaded = read_feature_shard(path, "fingerprint-a")
+
+    assert metadata["studies"] == 2
+    assert loaded["study_ids"].tolist() == ["study-a", "study-b"]
+    assert loaded["embeddings"].dtype == np.float16
+    assert loaded["valid_mask"].tolist() == mask.tolist()
+
+    with pytest.raises(ValueError, match="fingerprint"):
+        read_feature_shard(path, "fingerprint-b")

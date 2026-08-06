@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Sequence
 
@@ -95,3 +96,83 @@ def sha256_file(path: str | Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def write_feature_shard(
+    output_path: str | Path,
+    study_ids: Sequence[str],
+    embeddings: np.ndarray,
+    valid_mask: np.ndarray,
+    fingerprint: str,
+) -> dict[str, object]:
+    """Atomically write one compressed, self-describing feature shard."""
+    output_path = Path(output_path)
+    ids = np.asarray(study_ids, dtype=str)
+    features = np.asarray(embeddings)
+    mask = np.asarray(valid_mask, dtype=bool)
+    if features.ndim != 3:
+        raise ValueError("embeddings must have shape [studies, slices, features]")
+    if mask.shape != features.shape[:2]:
+        raise ValueError("valid_mask shape must match embedding studies/slices")
+    if len(ids) != len(features):
+        raise ValueError("study_ids and embeddings must have equal length")
+    if len(set(ids.tolist())) != len(ids):
+        raise ValueError("study_ids must be unique within a shard")
+    if not fingerprint:
+        raise ValueError("fingerprint is required")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_path.with_suffix(output_path.suffix + ".tmp")
+    with temporary.open("wb") as handle:
+        np.savez_compressed(
+            handle,
+            study_ids=ids,
+            embeddings=features.astype(np.float16),
+            valid_mask=mask,
+            fingerprint=np.asarray(fingerprint),
+        )
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(output_path)
+    return {
+        "path": str(output_path),
+        "studies": len(ids),
+        "slices": int(features.shape[1]),
+        "feature_dim": int(features.shape[2]),
+        "fingerprint": fingerprint,
+        "sha256": sha256_file(output_path),
+    }
+
+
+def read_feature_shard(
+    path: str | Path,
+    expected_fingerprint: str | None = None,
+) -> dict[str, np.ndarray | str]:
+    """Read and validate a feature shard before training or inference."""
+    with np.load(Path(path), allow_pickle=False) as data:
+        required = {
+            "study_ids",
+            "embeddings",
+            "valid_mask",
+            "fingerprint",
+        }
+        missing = required.difference(data.files)
+        if missing:
+            raise ValueError(f"feature shard is missing arrays: {sorted(missing)}")
+        result = {name: data[name].copy() for name in required}
+    fingerprint = str(result["fingerprint"].item())
+    if expected_fingerprint and fingerprint != expected_fingerprint:
+        raise ValueError("feature shard fingerprint does not match configuration")
+    features = result["embeddings"]
+    mask = result["valid_mask"]
+    ids = result["study_ids"]
+    if features.ndim != 3 or mask.shape != features.shape[:2]:
+        raise ValueError("feature shard arrays have incompatible shapes")
+    if len(ids) != len(features) or len(set(ids.tolist())) != len(ids):
+        raise ValueError("feature shard study IDs are invalid")
+    return {
+        "study_ids": ids,
+        "embeddings": features,
+        "valid_mask": mask,
+        "fingerprint": fingerprint,
+    }
