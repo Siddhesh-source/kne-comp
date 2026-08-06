@@ -14,7 +14,9 @@ from .constants import ID_COLUMN, LABELS
 from .data import read_metadata, summarize_metadata
 from .experiments import initialize_registry
 from .folds import make_report_grouped_folds, validate_fold_assignments
+from .llm_client import OpenAICompatibleClient
 from .metrics import competition_auc
+from .report_labeler import estimate_labeling, label_reports
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -25,6 +27,11 @@ def build_parser() -> argparse.ArgumentParser:
         "check-config", help="show non-secret LLM configuration"
     )
     config.add_argument("--env-file", type=Path)
+
+    smoke = commands.add_parser(
+        "smoke-llm", help="make a tiny non-competition API request"
+    )
+    smoke.add_argument("--env-file", type=Path, required=True)
 
     inspect = commands.add_parser(
         "inspect-data", help="validate and summarize competition metadata"
@@ -49,6 +56,23 @@ def build_parser() -> argparse.ArgumentParser:
         "init-registry", help="create the experiment registry"
     )
     registry.add_argument("--output", type=Path, required=True)
+
+    estimate = commands.add_parser(
+        "estimate-labeling", help="estimate unique reports and input size"
+    )
+    estimate.add_argument("--data-dir", type=Path, required=True)
+
+    label = commands.add_parser(
+        "label-reports", help="label reports into a resumable JSONL file"
+    )
+    label.add_argument("--env-file", type=Path, required=True)
+    label.add_argument("--data-dir", type=Path, required=True)
+    label.add_argument("--output", type=Path, required=True)
+    label.add_argument(
+        "--limit",
+        type=int,
+        help="maximum new unique reports to label in this run",
+    )
     return parser
 
 
@@ -57,6 +81,24 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "check-config":
         print(json.dumps(load_llm_config(args.env_file).safe_summary(), indent=2))
+        return 0
+
+    if args.command == "smoke-llm":
+        client = OpenAICompatibleClient(load_llm_config(args.env_file))
+        response = client.complete_json(
+            system="Return valid JSON only.",
+            user='Return exactly {"status":"ok"}.',
+        )
+        print(
+            json.dumps(
+                {
+                    "content": response.content,
+                    "response_id": response.response_id,
+                    "usage": response.usage,
+                },
+                indent=2,
+            )
+        )
         return 0
 
     if args.command == "inspect-data":
@@ -115,6 +157,22 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "init-registry":
         print(initialize_registry(args.output))
+        return 0
+
+    if args.command == "estimate-labeling":
+        train, _ = read_metadata(args.data_dir)
+        print(json.dumps(estimate_labeling(train), indent=2))
+        return 0
+
+    if args.command == "label-reports":
+        train, _ = read_metadata(args.data_dir)
+        result = label_reports(
+            train=train,
+            config=load_llm_config(args.env_file),
+            output_path=args.output,
+            limit=args.limit,
+        )
+        print(json.dumps(result, indent=2))
         return 0
 
     raise AssertionError(f"unhandled command: {args.command}")

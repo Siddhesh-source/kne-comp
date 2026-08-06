@@ -39,4 +39,25 @@ Check LLM settings without printing the API key:
 rsna-knee check-config --env-file ..\.env
 ```
 
+Test API connectivity without sending competition data:
+
+```powershell
+rsna-knee smoke-llm --env-file ..\.env
+```
+
+Estimate and label a small report batch:
+
+```powershell
+rsna-knee estimate-labeling --data-dir ..\data\raw
+
+rsna-knee label-reports `
+  --env-file ..\.env `
+  --data-dir ..\data\raw `
+  --output ..\data\derived\llm-labels-v1.jsonl `
+  --limit 5
+```
+
+Label output is append-only and resumable. The source report text is not copied
+into the output. Omitting `--limit` processes every remaining unique report.
+
 These commands are CPU-only and do not process MRI images.
