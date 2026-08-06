@@ -13,6 +13,7 @@ import pandas as pd
 from .config import LLMConfig
 from .constants import LABELS, REPORT_COLUMN
 from .folds import report_group
+from .file_lock import lock_output_argument
 from .llm_client import LLMRequestError, OpenAICompatibleClient
 from .metrics import competition_auc
 from .report_labeler import (
@@ -28,6 +29,7 @@ from .specialist_prompt import (
 from .specialist_schema import SPECIALIST_LABELS, SpecialistLabels
 
 
+@lock_output_argument
 def label_specialist_reports(
     train: pd.DataFrame,
     config: LLMConfig,

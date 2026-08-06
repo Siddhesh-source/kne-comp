@@ -6,6 +6,7 @@ import pytest
 from rsna_knee.config import LLMConfig
 from rsna_knee.constants import ID_COLUMN, LABELS, REPORT_COLUMN
 from rsna_knee.label_schema import ReportLabels
+from rsna_knee.file_lock import output_file_lock
 from rsna_knee.report_labeler import (
     completed_report_groups,
     estimate_labeling,
@@ -123,6 +124,15 @@ def test_label_reports_supports_parallel_workers(tmp_path, monkeypatch):
     assert result["written"] == 3
     assert result["remaining"] == 0
     assert len(completed_report_groups(output)) == 3
+
+
+def test_output_file_lock_rejects_overlapping_writer(tmp_path):
+    output = tmp_path / "labels.jsonl"
+
+    with output_file_lock(output):
+        with pytest.raises(RuntimeError, match="another labeling process"):
+            with output_file_lock(output):
+                pass
 
 
 def test_evaluate_report_labels_scores_verified_rows(tmp_path):

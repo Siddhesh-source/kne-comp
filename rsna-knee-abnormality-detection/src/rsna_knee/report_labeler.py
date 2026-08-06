@@ -14,6 +14,7 @@ import pandas as pd
 from .config import LLMConfig
 from .constants import ID_COLUMN, LABELS, REPORT_COLUMN
 from .folds import normalize_report, report_group
+from .file_lock import lock_output_argument
 from .label_prompt import PROMPT_VERSION, SYSTEM_PROMPT, build_user_prompt
 from .label_schema import ReportLabels
 from .llm_client import LLMRequestError, OpenAICompatibleClient
@@ -77,6 +78,7 @@ def completed_report_groups(path: str | Path) -> set[str]:
     return completed
 
 
+@lock_output_argument
 def label_reports(
     train: pd.DataFrame,
     config: LLMConfig,
