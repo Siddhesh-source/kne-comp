@@ -19,6 +19,8 @@ class AlignedTrainingData:
     targets: np.ndarray
     weights: np.ndarray
     folds: np.ndarray
+    fractional_positions: np.ndarray | None = None
+    slot_ids: np.ndarray | None = None
 
 
 def align_training_data(
@@ -28,6 +30,8 @@ def align_training_data(
     targets: pd.DataFrame,
     folds: pd.DataFrame,
     n_splits: int = 5,
+    fractional_positions: np.ndarray | None = None,
+    slot_ids: np.ndarray | None = None,
 ) -> AlignedTrainingData:
     """Align all artifacts by StudyInstanceUID and reject silent omissions."""
     ids = np.asarray(feature_ids, dtype=str)
@@ -35,6 +39,23 @@ def align_training_data(
         raise ValueError("feature arrays have incompatible shapes")
     if len(ids) != len(embeddings) or len(set(ids.tolist())) != len(ids):
         raise ValueError("feature study IDs are invalid")
+    if (fractional_positions is None) != (slot_ids is None):
+        raise ValueError("fractional positions and slot IDs must be provided together")
+    positions = None
+    slots = None
+    if fractional_positions is not None and slot_ids is not None:
+        positions = np.asarray(fractional_positions, dtype=np.float32)
+        slots = np.asarray(slot_ids, dtype=np.int16)
+        if positions.shape != valid_mask.shape or slots.shape != valid_mask.shape:
+            raise ValueError("positional metadata must match valid_mask")
+        if (
+            not np.isfinite(positions).all()
+            or np.any((positions[valid_mask] < 0) | (positions[valid_mask] > 1))
+            or np.any(positions[~valid_mask] != -1)
+            or np.any(slots[valid_mask] < 0)
+            or np.any(slots[~valid_mask] != -1)
+        ):
+            raise ValueError("positional metadata values are invalid")
 
     target_columns = [ID_COLUMN, *LABELS, *[f"{label}__weight" for label in LABELS]]
     missing_targets = set(target_columns).difference(targets.columns)
@@ -79,4 +100,6 @@ def align_training_data(
         targets=target_values,
         weights=weight_values,
         folds=fold_values,
+        fractional_positions=positions,
+        slot_ids=slots,
     )

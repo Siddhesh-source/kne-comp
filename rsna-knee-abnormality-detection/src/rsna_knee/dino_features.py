@@ -18,7 +18,9 @@ from .model_config import (
 )
 
 PREPROCESSING_VERSION = "dicom-v1"
-V2_PREPROCESSING_VERSION = "dicom-2p5d-center90-v2"
+V2_PREPROCESSING_VERSION = (
+    "dicom-2p5d-series-p01-p995-phys130-laterality-position-v3"
+)
 
 
 def sample_slice_indices(
@@ -72,7 +74,7 @@ def feature_config_fingerprint(
     payload = {
         "preprocessing_version": (
             V2_PREPROCESSING_VERSION
-            if config.version == "dino336-2p5d-l9l12-v2"
+            if config.version == "dino336-2p5d-l9l12-phys130-v3"
             else PREPROCESSING_VERSION
         ),
         "model": config.as_dict(),
@@ -109,6 +111,9 @@ def write_feature_shard(
     embeddings: np.ndarray,
     valid_mask: np.ndarray,
     fingerprint: str,
+    *,
+    fractional_positions: np.ndarray | None = None,
+    slot_ids: np.ndarray | None = None,
 ) -> dict[str, object]:
     """Atomically write one compressed, self-describing feature shard."""
     output_path = Path(output_path)
@@ -125,6 +130,26 @@ def write_feature_shard(
         raise ValueError("study_ids must be unique within a shard")
     if not fingerprint:
         raise ValueError("fingerprint is required")
+    if (fractional_positions is None) != (slot_ids is None):
+        raise ValueError("fractional_positions and slot_ids must be provided together")
+    extra_arrays: dict[str, np.ndarray] = {}
+    if fractional_positions is not None and slot_ids is not None:
+        positions = np.asarray(fractional_positions, dtype=np.float32)
+        slots = np.asarray(slot_ids, dtype=np.int16)
+        if positions.shape != mask.shape or slots.shape != mask.shape:
+            raise ValueError("position and slot arrays must match valid_mask")
+        if (
+            not np.isfinite(positions).all()
+            or np.any((positions[mask] < 0) | (positions[mask] > 1))
+            or np.any(positions[~mask] != -1)
+            or np.any(slots[mask] < 0)
+            or np.any(slots[~mask] != -1)
+        ):
+            raise ValueError("position or slot metadata values are invalid")
+        extra_arrays = {
+            "fractional_positions": positions,
+            "slot_ids": slots,
+        }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = output_path.with_suffix(output_path.suffix + ".tmp")
@@ -135,6 +160,7 @@ def write_feature_shard(
             embeddings=features.astype(np.float16),
             valid_mask=mask,
             fingerprint=np.asarray(fingerprint),
+            **extra_arrays,
         )
         handle.flush()
         os.fsync(handle.fileno())
@@ -164,7 +190,13 @@ def read_feature_shard(
         missing = required.difference(data.files)
         if missing:
             raise ValueError(f"feature shard is missing arrays: {sorted(missing)}")
-        result = {name: data[name].copy() for name in required}
+        optional = {"fractional_positions", "slot_ids"}.intersection(data.files)
+        if optional and optional != {"fractional_positions", "slot_ids"}:
+            raise ValueError("feature shard has incomplete positional metadata")
+        result = {
+            name: data[name].copy()
+            for name in required.union(optional)
+        }
     fingerprint = str(result["fingerprint"].item())
     if expected_fingerprint and fingerprint != expected_fingerprint:
         raise ValueError("feature shard fingerprint does not match configuration")
@@ -175,12 +207,28 @@ def read_feature_shard(
         raise ValueError("feature shard arrays have incompatible shapes")
     if len(ids) != len(features) or len(set(ids.tolist())) != len(ids):
         raise ValueError("feature shard study IDs are invalid")
-    return {
+    response: dict[str, np.ndarray | str] = {
         "study_ids": ids,
         "embeddings": features,
         "valid_mask": mask,
         "fingerprint": fingerprint,
     }
+    if "fractional_positions" in result:
+        positions = np.asarray(result["fractional_positions"], dtype=np.float32)
+        slots = np.asarray(result["slot_ids"], dtype=np.int16)
+        if positions.shape != mask.shape or slots.shape != mask.shape:
+            raise ValueError("feature shard positional metadata shapes are invalid")
+        if (
+            not np.isfinite(positions).all()
+            or np.any((positions[mask] < 0) | (positions[mask] > 1))
+            or np.any(positions[~mask] != -1)
+            or np.any(slots[mask] < 0)
+            or np.any(slots[~mask] != -1)
+        ):
+            raise ValueError("feature shard positional metadata values are invalid")
+        response["fractional_positions"] = positions
+        response["slot_ids"] = slots
+    return response
 
 
 def load_feature_shards(
@@ -196,6 +244,9 @@ def load_feature_shards(
     fingerprints = {str(shard["fingerprint"]) for shard in shards}
     if len(fingerprints) != 1:
         raise ValueError("feature shards have mixed fingerprints")
+    positional = ["fractional_positions" in shard for shard in shards]
+    if any(positional) and not all(positional):
+        raise ValueError("feature shards have mixed positional schemas")
     embeddings = np.concatenate(
         [np.asarray(shard["embeddings"]) for shard in shards],
         axis=0,
@@ -211,9 +262,21 @@ def load_feature_shards(
     if len(set(ids.tolist())) != len(ids):
         raise ValueError("feature shards contain duplicate study IDs")
     order = np.argsort(ids, kind="stable")
-    return {
+    response: dict[str, np.ndarray | str] = {
         "study_ids": ids[order],
         "embeddings": embeddings[order],
         "valid_mask": masks[order],
         "fingerprint": fingerprints.pop(),
     }
+    if all(positional):
+        positions = np.concatenate(
+            [np.asarray(shard["fractional_positions"]) for shard in shards],
+            axis=0,
+        )
+        slots = np.concatenate(
+            [np.asarray(shard["slot_ids"]) for shard in shards],
+            axis=0,
+        )
+        response["fractional_positions"] = positions[order]
+        response["slot_ids"] = slots[order]
+    return response

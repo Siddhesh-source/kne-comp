@@ -30,6 +30,8 @@ def dataset(
     slope=1,
     intercept=0,
     photometric="MONOCHROME2",
+    pixel_spacing=None,
+    laterality=None,
 ):
     values = {
         "pixel_array": np.asarray(value),
@@ -44,6 +46,10 @@ def dataset(
         values["ImagePositionPatient"] = position
     if orientation is not None:
         values["ImageOrientationPatient"] = orientation
+    if pixel_spacing is not None:
+        values["PixelSpacing"] = pixel_spacing
+    if laterality is not None:
+        values["ImageLaterality"] = laterality
     return SimpleNamespace(**values)
 
 
@@ -283,3 +289,114 @@ def test_partition_studies_is_sorted_balanced_and_validated():
         partition_study_ids(identifiers, 3, 3)
     with pytest.raises(ValueError, match="unique"):
         partition_study_ids(["a", "a"], 0, 1)
+
+
+def test_series_window_produces_consistent_normalization_across_triplets():
+    slot = ProtocolSlot("test", "Sagittal", 1, 2, 0.0, 1.0)
+    slices = [
+        dataset(np.full((8, 8), 50 + index, dtype=np.float32), instance=index)
+        for index in range(5)
+    ]
+    triplets = select_slot_triplets(slices, slot)
+    images = preprocess_slice_triplets(triplets, image_size=8, crop_fraction=1.0)
+
+    assert images.shape == (2, 3, 8, 8)
+    assert torch.isfinite(images).all()
+    assert not torch.equal(images[0, 0], images[0, 2])
+
+
+def test_physical_crop_uses_spacing_and_foreground_centroid():
+    slot = ProtocolSlot("test", "Sagittal", 1, 1, 0.0, 1.0)
+    pixels = np.zeros((64, 64), dtype=np.float32)
+    pixels[16:48, 16:48] = 100.0
+    slices = [
+        dataset(pixels, instance=index, pixel_spacing=[0.5, 0.5])
+        for index in range(3)
+    ]
+    triplets = select_slot_triplets(slices, slot)
+    images = preprocess_slice_triplets(
+        triplets,
+        image_size=32,
+        physical_crop_mm=130.0,
+        crop_fraction=0.9,
+    )
+
+    assert images.shape == (1, 3, 32, 32)
+    assert torch.isfinite(images).all()
+    assert images[0, 1, 16, 16] > 0.5
+
+
+def test_physical_crop_falls_back_to_center_crop_without_spacing():
+    slot = ProtocolSlot("test", "Sagittal", 1, 1, 0.0, 1.0)
+    pixels = np.zeros((64, 64), dtype=np.float32)
+    pixels[16:48, 16:48] = 100.0
+    slices = [dataset(pixels, instance=index) for index in range(3)]
+    triplets = select_slot_triplets(slices, slot)
+    images = preprocess_slice_triplets(
+        triplets,
+        image_size=32,
+        physical_crop_mm=130.0,
+        crop_fraction=0.8,
+    )
+
+    assert images.shape == (1, 3, 32, 32)
+    assert torch.isfinite(images).all()
+
+
+def test_right_knee_sagittal_reverses_slice_order():
+    slot = ProtocolSlot("test", "Sagittal", 1, 3, 0.0, 1.0)
+    slices = [
+        dataset(np.full((4, 4), index, dtype=np.float32), instance=index, laterality="R")
+        for index in range(5)
+    ]
+    triplets = select_slot_triplets(slices, slot)
+    assert [triplet[1].instance_number for triplet in triplets] == [4, 2, 0]
+
+
+def test_right_knee_coronal_flips_horizontal():
+    slot = ProtocolSlot("test", "Coronal", 1, 1, 0.0, 1.0)
+    pixels = np.zeros((8, 8), dtype=np.float32)
+    pixels[:, :4] = 100.0
+    slices = [
+        dataset(pixels + index, instance=index, laterality="R")
+        for index in range(3)
+    ]
+    triplets = select_slot_triplets(slices, slot)
+    images = preprocess_slice_triplets(
+        triplets, image_size=8, crop_fraction=1.0, plane="Coronal"
+    )
+    assert images.shape == (1, 3, 8, 8)
+    assert (images[0, 1, :, -1] > images[0, 1, :, 0]).all()
+
+
+def test_extraction_returns_positional_metadata():
+    slot = ProtocolSlot("test", "Sagittal", 1, 2, 0.0, 1.0)
+    slot_series = {
+        "test": [
+            dataset(np.arange(16).reshape(4, 4) + index, instance=index)
+            for index in range(4)
+        ]
+    }
+    features, mask, positions, slot_ids = extract_study_features(
+        slot_series,
+        FakeIntermediateDino(),
+        slots=(slot,),
+        image_size=16,
+        batch_size=2,
+        expected_feature_dim=24,
+        input_mode="2p5d",
+        physical_crop_mm=130.0,
+        intermediate_layers=(8, 11),
+        include_patch_max=True,
+        return_metadata=True,
+    )
+
+    assert features.shape == (2, 24)
+    assert valid_mask_function(mask)
+    assert positions.shape == (2,)
+    assert 0 <= positions[0] <= 1
+    assert slot_ids[0] == 0
+
+
+def valid_mask_function(m):
+    return m.shape == (2,) and m.all()

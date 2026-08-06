@@ -30,7 +30,7 @@ from rsna_knee.submission import (
 def test_default_model_configuration_has_expected_resolution():
     assert DEFAULT_DINO_CONFIG.image_size == 336
     assert DEFAULT_DINO_CONFIG.tokens_per_slice == 576
-    assert DINO_2P5D_L9L12_CONFIG.version == "dino336-2p5d-l9l12-v2"
+    assert DINO_2P5D_L9L12_CONFIG.version == "dino336-2p5d-l9l12-phys130-v3"
     assert len(DINO_2P5D_L9L12_CONFIG.embedding_parts) == 6
 
 
@@ -166,3 +166,71 @@ def test_multiple_feature_shards_load_in_study_order(tmp_path):
 
     assert loaded["study_ids"].tolist() == ["study-a", "study-b"]
     assert loaded["embeddings"][0].sum() == 0
+
+
+def test_feature_shard_round_trip_with_positional_metadata(tmp_path):
+    path = tmp_path / "features-pos.npz"
+    embeddings = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
+    mask = np.array([[True, True, False], [True, False, False]])
+    positions = np.array(
+        [[0.0, 0.5, -1.0], [0.25, -1.0, -1.0]], dtype=np.float32
+    )
+    slot_ids = np.array([[0, 0, -1], [1, -1, -1]], dtype=np.int16)
+
+    write_feature_shard(
+        path,
+        ["study-a", "study-b"],
+        embeddings,
+        mask,
+        "fp-pos",
+        fractional_positions=positions,
+        slot_ids=slot_ids,
+    )
+    loaded = read_feature_shard(path, "fp-pos")
+
+    assert loaded["fractional_positions"].tolist() == positions.tolist()
+    assert loaded["slot_ids"].tolist() == slot_ids.tolist()
+
+    with pytest.raises(ValueError, match="together"):
+        write_feature_shard(
+            path,
+            ["study-a"],
+            np.ones((1, 2, 3)),
+            np.ones((1, 2), dtype=bool),
+            "fp-bad",
+            fractional_positions=np.zeros((1, 2), dtype=np.float32),
+        )
+
+
+def test_feature_shard_rejects_invalid_positional_values(tmp_path):
+    path = tmp_path / "features-bad.npz"
+    embeddings = np.ones((1, 2, 3), dtype=np.float32)
+    mask = np.ones((1, 2), dtype=bool)
+    bad_positions = np.array([[0.5, 5.0]], dtype=np.float32)
+    slot_ids = np.array([[0, 0]], dtype=np.int16)
+
+    with pytest.raises(ValueError, match="position or slot"):
+        write_feature_shard(
+            path,
+            ["study-a"],
+            embeddings,
+            mask,
+            "fp-bad",
+            fractional_positions=bad_positions,
+            slot_ids=slot_ids,
+        )
+
+
+def test_v1_shard_remains_readable_without_positional_metadata(tmp_path):
+    path = tmp_path / "features-v1.npz"
+    write_feature_shard(
+        path,
+        ["study-a"],
+        np.ones((1, 2, 3)),
+        np.ones((1, 2), dtype=bool),
+        "fp-v1",
+    )
+    loaded = read_feature_shard(path, "fp-v1")
+
+    assert "fractional_positions" not in loaded
+    assert "slot_ids" not in loaded

@@ -54,7 +54,7 @@ DEFAULT_SLOTS = (
 DEFAULT_DINO_CONFIG = DINOModelConfig()
 
 DINO_2P5D_L9L12_CONFIG = DINOModelConfig(
-    version="dino336-2p5d-l9l12-v2",
+    version="dino336-2p5d-l9l12-phys130-v3",
     embedding_parts=(
         "block9_cls",
         "block9_patch_mean",

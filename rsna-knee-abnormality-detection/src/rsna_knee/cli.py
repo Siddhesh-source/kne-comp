@@ -539,6 +539,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             targets=pd.read_csv(args.targets),
             folds=pd.read_csv(args.folds),
             n_splits=args.splits,
+            fractional_positions=features.get("fractional_positions"),
+            slot_ids=features.get("slot_ids"),
         )
         print(
             json.dumps(

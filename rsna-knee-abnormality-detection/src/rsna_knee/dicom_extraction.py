@@ -30,6 +30,8 @@ class DicomSlice:
     position: np.ndarray | None
     orientation: np.ndarray | None
     source: str
+    pixel_spacing: np.ndarray | None = None
+    laterality: str | None = None
 
 
 def _numeric_vector(value: object, length: int) -> np.ndarray | None:
@@ -50,6 +52,15 @@ def _optional_float(value: object) -> float | None:
     except (TypeError, ValueError):
         return None
     return result if np.isfinite(result) else None
+
+
+def _normalize_laterality(value: object) -> str | None:
+    normalized = str(value or "").strip().upper()
+    if normalized in {"L", "LEFT"}:
+        return "L"
+    if normalized in {"R", "RIGHT"}:
+        return "R"
+    return None
 
 
 def _read_dataset(item: str | PathLike[str] | Any) -> tuple[Any, str]:
@@ -109,6 +120,16 @@ def decode_dicom_slice(
             getattr(dataset, "ImageOrientationPatient", None), 6
         ),
         source=source,
+        pixel_spacing=_numeric_vector(
+            getattr(dataset, "PixelSpacing", None), 2
+        ),
+        laterality=_normalize_laterality(
+            getattr(
+                dataset,
+                "ImageLaterality",
+                getattr(dataset, "Laterality", None),
+            )
+        ),
     )
 
 
@@ -189,6 +210,9 @@ def _read_dicom_header(
                 "InstanceNumber",
                 "ImagePositionPatient",
                 "ImageOrientationPatient",
+                "PixelSpacing",
+                "ImageLaterality",
+                "Laterality",
             ],
         )
     except Exception as exc:
@@ -205,6 +229,16 @@ def _read_dicom_header(
             getattr(dataset, "ImageOrientationPatient", None), 6
         ),
         source=str(path) or f"dataset-{source_index:08d}",
+        pixel_spacing=_numeric_vector(
+            getattr(dataset, "PixelSpacing", None), 2
+        ),
+        laterality=_normalize_laterality(
+            getattr(
+                dataset,
+                "ImageLaterality",
+                getattr(dataset, "Laterality", None),
+            )
+        ),
     )
 
 
@@ -256,6 +290,22 @@ def select_slot_triplets(
     slot: ProtocolSlot,
 ) -> list[tuple[DicomSlice, DicomSlice, DicomSlice]]:
     """Select center slices and return their immediate ordered neighbours."""
+    triplets, _ = _select_slot_triplets_with_positions(items, slot)
+    return triplets
+
+
+def _series_laterality(slices: Sequence[DicomSlice]) -> str | None:
+    values = {item.laterality for item in slices if item.laterality is not None}
+    return values.pop() if len(values) == 1 else None
+
+
+def _select_slot_triplets_with_positions(
+    items: Sequence[str | PathLike[str] | Any],
+    slot: ProtocolSlot,
+) -> tuple[
+    list[tuple[DicomSlice, DicomSlice, DicomSlice]],
+    np.ndarray,
+]:
     paths = items and all(isinstance(item, (str, PathLike)) for item in items)
     ordered = _order_dicom_slices(
         [
@@ -263,6 +313,8 @@ def select_slot_triplets(
             for index, item in enumerate(items)
         ]
     ) if paths else load_dicom_slices(items)
+    if _series_laterality(ordered) == "R" and slot.plane == "Sagittal":
+        ordered = list(reversed(ordered))
     centers = sample_slice_indices(
         len(ordered),
         slot.slice_budget,
@@ -285,10 +337,13 @@ def select_slot_triplets(
         }
     else:
         decoded = {index: item for index, item in enumerate(ordered)}
-    return [
+    triplets = [
         tuple(decoded[index] for index in group)
         for group in neighbour_indices
     ]
+    denominator = max(len(ordered) - 1, 1)
+    positions = np.asarray(centers, dtype=np.float32) / denominator
+    return triplets, positions
 
 
 def _center_crop_channels(
@@ -305,15 +360,87 @@ def _center_crop_channels(
     return values[..., top : top + crop_height, left : left + crop_width]
 
 
+def _series_window(
+    triplets: Sequence[tuple[DicomSlice, DicomSlice, DicomSlice]],
+) -> tuple[float, float]:
+    unique: dict[str, np.ndarray] = {}
+    for triplet in triplets:
+        for item in triplet:
+            unique.setdefault(item.source, item.pixels)
+    values = np.concatenate(
+        [np.asarray(pixels, dtype=np.float32).reshape(-1) for pixels in unique.values()]
+    )
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return 0.0, 1.0
+    nonzero = finite[finite != 0]
+    candidates = nonzero if nonzero.size >= 64 else finite
+    low, high = np.percentile(candidates, [1.0, 99.5])
+    if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+        return float(np.min(finite)), float(np.max(finite))
+    return float(low), float(high)
+
+
+def _window_pixels(values: np.ndarray, low: float, high: float) -> np.ndarray:
+    finite = np.isfinite(values)
+    replacement = low if high > low else 0.0
+    cleaned = np.where(finite, values, replacement).astype(np.float32)
+    if high <= low:
+        return np.zeros_like(cleaned, dtype=np.float32)
+    return np.clip((cleaned - low) / (high - low), 0, 1).astype(np.float32)
+
+
+def _foreground_centroid(values: np.ndarray) -> tuple[float, float] | None:
+    foreground = np.max(values, axis=0) > 0.05
+    if np.count_nonzero(foreground) < 64:
+        return None
+    rows, columns = np.nonzero(foreground)
+    return float(np.median(rows)), float(np.median(columns))
+
+
+def _physical_crop_channels(
+    values: np.ndarray,
+    spacing: np.ndarray | None,
+    *,
+    crop_mm: float,
+    fallback_fraction: float,
+) -> np.ndarray:
+    height, width = values.shape[-2:]
+    valid_spacing = (
+        spacing is not None
+        and spacing.shape == (2,)
+        and np.isfinite(spacing).all()
+        and np.all((spacing >= 0.05) & (spacing <= 10.0))
+    )
+    if not valid_spacing:
+        return _center_crop_channels(values, fallback_fraction)
+    crop_height = min(height, max(1, int(round(crop_mm / spacing[0]))))
+    crop_width = min(width, max(1, int(round(crop_mm / spacing[1]))))
+    centroid = _foreground_centroid(values)
+    center_row, center_column = centroid or (
+        (height - 1) / 2,
+        (width - 1) / 2,
+    )
+    top = int(round(center_row - (crop_height - 1) / 2))
+    left = int(round(center_column - (crop_width - 1) / 2))
+    top = min(max(top, 0), height - crop_height)
+    left = min(max(left, 0), width - crop_width)
+    return values[..., top : top + crop_height, left : left + crop_width]
+
+
 def preprocess_slice_triplets(
     triplets: Sequence[tuple[DicomSlice, DicomSlice, DicomSlice]],
     *,
     image_size: int = DEFAULT_DINO_CONFIG.image_size,
     crop_fraction: float = 0.9,
+    physical_crop_mm: float | None = None,
+    plane: str | None = None,
 ) -> Any:
     """Normalize adjacent slices as RGB channels for 2.5D DINO input."""
-    if image_size < 1:
-        raise ValueError("image_size must be positive")
+    if image_size < 1 or (
+        physical_crop_mm is not None and physical_crop_mm <= 0
+    ):
+        raise ValueError("image size and physical crop must be positive")
     try:
         import torch
         import torch.nn.functional as functional
@@ -328,22 +455,38 @@ def preprocess_slice_triplets(
     }
     if len(shapes) != 1:
         raise ValueError("selected DICOM slices must have matching pixel dimensions")
-    normalized = np.stack(
-        [
-            robust_normalize(
-                np.stack([item.pixels for item in triplet], axis=0)
+    low, high = _series_window(triplets)
+    processed = []
+    for triplet in triplets:
+        normalized = _window_pixels(
+            np.stack([item.pixels for item in triplet], axis=0),
+            low,
+            high,
+        )
+        if (
+            _series_laterality(triplet) == "R"
+            and plane in {"Coronal", "Axial"}
+        ):
+            normalized = normalized[..., ::-1].copy()
+        normalized = (
+            _physical_crop_channels(
+                normalized,
+                triplet[1].pixel_spacing,
+                crop_mm=physical_crop_mm,
+                fallback_fraction=crop_fraction,
             )
-            for triplet in triplets
-        ],
-        axis=0,
-    )
-    normalized = _center_crop_channels(normalized, crop_fraction)
-    tensor = functional.interpolate(
-        torch.from_numpy(normalized),
-        size=(image_size, image_size),
-        mode="bilinear",
-        align_corners=False,
-    )
+            if physical_crop_mm is not None
+            else _center_crop_channels(normalized, crop_fraction)
+        )
+        processed.append(
+            functional.interpolate(
+                torch.from_numpy(normalized).unsqueeze(0),
+                size=(image_size, image_size),
+                mode="bilinear",
+                align_corners=False,
+            )[0]
+        )
+    tensor = torch.stack(processed)
     mean = tensor.new_tensor(IMAGENET_MEAN).view(1, 3, 1, 1)
     std = tensor.new_tensor(IMAGENET_STD).view(1, 3, 1, 1)
     return (tensor - mean) / std
@@ -555,7 +698,9 @@ def build_study_images(
     image_size: int = DEFAULT_DINO_CONFIG.image_size,
     input_mode: str = "single",
     crop_fraction: float = 1.0,
-) -> tuple[Any, Any]:
+    physical_crop_mm: float | None = None,
+    return_metadata: bool = False,
+) -> tuple[Any, ...]:
     """Build a fixed slot-aligned image tensor and valid-slice mask."""
     try:
         import torch
@@ -568,19 +713,35 @@ def build_study_images(
         (total_slices, 3, image_size, image_size), dtype=torch.float32
     )
     valid_mask = torch.zeros(total_slices, dtype=torch.bool)
-    def prepare_slot(slot: ProtocolSlot) -> Any:
+    fractional_positions = np.full(total_slices, -1, dtype=np.float32)
+    slot_ids = np.full(total_slices, -1, dtype=np.int16)
+
+    def prepare_slot(slot: ProtocolSlot) -> tuple[Any, np.ndarray]:
         items = slot_series.get(slot.name, ())
         if not items:
-            return preprocess_slices([], image_size=image_size)
-        if input_mode == "2p5d":
-            return preprocess_slice_triplets(
-                select_slot_triplets(items, slot),
-                image_size=image_size,
-                crop_fraction=crop_fraction,
+            return (
+                preprocess_slices([], image_size=image_size),
+                np.empty(0, dtype=np.float32),
             )
-        return preprocess_slices(
-            select_slot_slices(items, slot),
-            image_size=image_size,
+        if input_mode == "2p5d":
+            triplets, positions = _select_slot_triplets_with_positions(
+                items,
+                slot,
+            )
+            return (
+                preprocess_slice_triplets(
+                    triplets,
+                    image_size=image_size,
+                    crop_fraction=crop_fraction,
+                    physical_crop_mm=physical_crop_mm,
+                    plane=slot.plane,
+                ),
+                positions,
+            )
+        selected = select_slot_slices(items, slot)
+        return (
+            preprocess_slices(selected, image_size=image_size),
+            np.linspace(0, 1, len(selected), dtype=np.float32),
         )
 
     worker_count = min(4, len(slots))
@@ -588,11 +749,18 @@ def build_study_images(
         prepared_slots = list(executor.map(prepare_slot, slots))
 
     offset = 0
-    for slot, prepared in zip(slots, prepared_slots, strict=True):
+    for slot_index, (slot, prepared_slot) in enumerate(
+        zip(slots, prepared_slots, strict=True)
+    ):
+        prepared, positions = prepared_slot
         count = len(prepared)
         images[offset : offset + count] = prepared
         valid_mask[offset : offset + count] = True
+        fractional_positions[offset : offset + count] = positions
+        slot_ids[offset : offset + count] = slot_index
         offset += slot.slice_budget
+    if return_metadata:
+        return images, valid_mask, fractional_positions, slot_ids
     return images, valid_mask
 
 
@@ -606,19 +774,24 @@ def extract_study_features(
     expected_feature_dim: int = DEFAULT_FEATURE_DIM,
     input_mode: str = "single",
     crop_fraction: float = 1.0,
+    physical_crop_mm: float | None = None,
     intermediate_layers: int | Sequence[int] = 0,
     include_patch_max: bool = False,
-) -> tuple[np.ndarray, np.ndarray]:
+    return_metadata: bool = False,
+) -> tuple[np.ndarray, ...]:
     """Extract a fixed-size study tensor, preserving protocol slot offsets."""
     if expected_feature_dim < 1:
         raise ValueError("expected_feature_dim must be positive")
-    images, mask = build_study_images(
+    study_images = build_study_images(
         slot_series,
         slots=slots,
         image_size=image_size,
         input_mode=input_mode,
         crop_fraction=crop_fraction,
+        physical_crop_mm=physical_crop_mm,
+        return_metadata=return_metadata,
     )
+    images, mask = study_images[:2]
     valid_features = extract_slice_features(
         model,
         images[mask],
@@ -634,6 +807,8 @@ def extract_study_features(
         )
     output = np.zeros((len(mask), expected_feature_dim), dtype=np.float32)
     output[mask.numpy()] = valid_features.numpy()
+    if return_metadata:
+        return output, mask.numpy(), study_images[2], study_images[3]
     return output, mask.numpy()
 
 

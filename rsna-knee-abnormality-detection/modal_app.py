@@ -450,6 +450,8 @@ def extract_feature_shard(
     completed_ids: list[str] = []
     embeddings: list[np.ndarray] = []
     masks: list[np.ndarray] = []
+    positions: list[np.ndarray] = []
+    slot_ids: list[np.ndarray] = []
     failures: list[dict[str, str]] = []
     started_at = time.perf_counter()
     print(
@@ -465,7 +467,7 @@ def extract_feature_shard(
                 series_path = train_root / study_id / series_id
                 slot_series[str(row.slot)] = sorted(series_path.glob("*.dcm"))
         try:
-            features, mask = extract_study_features(
+            extraction = extract_study_features(
                 slot_series,
                 model,
                 image_size=config.image_size,
@@ -473,12 +475,18 @@ def extract_feature_shard(
                 expected_feature_dim=2304 if v2 else 1152,
                 input_mode="2p5d" if v2 else "single",
                 crop_fraction=0.9 if v2 else 1.0,
+                physical_crop_mm=130.0 if v2 else None,
                 intermediate_layers=(8, 11) if v2 else 0,
                 include_patch_max=v2,
+                return_metadata=v2,
             )
+            features, mask = extraction[:2]
             completed_ids.append(study_id)
             embeddings.append(features)
             masks.append(mask)
+            if v2:
+                positions.append(extraction[2])
+                slot_ids.append(extraction[3])
         except Exception as exc:
             failures.append(
                 {
@@ -501,6 +509,8 @@ def extract_feature_shard(
         np.stack(embeddings),
         np.stack(masks),
         fingerprint,
+        fractional_positions=np.stack(positions) if v2 else None,
+        slot_ids=np.stack(slot_ids) if v2 else None,
     )
     output.with_suffix(".failures.json").write_text(
         json.dumps(failures, indent=2) + "\n",
@@ -600,6 +610,8 @@ def extract_test_features(
     completed_ids: list[str] = []
     embeddings: list[np.ndarray] = []
     masks: list[np.ndarray] = []
+    positions: list[np.ndarray] = []
+    slot_ids: list[np.ndarray] = []
     failures: list[dict[str, str]] = []
     for study_id in study_ids:
         slot_series: dict[str, list[Path]] = {}
@@ -609,7 +621,7 @@ def extract_test_features(
                 series_path = test_root / study_id / series_id
                 slot_series[str(row.slot)] = sorted(series_path.glob("*.dcm"))
         try:
-            features, mask = extract_study_features(
+            extraction = extract_study_features(
                 slot_series,
                 model,
                 image_size=config.image_size,
@@ -617,12 +629,18 @@ def extract_test_features(
                 expected_feature_dim=2304 if v2 else 1152,
                 input_mode="2p5d" if v2 else "single",
                 crop_fraction=0.9 if v2 else 1.0,
+                physical_crop_mm=130.0 if v2 else None,
                 intermediate_layers=(8, 11) if v2 else 0,
                 include_patch_max=v2,
+                return_metadata=v2,
             )
+            features, mask = extraction[:2]
             completed_ids.append(study_id)
             embeddings.append(features)
             masks.append(mask)
+            if v2:
+                positions.append(extraction[2])
+                slot_ids.append(extraction[3])
         except Exception as exc:
             failures.append(
                 {
@@ -638,6 +656,8 @@ def extract_test_features(
         np.stack(embeddings),
         np.stack(masks),
         fingerprint,
+        fractional_positions=np.stack(positions) if v2 else None,
+        slot_ids=np.stack(slot_ids) if v2 else None,
     )
     failure_path = output.with_suffix(".failures.json")
     failure_path.write_text(
@@ -724,6 +744,8 @@ def train_heads(
         targets=pd.read_csv(targets),
         folds=pd.read_csv(folds),
         n_splits=5,
+        fractional_positions=features.get("fractional_positions"),
+        slot_ids=features.get("slot_ids"),
     )
     metadata = train_fold_heads(
         data=aligned,
