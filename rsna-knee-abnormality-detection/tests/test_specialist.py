@@ -89,5 +89,7 @@ def test_specialist_evaluation_compares_blends(tmp_path):
     )
 
     assert result["verified_scored"] == 4
+    assert result["primary_macro_auc"] == pytest.approx(0.5)
+    assert result["fixed_half_blend_macro_auc"] == pytest.approx(7 / 12)
     assert result["labels"]["Effusion"]["specialist_auc"] == pytest.approx(1.0)
     assert result["labels"]["Synovitis"]["specialist_auc"] == pytest.approx(1.0)

@@ -14,6 +14,7 @@ from .config import LLMConfig
 from .constants import LABELS, REPORT_COLUMN
 from .folds import report_group
 from .llm_client import LLMRequestError, OpenAICompatibleClient
+from .metrics import competition_auc
 from .report_labeler import (
     completed_report_groups,
     iter_label_records,
@@ -137,6 +138,17 @@ def evaluate_specialist_labels(
     from sklearn.metrics import roc_auc_score
 
     label_results: dict[str, object] = {}
+    primary_frame = pd.DataFrame(
+        [
+            {
+                label: float(primary[group]["labels"][label]["probability"])
+                for label in LABELS
+            }
+            for group in scored["report_group"]
+        ],
+        index=scored.index,
+    )
+    fixed_blend_frame = primary_frame.copy()
     for label in SPECIALIST_LABELS:
         y_true = scored[label].astype(int).to_numpy()
         primary_values = [
@@ -168,11 +180,23 @@ def evaluate_specialist_labels(
             "specialist_auc": blends["1.0"],
             "blend_auc_by_specialist_weight": blends,
         }
+        fixed_blend_frame[label] = [
+            0.5 * base + 0.5 * specialist
+            for base, specialist in zip(
+                primary_values, specialist_values, strict=True
+            )
+        ]
 
     return {
         "verified_total": len(gold),
         "verified_scored": len(scored),
         "specialist_passes": len(specialists),
+        "primary_macro_auc": competition_auc(
+            scored.loc[:, LABELS], primary_frame
+        ).macro_auc,
+        "fixed_half_blend_macro_auc": competition_auc(
+            scored.loc[:, LABELS], fixed_blend_frame
+        ).macro_auc,
         "labels": label_results,
     }
 
