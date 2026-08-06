@@ -8,11 +8,13 @@ from rsna_knee.constants import ID_COLUMN, LABELS, REPORT_COLUMN
 from rsna_knee.label_schema import ReportLabels
 from rsna_knee.file_lock import output_file_lock
 from rsna_knee.report_labeler import (
+    _label_one,
     completed_report_groups,
     estimate_labeling,
     evaluate_report_labels,
     label_reports,
 )
+from rsna_knee.llm_client import LLMResponse
 from rsna_knee.folds import report_group
 
 
@@ -179,6 +181,28 @@ def test_label_reports_supports_disjoint_shards_and_completed_files(
         completed_paths=[shard_paths[0]],
     )
     assert skipped["written"] == 0
+
+
+def test_label_one_supplies_validation_error_on_schema_retry():
+    class CorrectingClient:
+        def __init__(self):
+            self.prompts = []
+
+        def complete_json(self, system, user):
+            self.prompts.append(user)
+            payload = valid_payload()
+            if len(self.prompts) == 1:
+                del payload["labels"]["ACL"]
+            return LLMResponse(payload, "response-id", {})
+
+    client = CorrectingClient()
+
+    labels, _, _ = _label_one(client, "normal report")
+
+    assert set(labels.labels) == set(LABELS)
+    assert len(client.prompts) == 2
+    assert "Validation error: label mismatch" in client.prompts[1]
+    assert "Previous JSON:" in client.prompts[1]
 
 
 def test_evaluate_report_labels_scores_verified_rows(tmp_path):
