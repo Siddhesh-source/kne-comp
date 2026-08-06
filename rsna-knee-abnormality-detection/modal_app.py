@@ -199,40 +199,85 @@ def download_competition_data() -> dict[str, object]:
 
 @app.function(
     image=gpu_image,
-    cpu=16,
-    memory=32768,
+    cpu=4,
+    memory=8192,
     timeout=21600,
     retries=1,
+    max_containers=16,
     volumes={DATA_MOUNT: data_volume},
 )
-def unpack_competition_data() -> dict[str, object]:
-    """Unpack the completed archive into the shared data volume."""
+def unpack_archive_shard(
+    shard_index: int,
+    shard_count: int,
+) -> dict[str, object]:
+    """Unpack one disjoint subset of archive entries."""
     data_volume.reload()
     archive = (
         DATA_MOUNT / "raw" / "rsna-knee-abnormality-detection.zip"
     )
-    train_root = DATA_MOUNT / "raw" / "train_series"
-    if train_root.is_dir():
-        studies = sum(1 for path in train_root.iterdir() if path.is_dir())
-        if studies == 4407:
-            return {
-                "status": "already_complete",
-                "train_study_directories": studies,
-            }
+    if shard_count < 1 or not 0 <= shard_index < shard_count:
+        raise ValueError("invalid unpack shard")
     if not archive.is_file():
         raise FileNotFoundError(archive)
     if not zipfile.is_zipfile(archive):
         raise ValueError("competition archive is incomplete or invalid")
+    root = DATA_MOUNT / "raw"
+    extracted = skipped = 0
     with zipfile.ZipFile(archive) as handle:
-        handle.extractall(DATA_MOUNT / "raw")
+        members = [
+            member
+            for member in handle.infolist()
+            if not member.is_dir()
+        ][shard_index::shard_count]
+        for member in members:
+            relative = PurePosixPath(member.filename)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError(f"unsafe archive member: {member.filename}")
+            destination = root.joinpath(*relative.parts)
+            if (
+                destination.is_file()
+                and destination.stat().st_size == member.file_size
+            ):
+                skipped += 1
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_suffix(destination.suffix + ".partial")
+            with handle.open(member) as source, temporary.open("wb") as target:
+                while chunk := source.read(8 * 1024 * 1024):
+                    target.write(chunk)
+            if temporary.stat().st_size != member.file_size:
+                raise IOError(f"incomplete extraction: {member.filename}")
+            temporary.replace(destination)
+            extracted += 1
+    data_volume.commit()
+    return {
+        "shard_index": shard_index,
+        "members": len(members),
+        "extracted": extracted,
+        "skipped": skipped,
+    }
+
+
+@app.function(
+    image=gpu_image,
+    cpu=2,
+    memory=4096,
+    timeout=600,
+    volumes={DATA_MOUNT: data_volume},
+)
+def validate_unpacked_data() -> dict[str, object]:
+    """Verify that every expected training study directory exists."""
+    data_volume.reload()
+    train_root = DATA_MOUNT / "raw" / "train_series"
+    if not train_root.is_dir():
+        raise FileNotFoundError(train_root)
     studies = sum(1 for path in train_root.iterdir() if path.is_dir())
     if studies != 4407:
         raise RuntimeError(
             f"expected 4407 train study directories, found {studies}"
         )
-    data_volume.commit()
     return {
-        "status": "unpacked",
+        "status": "complete",
         "train_study_directories": studies,
     }
 
@@ -510,8 +555,30 @@ def prepare_model() -> None:
 
 
 @app.local_entrypoint()
-def unpack_data() -> None:
-    print(json.dumps(unpack_competition_data.remote(), indent=2))
+def unpack_data(shard_count: int = 16) -> None:
+    if not 1 <= shard_count <= 32:
+        raise ValueError("shard_count must be between 1 and 32")
+    results = list(
+        unpack_archive_shard.starmap(
+            (
+                (shard_index, shard_count)
+                for shard_index in range(shard_count)
+            ),
+            order_outputs=False,
+        )
+    )
+    validation = validate_unpacked_data.remote()
+    print(
+        json.dumps(
+            {
+                "shards": sorted(
+                    results, key=lambda item: item["shard_index"]
+                ),
+                "validation": validation,
+            },
+            indent=2,
+        )
+    )
 
 
 @app.local_entrypoint()
