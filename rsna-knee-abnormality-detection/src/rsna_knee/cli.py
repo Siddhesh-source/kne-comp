@@ -13,7 +13,11 @@ from .config import load_llm_config
 from .consensus import write_consensus_table
 from .constants import ID_COLUMN, LABELS
 from .data import read_metadata, summarize_metadata
-from .dino_features import feature_config_fingerprint, sha256_file
+from .dino_features import (
+    feature_config_fingerprint,
+    load_feature_shards,
+    sha256_file,
+)
 from .experiments import initialize_registry
 from .folds import make_report_grouped_folds, validate_fold_assignments
 from .llm_client import OpenAICompatibleClient
@@ -36,6 +40,7 @@ from .specialist_labeler import (
     label_specialist_reports,
 )
 from .submission import project_runtime, validate_submission
+from .training_data import align_training_data
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -221,6 +226,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ensemble.add_argument("--sample", type=Path, required=True)
     ensemble.add_argument("--output", type=Path, required=True)
+
+    train_heads = commands.add_parser(
+        "train-fold-heads",
+        help="train masked fold heads from precomputed DINO features",
+    )
+    train_heads.add_argument(
+        "--feature-shard", type=Path, required=True, action="append"
+    )
+    train_heads.add_argument("--targets", type=Path, required=True)
+    train_heads.add_argument("--folds", type=Path, required=True)
+    train_heads.add_argument("--output", type=Path, required=True)
+    train_heads.add_argument("--fingerprint", required=True)
+    train_heads.add_argument("--splits", type=int, default=5)
+    train_heads.add_argument("--hidden-dim", type=int, default=256)
+    train_heads.add_argument("--epochs", type=int, default=18)
+    train_heads.add_argument("--batch-size", type=int, default=32)
+    train_heads.add_argument("--learning-rate", type=float, default=3e-4)
+    train_heads.add_argument("--device", default="cuda")
+    train_heads.add_argument("--seed", type=int, default=20260806)
     return parser
 
 
@@ -473,6 +497,40 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "output": str(args.output),
                     **validate_submission(submission, sample),
                 },
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.command == "train-fold-heads":
+        from .fold_heads import train_fold_heads
+
+        features = load_feature_shards(
+            args.feature_shard,
+            args.fingerprint,
+        )
+        data = align_training_data(
+            feature_ids=features["study_ids"],
+            embeddings=features["embeddings"],
+            valid_mask=features["valid_mask"],
+            targets=pd.read_csv(args.targets),
+            folds=pd.read_csv(args.folds),
+            n_splits=args.splits,
+        )
+        print(
+            json.dumps(
+                train_fold_heads(
+                    data=data,
+                    output_dir=args.output,
+                    feature_fingerprint=args.fingerprint,
+                    n_splits=args.splits,
+                    hidden_dim=args.hidden_dim,
+                    epochs=args.epochs,
+                    batch_size=args.batch_size,
+                    learning_rate=args.learning_rate,
+                    device=args.device,
+                    seed=args.seed,
+                ),
                 indent=2,
             )
         )

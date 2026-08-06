@@ -1,8 +1,15 @@
 import pytest
+import numpy as np
 
 torch = pytest.importorskip("torch")
 
-from rsna_knee.fold_heads import MaskedAttentionHead, weighted_soft_bce
+from rsna_knee.constants import LABELS
+from rsna_knee.fold_heads import (
+    MaskedAttentionHead,
+    train_fold_heads,
+    weighted_soft_bce,
+)
+from rsna_knee.training_data import AlignedTrainingData
 
 
 def test_masked_slices_cannot_change_logits():
@@ -45,3 +52,35 @@ def test_weighted_soft_bce_rejects_zero_weight_batch():
             torch.zeros(1, 2),
             torch.zeros(1, 2),
         )
+
+
+def test_tiny_fold_training_writes_models_oof_and_metadata(tmp_path):
+    rng = np.random.default_rng(7)
+    data = AlignedTrainingData(
+        study_ids=np.array(["a", "b", "c", "d"]),
+        embeddings=rng.normal(size=(4, 3, 4)).astype(np.float32),
+        valid_mask=np.ones((4, 3), dtype=bool),
+        targets=np.tile(
+            np.array([[0.0], [1.0], [0.0], [1.0]], dtype=np.float32),
+            (1, len(LABELS)),
+        ),
+        weights=np.ones((4, len(LABELS)), dtype=np.float32),
+        folds=np.array([0, 0, 1, 1]),
+    )
+
+    metadata = train_fold_heads(
+        data,
+        tmp_path,
+        "fingerprint",
+        n_splits=2,
+        hidden_dim=4,
+        epochs=1,
+        batch_size=2,
+        device="cpu",
+    )
+
+    assert metadata["n_splits"] == 2
+    assert (tmp_path / "fold-0.pt").exists()
+    assert (tmp_path / "fold-1.pt").exists()
+    assert (tmp_path / "oof.csv").exists()
+    assert (tmp_path / "metadata.json").exists()
