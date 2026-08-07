@@ -239,9 +239,9 @@ Both use the Phase A winning label file and `folds-v1.csv`.
 
 **Modal entry point** `train_finetune`, modelled on `train_heads`: both volumes mounted, a `fold` argument so five folds run as parallel containers via `.map()`, writes `fold-{k}.pt`, `oof-{k}.csv`, and `fold-{k}.metadata.json` under `heads/finetune-<name>/`, `timeout=21600`, A10, and refuses to overwrite using an exclusive fold lock. A finalizer will aggregate fold metadata and OOF files after all folds finish.
 
-### B3: smoke test
+### B3: DINOv2 smoke test — passed
 
-One fold, one epoch, 64 studies. Gate: completes, loss falls between first and last logged step, checkpoint written, GPU memory under 22 GiB. If memory overflows, drop batch to 1 and raise accumulation to 8 before changing anything else.
+The first attempt exposed a bfloat16-to-float32 scatter mismatch under CUDA autocast. Commit `42e9e62` fixed the boundary and added a CPU autocast regression test. A functional retry then completed and wrote its checkpoint/OOF/metadata. Commit `f088dc5` added explicit first/last-step telemetry, and the final approved smoke on `modal-secondary` passed: fold 0, one epoch, 64-study cap, 19 validation rows, loss **0.7501 → 0.5108**, checkpoint written, and peak allocated CUDA memory **1.82 GB**, far below the 22 GiB gate. The 0.426 validation AUC is not decision-quality at this sample size. Full suite: **133 passed**.
 
 ### B4: full runs
 
