@@ -19,7 +19,7 @@ from .model_config import (
 
 PREPROCESSING_VERSION = "dicom-v1"
 V2_PREPROCESSING_VERSION = (
-    "dicom-2p5d-series-p01-p995-phys130-laterality-position-v3"
+    "dicom-2p5d-series-p01-p995-phys150-laterality-position-v3"
 )
 
 
@@ -74,7 +74,7 @@ def feature_config_fingerprint(
     payload = {
         "preprocessing_version": (
             V2_PREPROCESSING_VERSION
-            if config.version == "dino336-2p5d-l9l12-phys130-v3"
+            if config.version == "dino336-2p5d-l9l12-phys150-v3"
             else PREPROCESSING_VERSION
         ),
         "model": config.as_dict(),

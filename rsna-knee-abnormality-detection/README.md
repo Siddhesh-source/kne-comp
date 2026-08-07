@@ -136,11 +136,11 @@ py -m modal run modal_app.py::preflight
 py -m modal run modal_app.py::extract_one --shard-index 0 --shard-count 256
 py -m modal run modal_app.py::extract --shard-count 256
 
-# V3 canary: 2.5D RGB, series windowing, 130mm physical crop, laterality, blocks 9/12
-py -m modal run modal_app.py::extract_one --feature-version dino336-2p5d-l9l12-phys130-v3 --shard-index 0 --shard-count 256 --batch-size 32
+# V3 canary: 2.5D RGB, series windowing, 150mm physical crop (true FOV), laterality, blocks 9/12
+py -m modal run modal_app.py::extract_one --feature-version dino336-2p5d-l9l12-phys150-v3 --shard-index 0 --shard-count 256 --batch-size 32
 
 # Launch selected V3 shard ranges after validating the canary
-py -m modal run modal_app.py::extract --feature-version dino336-2p5d-l9l12-phys130-v3 --shard-count 256 --start-shard 0 --end-shard 64 --batch-size 32
+py -m modal run modal_app.py::extract --feature-version dino336-2p5d-l9l12-phys150-v3 --shard-count 256 --start-shard 0 --end-shard 64 --batch-size 32
 ```
 
 The smoke command allocates an A10 and runs one CUDA matrix multiplication. It

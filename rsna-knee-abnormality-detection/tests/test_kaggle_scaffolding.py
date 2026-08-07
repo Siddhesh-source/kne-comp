@@ -30,7 +30,7 @@ from rsna_knee.submission import (
 def test_default_model_configuration_has_expected_resolution():
     assert DEFAULT_DINO_CONFIG.image_size == 336
     assert DEFAULT_DINO_CONFIG.tokens_per_slice == 576
-    assert DINO_2P5D_L9L12_CONFIG.version == "dino336-2p5d-l9l12-phys130-v3"
+    assert DINO_2P5D_L9L12_CONFIG.version == "dino336-2p5d-l9l12-phys150-v3"
     assert len(DINO_2P5D_L9L12_CONFIG.embedding_parts) == 6
 
 
