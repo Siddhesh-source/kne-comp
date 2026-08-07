@@ -539,7 +539,7 @@ def extract_feature_shard(
     memory=8192,
     timeout=21600,
     retries=2,
-    max_containers=16,
+    max_containers=40,
     volumes={
         DATA_MOUNT: data_volume,
         ARTIFACT_MOUNT: artifact_volume,
