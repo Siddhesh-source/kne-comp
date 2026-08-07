@@ -6,6 +6,8 @@ import torch
 
 from rsna_knee.dicom_extraction import (
     DEFAULT_STUDY_SLICES,
+    IMAGENET_MEAN,
+    IMAGENET_STD,
     build_study_images,
     decode_dicom_slice,
     extract_study_features,
@@ -138,6 +140,74 @@ def test_triplets_use_adjacent_slices_and_preserve_channel_context():
     assert images.shape == (2, 3, 8, 8)
     assert torch.isfinite(images).all()
     assert not torch.equal(images[:, 0], images[:, 2])
+
+
+def test_preprocess_slices_normalize_false_stays_in_unit_range_and_round_trips():
+    slices = load_dicom_slices(
+        [
+            dataset([[0, 1], [2, 3]], instance=1),
+            dataset([[4, 5], [6, 7]], instance=2),
+        ]
+    )
+
+    raw = preprocess_slices(slices, normalize=False)
+    normalized = preprocess_slices(slices, normalize=True)
+
+    assert raw.min() >= 0.0
+    assert raw.max() <= 1.0
+    mean = raw.new_tensor(IMAGENET_MEAN).view(1, 3, 1, 1)
+    std = raw.new_tensor(IMAGENET_STD).view(1, 3, 1, 1)
+    torch.testing.assert_close((raw - mean) / std, normalized, atol=1e-5, rtol=0)
+
+
+def test_preprocess_slice_triplets_normalize_false_stays_in_unit_range_and_round_trips():
+    slot = ProtocolSlot("test", "Sagittal", 1, 2, 0.0, 1.0)
+    slices = [
+        dataset(np.full((4, 4), index, dtype=np.float32), instance=index)
+        for index in range(5)
+    ]
+    triplets = select_slot_triplets(slices, slot)
+
+    raw = preprocess_slice_triplets(
+        triplets, image_size=8, crop_fraction=0.75, normalize=False
+    )
+    normalized = preprocess_slice_triplets(
+        triplets, image_size=8, crop_fraction=0.75, normalize=True
+    )
+
+    assert raw.min() >= 0.0
+    assert raw.max() <= 1.0
+    mean = raw.new_tensor(IMAGENET_MEAN).view(1, 3, 1, 1)
+    std = raw.new_tensor(IMAGENET_STD).view(1, 3, 1, 1)
+    torch.testing.assert_close((raw - mean) / std, normalized, atol=1e-5, rtol=0)
+
+
+def test_build_study_images_normalize_false_round_trips_through_uint8():
+    slot = ProtocolSlot("test", "Sagittal", 1, 4, 0.0, 1.0)
+    slices = [
+        dataset(np.full((4, 4), index * 20, dtype=np.float32), instance=index)
+        for index in range(4)
+    ]
+
+    raw, mask = build_study_images(
+        {"test": slices}, slots=(slot,), image_size=8, normalize=False
+    )
+    normalized, _ = build_study_images(
+        {"test": slices}, slots=(slot,), image_size=8, normalize=True
+    )
+
+    quantized = np.clip(np.rint(raw.numpy() * 255), 0, 255).astype(np.uint8)
+    restored = torch.from_numpy(quantized.astype(np.float32) / 255)
+    mean = restored.new_tensor(IMAGENET_MEAN).view(1, 3, 1, 1)
+    std = restored.new_tensor(IMAGENET_STD).view(1, 3, 1, 1)
+    restored_normalized = (restored - mean) / std
+
+    assert raw.min() >= 0.0
+    assert raw.max() <= 1.0
+    # uint8 quantization loses at most 1/255 of dynamic range per channel.
+    torch.testing.assert_close(
+        restored_normalized[mask], normalized[mask], atol=2 / 255, rtol=0
+    )
 
 
 def test_dino_output_pooling_concatenates_cls_mean_and_max():

@@ -435,8 +435,15 @@ def preprocess_slice_triplets(
     crop_fraction: float = 0.9,
     physical_crop_mm: float | None = None,
     plane: str | None = None,
+    normalize: bool = True,
 ) -> Any:
-    """Normalize adjacent slices as RGB channels for 2.5D DINO input."""
+    """Normalize adjacent slices as RGB channels for 2.5D DINO input.
+
+    When ``normalize`` is False, return the resized/cropped tensor before
+    the ImageNet mean/std step, with values in [0, 1]. Used by the image
+    cache, which stores raw pixels and normalizes at load time so the
+    stored files stay small and augmentation-friendly.
+    """
     if image_size < 1 or (
         physical_crop_mm is not None and physical_crop_mm <= 0
     ):
@@ -487,6 +494,8 @@ def preprocess_slice_triplets(
             )[0]
         )
     tensor = torch.stack(processed)
+    if not normalize:
+        return tensor
     mean = tensor.new_tensor(IMAGENET_MEAN).view(1, 3, 1, 1)
     std = tensor.new_tensor(IMAGENET_STD).view(1, 3, 1, 1)
     return (tensor - mean) / std
@@ -496,8 +505,12 @@ def preprocess_slices(
     slices: Sequence[DicomSlice],
     *,
     image_size: int = DEFAULT_DINO_CONFIG.image_size,
+    normalize: bool = True,
 ) -> Any:
-    """Normalize, resize, replicate channels, and apply ImageNet statistics."""
+    """Normalize, resize, replicate channels, and apply ImageNet statistics.
+
+    See ``preprocess_slice_triplets`` for the meaning of ``normalize=False``.
+    """
     if image_size < 1:
         raise ValueError("image_size must be positive")
     if not slices:
@@ -525,6 +538,8 @@ def preprocess_slices(
         mode="bilinear",
         align_corners=False,
     ).repeat(1, 3, 1, 1)
+    if not normalize:
+        return tensor
     mean = tensor.new_tensor(IMAGENET_MEAN).view(1, 3, 1, 1)
     std = tensor.new_tensor(IMAGENET_STD).view(1, 3, 1, 1)
     return (tensor - mean) / std
@@ -700,8 +715,12 @@ def build_study_images(
     crop_fraction: float = 1.0,
     physical_crop_mm: float | None = None,
     return_metadata: bool = False,
+    normalize: bool = True,
 ) -> tuple[Any, ...]:
-    """Build a fixed slot-aligned image tensor and valid-slice mask."""
+    """Build a fixed slot-aligned image tensor and valid-slice mask.
+
+    See ``preprocess_slice_triplets`` for the meaning of ``normalize=False``.
+    """
     try:
         import torch
     except ImportError as exc:
@@ -720,7 +739,7 @@ def build_study_images(
         items = slot_series.get(slot.name, ())
         if not items:
             return (
-                preprocess_slices([], image_size=image_size),
+                preprocess_slices([], image_size=image_size, normalize=normalize),
                 np.empty(0, dtype=np.float32),
             )
         if input_mode == "2p5d":
@@ -735,12 +754,15 @@ def build_study_images(
                     crop_fraction=crop_fraction,
                     physical_crop_mm=physical_crop_mm,
                     plane=slot.plane,
+                    normalize=normalize,
                 ),
                 positions,
             )
         selected = select_slot_slices(items, slot)
         return (
-            preprocess_slices(selected, image_size=image_size),
+            preprocess_slices(
+                selected, image_size=image_size, normalize=normalize
+            ),
             np.linspace(0, 1, len(selected), dtype=np.float32),
         )
 
