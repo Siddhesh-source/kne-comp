@@ -11,6 +11,7 @@ from modal_app import (
     _finalize_finetune_artifacts,
     _parse_finetune_folds,
     _validate_finetune_request,
+    _validate_finetune_runtime,
     _volume_path,
 )
 from rsna_knee.constants import ID_COLUMN, LABELS
@@ -52,6 +53,25 @@ def test_selected_folds_are_strict_and_unique():
         _parse_finetune_folds("0,0")
     with pytest.raises(ValueError, match="0 through 4"):
         _parse_finetune_folds("5")
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "accumulation", "workers", "message"),
+    (
+        (0, 4, 0, "batch_size"),
+        (33, 4, 0, "batch_size"),
+        (2, 0, 0, "gradient_accumulation_steps"),
+        (2, 65, 0, "gradient_accumulation_steps"),
+        (2, 4, -1, "num_workers"),
+        (2, 4, 9, "num_workers"),
+        (True, 4, 0, "batch_size"),
+    ),
+)
+def test_finetune_runtime_controls_are_bounded(
+    batch_size, accumulation, workers, message
+):
+    with pytest.raises(ValueError, match=message):
+        _validate_finetune_runtime(batch_size, accumulation, workers)
 
 
 def _write_complete_finetune_run(root: Path, folds_path: Path) -> list[str]:

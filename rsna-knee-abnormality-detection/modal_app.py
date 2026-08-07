@@ -102,6 +102,28 @@ def _validate_finetune_request(
         raise ValueError("fold must be an integer from 0 through 4")
 
 
+def _validate_finetune_runtime(
+    batch_size: int,
+    gradient_accumulation_steps: int,
+    num_workers: int,
+) -> None:
+    """Validate bounded runtime controls before allocating a GPU."""
+    for name, value, minimum, maximum in (
+        ("batch_size", batch_size, 1, 32),
+        (
+            "gradient_accumulation_steps",
+            gradient_accumulation_steps,
+            1,
+            64,
+        ),
+        ("num_workers", num_workers, 0, 8),
+    ):
+        if type(value) is not int or not minimum <= value <= maximum:
+            raise ValueError(
+                f"{name} must be an integer from {minimum} through {maximum}"
+            )
+
+
 def _parse_finetune_folds(value: str) -> tuple[int, ...]:
     """Parse a unique comma-separated subset of the five folds."""
     try:
@@ -1372,6 +1394,9 @@ def train_finetune_fold(
     backbone: str,
     fold: int,
     smoke: bool = False,
+    batch_size: int = 2,
+    gradient_accumulation_steps: int = 4,
+    num_workers: int = 0,
 ) -> dict[str, object]:
     """Fine-tune one image fold on an A10 from the committed image cache."""
     import torch
@@ -1385,6 +1410,11 @@ def train_finetune_fold(
     _validate_finetune_request(run_name, backbone, fold)
     if not isinstance(smoke, bool):
         raise ValueError("smoke must be a boolean")
+    _validate_finetune_runtime(
+        batch_size,
+        gradient_accumulation_steps,
+        num_workers,
+    )
     data_volume.reload()
     artifact_volume.reload()
     cache_root = (
@@ -1402,13 +1432,22 @@ def train_finetune_fold(
         folds_path,
         n_splits=len(FINETUNE_FOLDS),
     )
-    overrides = {"epochs": 1, "max_studies": 64} if smoke else {}
+    overrides = {
+        "batch_size": batch_size,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "num_workers": num_workers,
+    }
+    if smoke:
+        overrides.update({"epochs": 1, "max_studies": 64})
     config = (
         FinetuneConfig.cnn(**overrides)
         if backbone == "tf_efficientnetv2_s"
         else FinetuneConfig(backbone_name=backbone, **overrides)
     )
+    import time
+
     torch.cuda.reset_peak_memory_stats()
+    started = time.perf_counter()
     metadata = train_fold_core(
         data,
         output,
@@ -1416,6 +1455,7 @@ def train_finetune_fold(
         config=config,
         device="cuda",
     )
+    elapsed_seconds = time.perf_counter() - started
     peak_bytes = int(torch.cuda.max_memory_allocated())
     artifact_volume.commit()
     return {
@@ -1430,6 +1470,7 @@ def train_finetune_fold(
         "first_step_loss": metadata["first_step_loss"],
         "last_step_loss": metadata["last_step_loss"],
         "step_loss_decreased": metadata["step_loss_decreased"],
+        "elapsed_seconds": elapsed_seconds,
         "peak_cuda_memory_bytes": peak_bytes,
         "output": str(output),
     }
@@ -1907,14 +1948,30 @@ def train_finetune(
     backbone: str,
     folds: str = "0,1,2,3,4",
     smoke: bool = False,
+    batch_size: int = 2,
+    gradient_accumulation_steps: int = 4,
+    num_workers: int = 0,
 ) -> None:
     """Launch selected fine-tuning folds concurrently in the active profile."""
     _validate_finetune_request(run_name, backbone)
+    _validate_finetune_runtime(
+        batch_size,
+        gradient_accumulation_steps,
+        num_workers,
+    )
     selected_folds = _parse_finetune_folds(folds)
     results = list(
         train_finetune_fold.starmap(
             (
-                (run_name, backbone, fold, smoke)
+                (
+                    run_name,
+                    backbone,
+                    fold,
+                    smoke,
+                    batch_size,
+                    gradient_accumulation_steps,
+                    num_workers,
+                )
                 for fold in selected_folds
             ),
             order_outputs=False,
