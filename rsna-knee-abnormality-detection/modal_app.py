@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
 import subprocess
 import sys
+import tempfile
 import zipfile
 from pathlib import Path, PurePosixPath
 
@@ -27,6 +30,7 @@ gpu_image = (
         "pandas==2.3.1",
         "scikit-learn==1.7.1",
         "torch==2.7.1",
+        "timm==1.0.19",
         "xformers==0.0.31",
         "pydicom==3.0.1",
         "pillow==11.3.0",
@@ -56,6 +60,15 @@ _DINO_MODELS: dict[str, object] = {}
 
 app = modal.App(APP_NAME)
 
+FINETUNE_BACKBONES = frozenset(
+    {"dinov2_vits14", "tf_efficientnetv2_s"}
+)
+FINETUNE_FOLDS = tuple(range(5))
+FINETUNE_STUDY_COUNT = 4407
+FINETUNE_RUN_PATTERN = re.compile(
+    r"[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?"
+)
+
 
 def _volume_path(root: Path, relative_path: str) -> Path:
     """Resolve a path inside a mounted volume and reject traversal."""
@@ -63,6 +76,233 @@ def _volume_path(root: Path, relative_path: str) -> Path:
     if value.is_absolute() or ".." in value.parts or not value.parts:
         raise ValueError("volume paths must be non-empty relative paths")
     return root.joinpath(*value.parts)
+
+
+def _validate_finetune_request(
+    run_name: str,
+    backbone: str,
+    fold: int | None = None,
+) -> None:
+    """Validate identifiers before constructing artifact paths."""
+    if (
+        not isinstance(run_name, str)
+        or not FINETUNE_RUN_PATTERN.fullmatch(run_name)
+    ):
+        raise ValueError(
+            "run_name must be 1-48 lowercase letters, digits, or hyphens, "
+            "with no leading or trailing hyphen"
+        )
+    if not isinstance(backbone, str) or backbone not in FINETUNE_BACKBONES:
+        raise ValueError(
+            f"backbone must be one of {sorted(FINETUNE_BACKBONES)}"
+        )
+    if fold is not None and (
+        type(fold) is not int or fold not in FINETUNE_FOLDS
+    ):
+        raise ValueError("fold must be an integer from 0 through 4")
+
+
+def _parse_finetune_folds(value: str) -> tuple[int, ...]:
+    """Parse a unique comma-separated subset of the five folds."""
+    try:
+        folds = tuple(int(item.strip()) for item in value.split(","))
+    except ValueError as exc:
+        raise ValueError("folds must be comma-separated integers") from exc
+    if not folds or any(
+        not item.strip() for item in value.split(",")
+    ):
+        raise ValueError("at least one fold is required")
+    if len(folds) != len(set(folds)):
+        raise ValueError("folds must not contain duplicates")
+    for fold in folds:
+        if fold not in FINETUNE_FOLDS:
+            raise ValueError("each fold must be an integer from 0 through 4")
+    return folds
+
+
+def _atomic_json_write(value: object, path: Path) -> None:
+    """Atomically create a JSON file while refusing to replace one."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        reservation = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError as exc:
+        raise FileExistsError(
+            f"refusing to overwrite run artifact: {path}"
+        ) from exc
+    os.close(reservation)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    os.close(descriptor)
+    try:
+        Path(temporary).write_text(
+            json.dumps(value, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _atomic_frame_write(frame, path: Path) -> None:
+    """Atomically create a CSV file while refusing to replace one."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        reservation = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError as exc:
+        raise FileExistsError(
+            f"refusing to overwrite run artifact: {path}"
+        ) from exc
+    os.close(reservation)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    os.close(descriptor)
+    try:
+        frame.to_csv(temporary, index=False)
+        os.replace(temporary, path)
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _finalize_finetune_artifacts(
+    output: Path,
+    folds_path: Path,
+    run_name: str,
+    backbone: str,
+) -> dict[str, object]:
+    """Validate five fold outputs and create strict run-level artifacts."""
+    import numpy as np
+    import pandas as pd
+
+    from rsna_knee.constants import ID_COLUMN, LABELS
+
+    _validate_finetune_request(run_name, backbone)
+    run_oof = output / "oof.csv"
+    run_metadata = output / "metadata.json"
+    existing = [path for path in (run_oof, run_metadata) if path.exists()]
+    if existing:
+        raise FileExistsError(
+            "refusing to overwrite run artifacts: "
+            + ", ".join(str(path) for path in existing)
+        )
+    if not folds_path.is_file():
+        raise FileNotFoundError(folds_path)
+    folds = pd.read_csv(folds_path, dtype={ID_COLUMN: str})
+    required_fold_columns = {ID_COLUMN, "fold"}
+    missing = required_fold_columns.difference(folds.columns)
+    if missing:
+        raise ValueError(f"fold file is missing columns: {sorted(missing)}")
+    if folds[ID_COLUMN].isna().any() or folds[ID_COLUMN].duplicated().any():
+        raise ValueError("fold file study IDs must be non-empty and unique")
+    if len(folds) != FINETUNE_STUDY_COUNT:
+        raise ValueError(
+            f"fold file must contain exactly {FINETUNE_STUDY_COUNT} studies"
+        )
+    fold_numbers = pd.to_numeric(folds["fold"], errors="coerce")
+    if (
+        fold_numbers.isna().any()
+        or not np.equal(fold_numbers, np.floor(fold_numbers)).all()
+        or set(fold_numbers.astype(int)) != set(FINETUNE_FOLDS)
+    ):
+        raise ValueError("fold file must contain integer folds 0 through 4")
+    folds = folds.assign(fold=fold_numbers.astype(int))
+
+    frames = []
+    fold_metadata = []
+    expected_columns = [ID_COLUMN, *LABELS]
+    for fold in FINETUNE_FOLDS:
+        checkpoint = output / f"fold-{fold}.pt"
+        oof_path = output / f"oof-{fold}.csv"
+        metadata_path = output / f"fold-{fold}.metadata.json"
+        missing_artifacts = [
+            path
+            for path in (checkpoint, oof_path, metadata_path)
+            if not path.is_file()
+        ]
+        if missing_artifacts:
+            raise FileNotFoundError(
+                "missing fold artifacts: "
+                + ", ".join(str(path) for path in missing_artifacts)
+            )
+        if checkpoint.stat().st_size == 0:
+            raise ValueError(f"checkpoint is empty for fold {fold}")
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata.get("fold") != fold:
+            raise ValueError(f"metadata fold mismatch for fold {fold}")
+        if metadata.get("labels") != list(LABELS):
+            raise ValueError(f"metadata labels mismatch for fold {fold}")
+        if metadata.get("config", {}).get("backbone_name") != backbone:
+            raise ValueError(f"metadata backbone mismatch for fold {fold}")
+        if metadata.get("checkpoint") != checkpoint.name:
+            raise ValueError(f"metadata checkpoint mismatch for fold {fold}")
+        if metadata.get("oof") != oof_path.name:
+            raise ValueError(f"metadata OOF mismatch for fold {fold}")
+        frame = pd.read_csv(oof_path, dtype={ID_COLUMN: str})
+        if list(frame.columns) != expected_columns:
+            raise ValueError(f"OOF columns are invalid for fold {fold}")
+        if (
+            frame[ID_COLUMN].isna().any()
+            or frame[ID_COLUMN].duplicated().any()
+        ):
+            raise ValueError(f"OOF study IDs are invalid for fold {fold}")
+        if metadata.get("valid_rows") != len(frame):
+            raise ValueError(f"metadata row count mismatch for fold {fold}")
+        expected_ids = set(
+            folds.loc[folds["fold"] == fold, ID_COLUMN].astype(str)
+        )
+        observed_ids = set(frame[ID_COLUMN])
+        if observed_ids != expected_ids:
+            raise ValueError(f"OOF study IDs do not match fold {fold}")
+        predictions = frame.loc[:, LABELS].to_numpy(dtype=float)
+        if (
+            not np.isfinite(predictions).all()
+            or np.any((predictions < 0) | (predictions > 1))
+        ):
+            raise ValueError(f"OOF predictions are invalid for fold {fold}")
+        frames.append(frame)
+        fold_metadata.append(metadata)
+
+    combined = pd.concat(frames, ignore_index=True)
+    expected_ids = folds[ID_COLUMN].astype(str).tolist()
+    if (
+        len(combined) != len(expected_ids)
+        or combined[ID_COLUMN].duplicated().any()
+        or set(combined[ID_COLUMN]) != set(expected_ids)
+    ):
+        raise ValueError("combined OOF must contain exactly one row per study")
+    order = {study_id: index for index, study_id in enumerate(expected_ids)}
+    combined = combined.assign(
+        _order=combined[ID_COLUMN].map(order)
+    ).sort_values("_order").drop(columns="_order").reset_index(drop=True)
+    metadata = {
+        "schema_version": 1,
+        "run_name": run_name,
+        "backbone_name": backbone,
+        "folds": list(FINETUNE_FOLDS),
+        "studies": len(combined),
+        "oof": run_oof.name,
+        "fold_metadata": fold_metadata,
+    }
+    _atomic_frame_write(combined, run_oof)
+    try:
+        _atomic_json_write(metadata, run_metadata)
+    except Exception:
+        run_oof.unlink(missing_ok=True)
+        raise
+    return metadata
 
 
 def _sha256(path: Path) -> str:
@@ -1117,6 +1357,133 @@ def train_heads(
 
 @app.function(
     image=gpu_image,
+    gpu=GPU_TYPE,
+    cpu=8,
+    memory=32768,
+    timeout=21600,
+    max_containers=5,
+    volumes={
+        DATA_MOUNT: data_volume,
+        ARTIFACT_MOUNT: artifact_volume,
+    },
+)
+def train_finetune_fold(
+    run_name: str,
+    backbone: str,
+    fold: int,
+    smoke: bool = False,
+) -> dict[str, object]:
+    """Fine-tune one image fold on an A10 from the committed image cache."""
+    import torch
+
+    from rsna_knee.finetune import (
+        FinetuneConfig,
+        align_cached_training_data,
+        train_finetune_fold as train_fold_core,
+    )
+
+    _validate_finetune_request(run_name, backbone, fold)
+    if not isinstance(smoke, bool):
+        raise ValueError("smoke must be a boolean")
+    data_volume.reload()
+    artifact_volume.reload()
+    cache_root = (
+        ARTIFACT_MOUNT / "cache" / "images-336-v3-webp" / "train"
+    )
+    targets_path = DATA_MOUNT / "metadata" / "consensus-labels-v1.csv"
+    folds_path = DATA_MOUNT / "metadata" / "folds-v1.csv"
+    output = ARTIFACT_MOUNT / "heads" / f"finetune-{run_name}"
+    for path in (targets_path, folds_path):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    data = align_cached_training_data(
+        cache_root,
+        targets_path,
+        folds_path,
+        n_splits=len(FINETUNE_FOLDS),
+    )
+    overrides = {"epochs": 1, "max_studies": 64} if smoke else {}
+    config = (
+        FinetuneConfig.cnn(**overrides)
+        if backbone == "tf_efficientnetv2_s"
+        else FinetuneConfig(backbone_name=backbone, **overrides)
+    )
+    torch.cuda.reset_peak_memory_stats()
+    metadata = train_fold_core(
+        data,
+        output,
+        fold,
+        config=config,
+        device="cuda",
+    )
+    peak_bytes = int(torch.cuda.max_memory_allocated())
+    artifact_volume.commit()
+    return {
+        "run_name": run_name,
+        "backbone": backbone,
+        "fold": fold,
+        "smoke": smoke,
+        "studies": len(data.study_ids),
+        "valid_rows": metadata["valid_rows"],
+        "best_epoch": metadata["best_epoch"],
+        "best_valid_auc": metadata["best_valid_auc"],
+        "peak_cuda_memory_bytes": peak_bytes,
+        "output": str(output),
+    }
+
+
+@app.function(
+    image=gpu_image,
+    cpu=2,
+    memory=8192,
+    timeout=600,
+    max_containers=1,
+    volumes={
+        DATA_MOUNT: data_volume,
+        ARTIFACT_MOUNT: artifact_volume,
+    },
+)
+def finalize_finetune_run(
+    run_name: str,
+    backbone: str,
+) -> dict[str, object]:
+    """Create run metadata and one strictly validated five-fold OOF file."""
+    _validate_finetune_request(run_name, backbone)
+    data_volume.reload()
+    artifact_volume.reload()
+    output = ARTIFACT_MOUNT / "heads" / f"finetune-{run_name}"
+    output.mkdir(parents=True, exist_ok=True)
+    lock = output / ".finalize.lock"
+    try:
+        descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError as exc:
+        raise FileExistsError(
+            f"fine-tune run is already being finalized: {lock}"
+        ) from exc
+    try:
+        os.close(descriptor)
+        metadata = _finalize_finetune_artifacts(
+            output,
+            DATA_MOUNT / "metadata" / "folds-v1.csv",
+            run_name,
+            backbone,
+        )
+    finally:
+        lock.unlink(missing_ok=True)
+    artifact_volume.commit()
+    return {
+        "run_name": run_name,
+        "backbone": backbone,
+        "folds": metadata["folds"],
+        "studies": metadata["studies"],
+        "output": str(output),
+        "oof": str(output / str(metadata["oof"])),
+        "metadata": str(output / "metadata.json"),
+    }
+
+
+@app.function(
+    image=gpu_image,
     cpu=8,
     memory=32768,
     timeout=21600,
@@ -1529,6 +1896,47 @@ def train(
         overwrite=overwrite,
     )
     print(json.dumps(result, indent=2))
+
+
+@app.local_entrypoint()
+def train_finetune(
+    run_name: str,
+    backbone: str,
+    folds: str = "0,1,2,3,4",
+    smoke: bool = False,
+) -> None:
+    """Launch selected fine-tuning folds concurrently in the active profile."""
+    _validate_finetune_request(run_name, backbone)
+    selected_folds = _parse_finetune_folds(folds)
+    results = list(
+        train_finetune_fold.starmap(
+            (
+                (run_name, backbone, fold, smoke)
+                for fold in selected_folds
+            ),
+            order_outputs=False,
+        )
+    )
+    print(
+        json.dumps(
+            sorted(results, key=lambda item: item["fold"]),
+            indent=2,
+        )
+    )
+
+
+@app.local_entrypoint()
+def finalize_finetune(
+    run_name: str,
+    backbone: str,
+) -> None:
+    """Finalize a complete five-fold run in the active Modal profile."""
+    print(
+        json.dumps(
+            finalize_finetune_run.remote(run_name, backbone),
+            indent=2,
+        )
+    )
 
 
 @app.local_entrypoint()
