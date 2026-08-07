@@ -1425,8 +1425,8 @@ def track_b_train_fold(
 @app.function(
     image=image,
     gpu="A10",
-    cpu=8,
-    memory=32768,
+    cpu=16,
+    memory=65536,
     ephemeral_disk=65536,
     timeout=43200,
     max_containers=2,
