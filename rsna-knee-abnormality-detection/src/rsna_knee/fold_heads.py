@@ -271,9 +271,13 @@ def train_fold_heads(
         generator = torch.Generator().manual_seed(seed + fold)
         train_targets = data.targets[train_indices]
         if hard_target_mix:
+            # A target of exactly 0.5 means the report never mentioned the
+            # finding, not that it was reported positive. Comparing with
+            # ">" instead of ">=" keeps every silent label on the negative
+            # side of the hard-target mix.
             train_targets = (
                 (1 - hard_target_mix) * train_targets
-                + hard_target_mix * (train_targets >= 0.5)
+                + hard_target_mix * (train_targets > 0.5)
             ).astype(np.float32)
         train_dataset = TensorDataset(
             torch.from_numpy(
@@ -582,7 +586,9 @@ def _macro_binary_auc(
 ) -> float:
     from sklearn.metrics import roc_auc_score
 
-    binary = np.asarray(targets) >= 0.5
+    # See the matching note in train_fold_heads: a target of exactly 0.5 is
+    # an unmentioned finding, not a positive one.
+    binary = np.asarray(targets) > 0.5
     scores: list[float] = []
     for index in range(binary.shape[1]):
         if np.unique(binary[:, index]).size < 2:
@@ -601,3 +607,6 @@ def _seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+

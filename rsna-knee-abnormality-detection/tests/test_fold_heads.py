@@ -246,6 +246,37 @@ def test_gated_training_controls_round_trip(tmp_path):
     assert predictions.shape == (6, len(LABELS) + 1)
 
 
+def test_hard_target_mix_treats_silence_as_negative():
+    """A target of exactly 0.5 means the report was silent, not positive."""
+    hard_target_mix = 0.5
+    targets = np.array([[0.0, 0.5, 0.99]], dtype=np.float32)
+
+    mixed = (
+        (1 - hard_target_mix) * targets + hard_target_mix * (targets > 0.5)
+    ).astype(np.float32)
+
+    assert mixed[0, 0] == pytest.approx(0.0)
+    assert mixed[0, 1] == pytest.approx(0.25)
+    assert mixed[0, 2] > 0.9
+
+
+def test_macro_binary_auc_treats_silence_as_negative():
+    """The validation metric must binarize 0.5 as negative, not positive."""
+    from rsna_knee.fold_heads import _macro_binary_auc
+
+    targets = np.array(
+        [[0.0], [0.5], [0.5], [1.0], [1.0], [1.0]], dtype=np.float32
+    )
+    # Predictions rank both silent studies (target 0.5) below the one true
+    # negative (target 0.0). If silence counted as positive, this negative
+    # would outrank two "positives" and AUC would drop below 1.0.
+    predictions = np.array(
+        [[0.10], [0.05], [0.05], [0.7], [0.8], [0.9]], dtype=np.float32
+    )
+
+    assert _macro_binary_auc(targets, predictions) == pytest.approx(1.0)
+
+
 @pytest.mark.parametrize("hard_target_mix", [-0.1, 1.1])
 def test_training_rejects_invalid_hard_target_mix(
     tmp_path,
