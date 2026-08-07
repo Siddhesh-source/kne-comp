@@ -35,6 +35,7 @@ from .report_labeler import (
     evaluate_report_labels,
     label_reports,
 )
+from .silence_prior import write_silence_prior_table
 from .specialist_labeler import (
     evaluate_specialist_labels,
     label_specialist_reports,
@@ -180,6 +181,15 @@ def build_parser() -> argparse.ArgumentParser:
     consensus.add_argument("--output", type=Path, required=True)
     consensus.add_argument("--specialist-weight", type=float, default=0.5)
     consensus.add_argument("--gold-weight", type=float, default=8.0)
+
+    silence = commands.add_parser(
+        "apply-silence-prior",
+        help="rewrite not-mentioned label placeholders with a prior",
+    )
+    silence.add_argument("--labels", type=Path, required=True)
+    silence.add_argument("--output", type=Path, required=True)
+    silence.add_argument("--prior", type=float, required=True)
+    silence.add_argument("--weight", type=float, default=0.35)
 
     quality = commands.add_parser(
         "label-quality",
@@ -434,6 +444,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                     output_path=args.output,
                     specialist_weight=args.specialist_weight,
                     gold_weight=args.gold_weight,
+                ),
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.command == "apply-silence-prior":
+        print(
+            json.dumps(
+                write_silence_prior_table(
+                    source_path=args.labels,
+                    output_path=args.output,
+                    prior=args.prior,
+                    weight=args.weight,
                 ),
                 indent=2,
             )
