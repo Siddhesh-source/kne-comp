@@ -535,6 +535,295 @@ def extract_feature_shard(
 
 @app.function(
     image=gpu_image,
+    cpu=4,
+    memory=8192,
+    timeout=21600,
+    retries=2,
+    max_containers=16,
+    volumes={
+        DATA_MOUNT: data_volume,
+        ARTIFACT_MOUNT: artifact_volume,
+    },
+)
+def cache_study_images(
+    shard_index: int,
+    shard_count: int,
+) -> dict[str, object]:
+    """Cache one deterministic shard of preprocessed training studies."""
+    import time
+
+    import numpy as np
+    import pandas as pd
+
+    from rsna_knee.constants import ID_COLUMN
+    from rsna_knee.dicom_extraction import (
+        build_study_images,
+        partition_study_ids,
+    )
+
+    data_volume.reload()
+    artifact_volume.reload()
+    manifest_path = (
+        DATA_MOUNT / "metadata" / "train-protocol-manifest-v1.csv"
+    )
+    train_root = DATA_MOUNT / "raw" / "train_series"
+    if not manifest_path.is_file() or not train_root.is_dir():
+        raise FileNotFoundError("manifest or train_series directory is missing")
+    manifest = pd.read_csv(manifest_path, dtype=str).fillna("")
+    study_ids = partition_study_ids(
+        manifest[ID_COLUMN].unique().tolist(),
+        shard_index,
+        shard_count,
+    )
+    grouped = {
+        str(study): frame
+        for study, frame in manifest.groupby(ID_COLUMN, sort=False)
+    }
+    output_root = (
+        ARTIFACT_MOUNT / "cache" / "images-336-v3" / "train"
+    )
+    output_root.mkdir(parents=True, exist_ok=True)
+    manifest_root = output_root.parent / "manifests"
+    manifest_root.mkdir(parents=True, exist_ok=True)
+
+    written = skipped = 0
+    bytes_written = 0
+    file_sizes: list[int] = []
+    failures: list[dict[str, str]] = []
+    started_at = time.perf_counter()
+    print(
+        f"image cache shard {shard_index}/{shard_count}: starting "
+        f"{len(study_ids)} studies",
+        flush=True,
+    )
+    for study_number, study_id in enumerate(study_ids, start=1):
+        destination = output_root / f"{study_id}.npz"
+        if destination.is_file():
+            size = destination.stat().st_size
+            skipped += 1
+            file_sizes.append(size)
+            continue
+        slot_series: dict[str, list[Path]] = {}
+        for row in grouped[study_id].itertuples(index=False):
+            series_id = str(row.SeriesInstanceUID)
+            if series_id:
+                series_path = train_root / study_id / series_id
+                slot_series[str(row.slot)] = sorted(series_path.glob("*.dcm"))
+        temporary = destination.with_suffix(".npz.partial")
+        try:
+            images, valid_mask, positions, slot_ids = build_study_images(
+                slot_series,
+                image_size=336,
+                input_mode="2p5d",
+                crop_fraction=0.9,
+                physical_crop_mm=150.0,
+                return_metadata=True,
+                normalize=False,
+            )
+            uint8_images = np.clip(
+                np.rint(images.numpy() * 255),
+                0,
+                255,
+            ).astype(np.uint8)
+            with temporary.open("wb") as handle:
+                np.savez_compressed(
+                    handle,
+                    images=uint8_images,
+                    valid_mask=valid_mask.numpy(),
+                    positions=positions,
+                    slot_ids=slot_ids,
+                )
+            temporary.replace(destination)
+            size = destination.stat().st_size
+            written += 1
+            bytes_written += size
+            file_sizes.append(size)
+        except Exception as exc:
+            if temporary.exists():
+                temporary.unlink()
+            failures.append(
+                {
+                    "study_id": study_id,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+        if study_number % 5 == 0 or study_number == len(study_ids):
+            print(
+                f"image cache shard {shard_index}/{shard_count}: "
+                f"{study_number}/{len(study_ids)} processed, "
+                f"{len(failures)} failed",
+                flush=True,
+            )
+    failure_path = (
+        manifest_root
+        / f"cache-{shard_index:03d}-of-{shard_count:03d}.failures.json"
+    )
+    failure_path.write_text(
+        json.dumps(failures, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    artifact_volume.commit()
+    if failures:
+        raise RuntimeError(
+            f"image cache shard {shard_index}/{shard_count} failed for "
+            f"{len(failures)} studies; see {failure_path}"
+        )
+    elapsed_seconds = time.perf_counter() - started_at
+    return {
+        "shard_index": shard_index,
+        "shard_count": shard_count,
+        "status": "written",
+        "studies": len(study_ids),
+        "written": written,
+        "skipped": skipped,
+        "failures": len(failures),
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "seconds_per_study": round(
+            elapsed_seconds / max(len(study_ids), 1),
+            3,
+        ),
+        "bytes_written": bytes_written,
+        "mean_file_bytes": (
+            round(sum(file_sizes) / len(file_sizes))
+            if file_sizes
+            else 0
+        ),
+        "max_file_bytes": max(file_sizes, default=0),
+        "output": str(output_root),
+        "failure_manifest": str(failure_path),
+    }
+
+
+@app.function(
+    image=gpu_image,
+    cpu=4,
+    memory=8192,
+    timeout=3600,
+    volumes={
+        DATA_MOUNT: data_volume,
+        ARTIFACT_MOUNT: artifact_volume,
+    },
+)
+def validate_study_image_cache(
+    shard_index: int,
+    shard_count: int,
+    sample_size: int = 5,
+) -> dict[str, object]:
+    """Compare cached uint8 studies with fresh normalized preprocessing."""
+    import numpy as np
+    import pandas as pd
+
+    from rsna_knee.constants import ID_COLUMN
+    from rsna_knee.dicom_extraction import (
+        IMAGENET_MEAN,
+        IMAGENET_STD,
+        build_study_images,
+        partition_study_ids,
+    )
+
+    if sample_size < 1:
+        raise ValueError("sample_size must be positive")
+    data_volume.reload()
+    artifact_volume.reload()
+    manifest_path = (
+        DATA_MOUNT / "metadata" / "train-protocol-manifest-v1.csv"
+    )
+    train_root = DATA_MOUNT / "raw" / "train_series"
+    manifest = pd.read_csv(manifest_path, dtype=str).fillna("")
+    study_ids = partition_study_ids(
+        manifest[ID_COLUMN].unique().tolist(),
+        shard_index,
+        shard_count,
+    )
+    grouped = {
+        str(study): frame
+        for study, frame in manifest.groupby(ID_COLUMN, sort=False)
+    }
+    cache_root = ARTIFACT_MOUNT / "cache" / "images-336-v3" / "train"
+    checked: list[dict[str, object]] = []
+    for study_id in study_ids:
+        cache_path = cache_root / f"{study_id}.npz"
+        if not cache_path.is_file():
+            continue
+        slot_series: dict[str, list[Path]] = {}
+        for row in grouped[study_id].itertuples(index=False):
+            series_id = str(row.SeriesInstanceUID)
+            if series_id:
+                series_path = train_root / study_id / series_id
+                slot_series[str(row.slot)] = sorted(series_path.glob("*.dcm"))
+        normalized, valid_mask, positions, slot_ids = build_study_images(
+            slot_series,
+            image_size=336,
+            input_mode="2p5d",
+            crop_fraction=0.9,
+            physical_crop_mm=150.0,
+            return_metadata=True,
+            normalize=True,
+        )
+        with np.load(cache_path, allow_pickle=False) as cached:
+            images = cached["images"]
+            cached_mask = cached["valid_mask"]
+            cached_positions = cached["positions"]
+            cached_slot_ids = cached["slot_ids"]
+        if images.shape != (46, 3, 336, 336) or images.dtype != np.uint8:
+            raise ValueError(f"invalid cached image tensor for {study_id}")
+        if cached_mask.shape != (46,) or cached_mask.dtype != np.bool_:
+            raise ValueError(f"invalid cached mask for {study_id}")
+        if cached_positions.shape != (46,):
+            raise ValueError(f"invalid cached positions for {study_id}")
+        if cached_slot_ids.shape != (46,):
+            raise ValueError(f"invalid cached slot IDs for {study_id}")
+        restored = images.astype(np.float32) / 255.0
+        mean = np.asarray(IMAGENET_MEAN, dtype=np.float32).reshape(1, 3, 1, 1)
+        std = np.asarray(IMAGENET_STD, dtype=np.float32).reshape(1, 3, 1, 1)
+        restored_normalized = (restored - mean) / std
+        expected = normalized.numpy()
+        mask = valid_mask.numpy()
+        raw_error_bound = 0.5 / 255 + 1e-6
+        normalized_error_bound = raw_error_bound / min(IMAGENET_STD)
+        max_normalized_error = float(
+            np.max(np.abs(restored_normalized[mask] - expected[mask]))
+        )
+        if not np.array_equal(cached_mask, mask):
+            raise ValueError(f"valid mask mismatch for {study_id}")
+        if not np.allclose(cached_positions, positions, atol=1e-7):
+            raise ValueError(f"position mismatch for {study_id}")
+        if not np.array_equal(cached_slot_ids, slot_ids):
+            raise ValueError(f"slot ID mismatch for {study_id}")
+        if max_normalized_error > normalized_error_bound:
+            raise ValueError(
+                f"quantization error too large for {study_id}: "
+                f"{max_normalized_error}"
+            )
+        checked.append(
+            {
+                "study_id": study_id,
+                "file_bytes": cache_path.stat().st_size,
+                "valid_slices": int(mask.sum()),
+                "max_normalized_error": max_normalized_error,
+            }
+        )
+        if len(checked) == sample_size:
+            break
+    if len(checked) != min(sample_size, len(study_ids)):
+        raise RuntimeError(
+            f"expected {min(sample_size, len(study_ids))} cached studies, "
+            f"found {len(checked)}"
+        )
+    return {
+        "shard_index": shard_index,
+        "shard_count": shard_count,
+        "checked": checked,
+        "raw_error_bound": 0.5 / 255 + 1e-6,
+        "normalized_error_bound": (
+            (0.5 / 255 + 1e-6) / min(IMAGENET_STD)
+        ),
+        "status": "passed",
+    }
+
+
+@app.function(
+    image=gpu_image,
     gpu=GPU_TYPE,
     cpu=4,
     memory=8192,
@@ -990,6 +1279,69 @@ def unpack_data(shard_count: int = 16) -> None:
                 ),
                 "validation": validation,
             },
+            indent=2,
+        )
+    )
+
+
+@app.local_entrypoint()
+def cache_images(
+    shard_count: int = 256,
+    start_shard: int = 0,
+    end_shard: int = -1,
+) -> None:
+    """Cache a selected range of preprocessed training-image shards."""
+    if not 1 <= shard_count <= 256:
+        raise ValueError("shard_count must be between 1 and 256")
+    if end_shard == -1:
+        end_shard = shard_count
+    if not 0 <= start_shard < end_shard <= shard_count:
+        raise ValueError(
+            "shard range must satisfy 0 <= start < end <= shard_count"
+        )
+    results = list(
+        cache_study_images.starmap(
+            (
+                (shard_index, shard_count)
+                for shard_index in range(start_shard, end_shard)
+            ),
+            order_outputs=False,
+        )
+    )
+    print(
+        json.dumps(
+            sorted(results, key=lambda item: item["shard_index"]),
+            indent=2,
+        )
+    )
+
+
+@app.local_entrypoint()
+def cache_one(
+    shard_index: int = 0,
+    shard_count: int = 256,
+    validate_count: int = 5,
+) -> None:
+    """Cache one shard and validate a small sample against fresh decoding."""
+    if not 1 <= shard_count <= 256:
+        raise ValueError("shard_count must be between 1 and 256")
+    if not 0 <= shard_index < shard_count:
+        raise ValueError("shard_index must satisfy 0 <= index < shard_count")
+    if validate_count < 0:
+        raise ValueError("validate_count must be non-negative")
+    result = cache_study_images.remote(shard_index, shard_count)
+    validation = (
+        validate_study_image_cache.remote(
+            shard_index,
+            shard_count,
+            validate_count,
+        )
+        if validate_count
+        else None
+    )
+    print(
+        json.dumps(
+            {"cache": result, "validation": validation},
             indent=2,
         )
     )
