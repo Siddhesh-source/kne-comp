@@ -1,4 +1,5 @@
 import importlib.util
+import importlib.util
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,16 @@ def test_coverage_gate_arms_support_parallel_and_selective_resume():
         module._parse_coverage_arms("c0,c0")
     with pytest.raises(ValueError, match="c0 and c1"):
         module._parse_coverage_arms("c2")
+
+
+def test_c1_five_fold_parser_supports_parallel_and_selective_resume():
+    module = load_track_b_modal()
+    assert module._parse_folds("0,1,2,3,4") == [0, 1, 2, 3, 4]
+    assert module._parse_folds(" 4,2 ") == [4, 2]
+    with pytest.raises(ValueError, match="unique"):
+        module._parse_folds("0,0")
+    with pytest.raises(ValueError, match="0 through 4"):
+        module._parse_folds("5")
 
 
 def test_stage_cache_locally_copies_exact_files(tmp_path):

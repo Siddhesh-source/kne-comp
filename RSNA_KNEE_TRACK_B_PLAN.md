@@ -39,11 +39,11 @@ Phase 1  Coverage-aware C1 code and local tests                   COMPLETE
          |
 Phase 2  Bounded C1 cache canary and independent QC               COMPLETE
          |
-Phase 3  Full C1 cache, then matched fold-0 C0 versus C1          IN PROGRESS
+Phase 3  Full C1 cache, then matched fold-0 C0 versus C1          COMPLETE
          |
          +-- C1 clearly wins --> optional C2 only if still justified
          |
-Phase 4  Five-fold supervised baseline using promoted coverage   BLOCKED BY PHASE 3
+Phase 4  Five-fold supervised baseline using promoted coverage   READY
          |
 Phase 5  Supervised notebook ablations, one at a time             BLOCKED BY PHASE 4
          |
@@ -52,10 +52,10 @@ Phase 6  MRI SSL and report-alignment initialization tests        BLOCKED BY PHA
 Phase 7  OOF blend with any completed independent model           BLOCKED BY OOF
 ```
 
-Phase 2 is complete. The basic 16-study C1 CPU canary and the strengthened independent QC
-both passed on `modal-secondary`. Phase 3 is in progress: the resumable full-C1 cache
-build is running, and the matched fold-0 C0/C1 gate is implemented and locally validated.
-The gate has not been launched. This is still not a five-fold training run.
+Phase 3 is complete. The full C1 cache and matched fold-0 gate both passed on
+`modal-secondary`. C1 improved macro AUC from `0.79980` to `0.81625`, a gain of
+`0.01645`. All 2,000 paired report-group bootstrap draws were above zero. C1 is the
+promoted input for Phase 4.
 
 ### Status table
 
@@ -64,8 +64,8 @@ The gate has not been launched. This is still not a five-fold training run.
 | 0. Six-slot foundation | Reproduce the strongest auditable sparse design without touching Track A | Deterministic six-slot classification, physical ordering, laterality recovery, C0 cache, sparse DINO head, strict folds and artifacts | **Complete** |
 | 1. Coverage implementation | Turn the public multi-group idea into a backward-compatible repository path | Schema-v2 grouped cache, exact C0 group, source indices, short-series masks, train-time group sampling, all-group validation reduction, local tests | **Complete** |
 | 2. C1 cache canary | Prove real DICOM behavior before building another multi-GB cache | Basic 16-study build plus deterministic edge cases, seeded random samples, independent pixel/source-index rebuild checks, slot/group telemetry, size and decode time | **Complete** |
-| 3. Coverage gate | Decide how many slices the supervised baseline should use | Full C1 cache, then matched fold-0 `TB-C0` versus `TB-C1`; C2 only if C1 passes its gate | **In progress** |
-| 4. Supervised baseline | Establish the number that every pretraining idea must beat | Five-fold `TB-P0`, exactly 4,407 OOF rows, per-label metrics, runtime and memory | Blocked by Phase 3 |
+| 3. Coverage gate | Decide how many slices the supervised baseline should use | Full C1 cache, then matched fold-0 `TB-C0` versus `TB-C1`; C2 only if C1 passes its gate | **Complete, C1 promoted** |
+| 4. Supervised baseline | Establish the number that every pretraining idea must beat | Five-fold `TB-P0`, exactly 4,407 OOF rows, per-label metrics, runtime and memory | Ready |
 | 5. Public-notebook ablations | Test plausible additions without bundling them together | Focal patch pooling, weak anatomical prior, group reducer, crop/resolution and optional slot-taxonomy controls | Blocked by Phase 4 |
 | 6. Representation pretraining | Test whether MRI adaptation or reports improve the same model | Matched `TB-P1`, `TB-P2`, and `TB-P3`; only initialization changes in the first comparison | Blocked by Phase 4 |
 | 7. Ensemble and submission | Keep Track B only if it adds standalone or complementary OOF signal | OOF-gated blend with any completed independent model, inference-cost check and final reproducible package | Blocked by complete OOF |
@@ -130,8 +130,8 @@ The gate has not been launched. This is still not a five-fold training run.
   deterministic valid-group choices for C1. It rejects any mismatch in configuration,
   schedule fingerprint, optimizer updates, study presentations or study-order
   fingerprint.
-- C0 and C1 run as independent parallel H100 tasks. Each task stages the completed
-  grouped cache once onto a 512 GiB ephemeral SSD with 16 copy workers, then trains all
+- C0 and C1 ran as independent parallel H100 tasks. Each task staged the completed
+  grouped cache once onto a 512 GiB ephemeral SSD with 16 copy workers, then trained all
   epochs from local storage. Either arm can be resumed alone without rerunning a
   completed arm. A separate CPU finalizer rebuilds the schedule, checks both arm
   manifests and revisions, verifies the registered C0 sample and writes the paired
@@ -142,8 +142,37 @@ The gate has not been launched. This is still not a five-fold training run.
 - The gate report uses a seeded paired bootstrap over validation report groups, retains
   the full paired prediction table and records per-label AUC differences. The bootstrap
   evidence is create-only and reproducible.
-- Focused gate tests, the full repository test suite, Python compilation, whitespace
-  checks and the Modal entrypoint check passed. No gate GPU job has been launched.
+- The matched gate completed without an error or preemption. C0 selected epoch 8 at
+  `0.79980`; C1 selected epoch 10 at `0.81625`. C1 gained `0.01645` macro AUC and passed
+  the bootstrap screen with every one of 2,000 draws above zero. The app stopped cleanly
+  after writing both arm artifacts and the paired evidence.
+
+### Portable five-fold recovery
+
+Phase 4 writes an immutable checkpoint and checksum manifest after every completed
+epoch. Each checkpoint contains the current model, optimizer, OneCycle scheduler, best
+model, metric history, random-number generator states and the next epoch cursor. The GPU
+worker commits the pair to the artifacts volume before it reports
+`epoch_checkpoint_committed`.
+
+The resume identity is independent of Modal paths and account names. It includes the run
+name, fold, labels, complete configuration, Git revision, source manifest hash, C1 cache
+fingerprint, aligned data fingerprint and model structure fingerprint. A different GPU
+may introduce small floating-point differences, but it resumes the same epoch,
+optimizer schedule and sampled-data state.
+
+Modal volumes do not cross account boundaries. Recovery on another account therefore
+requires:
+
+1. download at least the latest `fold-N.resume/epoch-NNN.{pt,json}` pair;
+2. make the same 19.50 GiB C1 cache, labels and folds available in the target account;
+3. check out the recorded Git revision;
+4. upload the checkpoint pair under the same run and fold directory;
+5. launch only the incomplete folds.
+
+The target worker verifies the checkpoint checksum and every identity field before it
+loads training state. Completed fold artifacts can be transferred with the same run
+directory and are skipped after validation.
 
 ### What the notebook audit changed
 
@@ -165,23 +194,14 @@ available. Tony and prvsiyan changed the order of experiments:
 
 ### Immediate execution plan
 
-1. Let the active full-C1 CPU shards finish on `modal-secondary`. If the detached run
-   stops early, resume only the missing shard indices; do not race active create-only
-   writers.
-2. Run the strict finalizer and record the 4,407-study cache fingerprint, valid-group
-   histogram, laterality counts and storage quantiles.
-3. Run matched fold-0 C0 and C1 jobs from the same schema-v2 C1 cache. C0 must select
-   registered group zero. Before training, compare a deterministic sample of those C0
-   pixels against the existing schema-v1 cache. Keep seed, crop, labels, optimizer,
-   scheduler, optimizer-update count, epoch budget and checkpoint rule fixed.
-4. Confirm the two arm manifests have identical schedule, study-order, presentation and
-   optimizer-update fingerprints before interpreting AUC.
-5. Run the paired report-group bootstrap and retain its paired predictions, bootstrap
-   draws, per-label differences and provenance.
-6. Promote C1 only if it meets the gate below. Do not start five folds merely because the
-   code runs.
-7. Train five-fold `TB-P0` with the promoted coverage, then freeze that result as the
-   baseline for every later SSL or report-alignment comparison.
+1. Run all five promoted C1 folds on independent H100 workers.
+2. Stage the C1 cache on each worker's local SSD and commit one portable checkpoint pair
+   after every epoch.
+3. If a worker stops, resume only that fold from its highest valid checkpoint.
+4. Finalize exactly 4,407 OOF rows after all five folds complete.
+5. Record macro and per-label OOF AUC, fold spread, runtime and memory.
+6. Freeze the completed result as `TB-P0`, the baseline for later SSL and report
+   alignment experiments.
 
 ### Coverage promotion gate
 

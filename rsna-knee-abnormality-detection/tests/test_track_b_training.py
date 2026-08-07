@@ -1,5 +1,7 @@
 import json
 
+import shutil
+
 import pytest
 from types import SimpleNamespace
 
@@ -605,6 +607,179 @@ def test_cpu_fold_training_writes_create_only_tb_p0_artifacts(tmp_path, capsys):
             git_revision="test-revision",
             source_manifest_sha256="manifest-fingerprint",
             competition_cache_fingerprint="cache-fingerprint",
+        )
+
+
+def test_tb_p0_fold_resumes_exactly_from_epoch_checkpoint(tmp_path):
+    data = aligned_cache_fixture(tmp_path)
+    config = TBP0Config(
+        feature_dim=8,
+        hidden_dim=6,
+        epochs=3,
+        batch_size=2,
+        gradient_accumulation_steps=1,
+        seed=41,
+    )
+    common = {
+        "run_name": "tb-p0-resume-test",
+        "config": config,
+        "model_factory": TinyTBP0Model,
+        "device": "cpu",
+        "git_revision": "test-revision",
+        "source_manifest_sha256": "manifest-fingerprint",
+        "competition_cache_fingerprint": "cache-fingerprint",
+        "coverage_arm": "c1",
+    }
+    uninterrupted = tmp_path / "uninterrupted"
+    expected = train_tb_p0_fold(data, uninterrupted, 0, **common)
+    interrupted = tmp_path / "interrupted"
+
+    def stop_after_first_epoch(manifest):
+        if manifest["completed_epoch"] == 1:
+            raise RuntimeError("simulated interruption")
+
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        train_tb_p0_fold(
+            data,
+            interrupted,
+            0,
+            epoch_checkpoint_callback=stop_after_first_epoch,
+            **common,
+        )
+    first_resume = interrupted / "fold-0.resume" / "epoch-001.pt"
+    first_manifest = interrupted / "fold-0.resume" / "epoch-001.json"
+    assert first_resume.is_file()
+    assert first_manifest.is_file()
+
+    actual = train_tb_p0_fold(data, interrupted, 0, **common)
+
+    assert actual["resumed_from_epoch"] == 1
+    assert actual["optimizer_updates"] == expected["optimizer_updates"]
+    assert actual["history"] == expected["history"]
+    expected_checkpoint = torch.load(
+        uninterrupted / "fold-0.pt",
+        weights_only=False,
+    )
+    actual_checkpoint = torch.load(
+        interrupted / "fold-0.pt",
+        weights_only=False,
+    )
+    for name, expected_value in expected_checkpoint["model_state"].items():
+        torch.testing.assert_close(
+            actual_checkpoint["model_state"][name],
+            expected_value,
+            rtol=0,
+            atol=0,
+        )
+
+
+def test_tb_p0_portable_lone_epoch_snapshot_resumes_in_fresh_directory(tmp_path):
+    data = aligned_cache_fixture(tmp_path)
+    config = TBP0Config(
+        feature_dim=8,
+        hidden_dim=6,
+        epochs=3,
+        batch_size=2,
+        seed=73,
+    )
+    common = {
+        "run_name": "tb-p0-portable-test",
+        "config": config,
+        "model_factory": TinyTBP0Model,
+        "device": "cpu",
+        "git_revision": "portable-revision",
+        "source_manifest_sha256": "portable-manifest",
+        "competition_cache_fingerprint": "portable-cache",
+        "coverage_arm": "c1",
+    }
+    expected_output = tmp_path / "portable-uninterrupted"
+    expected = train_tb_p0_fold(data, expected_output, 1, **common)
+    source_output = tmp_path / "portable-source"
+
+    def stop_after_second_epoch(manifest):
+        if manifest["completed_epoch"] == 2:
+            raise RuntimeError("simulated account exhaustion")
+
+    with pytest.raises(RuntimeError, match="account exhaustion"):
+        train_tb_p0_fold(
+            data,
+            source_output,
+            1,
+            epoch_checkpoint_callback=stop_after_second_epoch,
+            **common,
+        )
+
+    imported_output = tmp_path / "portable-import"
+    imported_resume = imported_output / "fold-1.resume"
+    imported_resume.mkdir(parents=True)
+    for suffix in ("pt", "json"):
+        shutil.copyfile(
+            source_output / "fold-1.resume" / f"epoch-002.{suffix}",
+            imported_resume / f"epoch-002.{suffix}",
+        )
+
+    actual = train_tb_p0_fold(data, imported_output, 1, **common)
+
+    assert actual["resumed_from_epoch"] == 2
+    assert actual["history"] == expected["history"]
+    expected_checkpoint = torch.load(
+        expected_output / "fold-1.pt",
+        weights_only=False,
+    )
+    actual_checkpoint = torch.load(
+        imported_output / "fold-1.pt",
+        weights_only=False,
+    )
+    for name, expected_value in expected_checkpoint["model_state"].items():
+        torch.testing.assert_close(
+            actual_checkpoint["model_state"][name],
+            expected_value,
+            rtol=0,
+            atol=0,
+        )
+
+
+def test_tb_p0_resume_rejects_changed_account_neutral_identity(tmp_path):
+    data = aligned_cache_fixture(tmp_path)
+    output = tmp_path / "identity-mismatch"
+    config = TBP0Config(
+        feature_dim=8,
+        hidden_dim=6,
+        epochs=2,
+        batch_size=2,
+    )
+
+    def interrupt(_manifest):
+        raise RuntimeError("stop")
+
+    with pytest.raises(RuntimeError, match="stop"):
+        train_tb_p0_fold(
+            data,
+            output,
+            0,
+            run_name="tb-p0-identity-test",
+            config=config,
+            model_factory=TinyTBP0Model,
+            device="cpu",
+            git_revision="revision-a",
+            source_manifest_sha256="manifest",
+            competition_cache_fingerprint="cache",
+            coverage_arm="c1",
+            epoch_checkpoint_callback=interrupt,
+        )
+    with pytest.raises(ValueError, match="identity does not match"):
+        train_tb_p0_fold(
+            data,
+            output,
+            0,
+            run_name="tb-p0-identity-test",
+            config=config,
+            model_factory=TinyTBP0Model,
+            device="cpu",
+            git_revision="revision-b",
+            source_manifest_sha256="manifest",
+            competition_cache_fingerprint="cache",
+            coverage_arm="c1",
         )
 
 

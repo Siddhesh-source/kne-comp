@@ -77,6 +77,17 @@ def _parse_coverage_arms(value: str) -> list[str]:
     return arms
 
 
+def _parse_folds(value: str) -> list[int]:
+    folds = [int(item.strip()) for item in value.split(",")]
+    if (
+        not folds
+        or len(folds) != len(set(folds))
+        or any(fold not in range(5) for fold in folds)
+    ):
+        raise ValueError("folds must contain unique fold indices from 0 through 4")
+    return folds
+
+
 def _stage_cache_locally(
     source_root: Path,
     destination_root: Path,
@@ -1546,6 +1557,162 @@ def track_b_train_coverage_arm(
 
 @app.function(
     image=image,
+    gpu="H100",
+    cpu=16,
+    memory=65536,
+    ephemeral_disk=524288,
+    timeout=43200,
+    max_containers=5,
+    volumes={DATA_MOUNT: data_volume, ARTIFACT_MOUNT: artifact_volume},
+)
+def track_b_train_c1_fold(
+    run_name: str,
+    git_revision: str,
+    crop_mm: int,
+    fold: int,
+    batch_size: int,
+) -> dict[str, object]:
+    """Train or resume one promoted C1 fold with durable epoch checkpoints."""
+    import json
+
+    import pandas as pd
+    import torch
+
+    from rsna_knee.track_b_training import (
+        TBP0Config,
+        align_tb_p0_cached_data,
+        train_tb_p0_fold,
+    )
+
+    _validate_crop(crop_mm)
+    if type(fold) is not int or fold not in range(5):
+        raise ValueError("fold must be an integer from 0 through 4")
+    if type(batch_size) is not int or not 1 <= batch_size <= 16:
+        raise ValueError("batch_size must be an integer from 1 through 16")
+    data_volume.reload()
+    artifact_volume.reload()
+    grouped_base = (
+        TRACK_B_ROOT / "cache" / _coverage_cache_name(crop_mm, 4) / "full"
+    )
+    grouped_root = grouped_base / "train"
+    grouped_manifest_path = grouped_base / "manifest.json"
+    targets_path = DATA_MOUNT / "metadata" / "consensus-labels-v1.csv"
+    folds_path = DATA_MOUNT / "metadata" / "folds-v1.csv"
+    for path in (grouped_manifest_path, targets_path, folds_path):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    manifest = json.loads(grouped_manifest_path.read_text(encoding="utf-8"))
+    if (
+        manifest.get("stage") != "TB-C1-cache"
+        or manifest.get("crop_mm") != crop_mm
+        or manifest.get("group_count") != 4
+        or manifest.get("studies") != 4407
+    ):
+        raise ValueError("full Track B C1 cache manifest is incompatible")
+    output = TRACK_B_ROOT / "runs" / run_name
+    completed_metadata_path = output / f"fold-{fold}.metadata.json"
+    if completed_metadata_path.is_file():
+        completed = json.loads(completed_metadata_path.read_text(encoding="utf-8"))
+        if (
+            completed.get("run_name") != run_name
+            or completed.get("fold") != fold
+            or completed.get("coverage_arm") != "c1"
+            or completed.get("git_revision") != git_revision
+            or completed.get("competition_cache_fingerprint")
+            != manifest.get("competition_cache_fingerprint")
+        ):
+            raise ValueError(f"completed C1 fold {fold} is incompatible")
+        return {
+            "run_name": run_name,
+            "fold": fold,
+            "status": "already_completed",
+            "best_epoch": completed["best_epoch"],
+            "best_valid_auc": completed["best_valid_auc"],
+            "output": str(output),
+        }
+    print(
+        json.dumps(
+            {
+                "event": "c1_fold_start",
+                "run_name": run_name,
+                "fold": fold,
+                "studies": manifest["studies"],
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    staging = _stage_cache_locally(
+        grouped_root,
+        Path(f"/tmp/track-b-c1-fold-{fold}-cache"),
+        expected_studies=4407,
+    )
+    print(
+        json.dumps(
+            {"event": "cache_staged", "fold": fold, **staging},
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    targets = pd.read_csv(targets_path, dtype={"StudyInstanceUID": str})
+    folds = pd.read_csv(folds_path, dtype={"StudyInstanceUID": str})
+    data = align_tb_p0_cached_data(Path(str(staging["root"])), targets, folds)
+    if len(data.study_ids) != 4407:
+        raise ValueError("full C1 training data must contain 4,407 studies")
+    config = TBP0Config(batch_size=batch_size)
+    torch.hub.set_dir(str(ARTIFACT_MOUNT / "models" / "torch-hub"))
+    torch.cuda.reset_peak_memory_stats()
+
+    def commit_epoch(epoch_manifest: dict[str, object]) -> None:
+        artifact_volume.commit()
+        print(
+            json.dumps(
+                {
+                    "event": "epoch_checkpoint_committed",
+                    "run_name": run_name,
+                    "fold": fold,
+                    **epoch_manifest,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
+    metadata = train_tb_p0_fold(
+        data,
+        output,
+        fold,
+        run_name=run_name,
+        config=config,
+        device="cuda",
+        git_revision=git_revision,
+        source_manifest_sha256=_sha256_file(grouped_manifest_path),
+        competition_cache_fingerprint=str(
+            manifest["competition_cache_fingerprint"]
+        ),
+        coverage_arm="c1",
+        resume=True,
+        epoch_checkpoint_callback=commit_epoch,
+    )
+    artifact_volume.commit()
+    return {
+        "run_name": run_name,
+        "fold": fold,
+        "status": (
+            "resumed" if metadata["resumed_from_epoch"] else "completed"
+        ),
+        "resumed_from_epoch": metadata["resumed_from_epoch"],
+        "best_epoch": metadata["best_epoch"],
+        "best_valid_auc": metadata["best_valid_auc"],
+        "cache_staging": staging,
+        "peak_gpu_memory_bytes": metadata["peak_gpu_memory_bytes"],
+        "runtime_seconds": metadata["runtime_seconds"],
+        "output": str(output),
+    }
+
+
+@app.function(
+    image=image,
     cpu=4,
     memory=16384,
     timeout=3600,
@@ -1743,6 +1910,42 @@ def track_b_run_coverage_gate(
     )
     return {
         "arms": sorted(results, key=lambda item: item["arm"]),
+        "final": final,
+    }
+
+
+@app.function(
+    image=image,
+    cpu=1,
+    memory=2048,
+    timeout=43200,
+    max_containers=1,
+)
+def track_b_run_c1_finetune(
+    run_name: str,
+    git_revision: str,
+    crop_mm: int = 130,
+    batch_size: int = 8,
+    folds: str = "0,1,2,3,4",
+) -> dict[str, object]:
+    """Keep parallel promoted-C1 folds and strict OOF finalization alive remotely."""
+    selected_folds = _parse_folds(folds)
+    results = list(
+        track_b_train_c1_fold.starmap(
+            (
+                (run_name, git_revision, crop_mm, fold, batch_size)
+                for fold in selected_folds
+            ),
+            order_outputs=False,
+        )
+    )
+    final = (
+        track_b_finalize_finetune.remote(run_name)
+        if len(selected_folds) == 5 and set(selected_folds) == set(range(5))
+        else None
+    )
+    return {
+        "folds": sorted(results, key=lambda item: item["fold"]),
         "final": final,
     }
 
@@ -1954,13 +2157,7 @@ def finetune_full(
     """Launch selected full TB-P0 folds concurrently in the active profile."""
     import json
 
-    selected_folds = [int(value.strip()) for value in folds.split(",")]
-    if (
-        not selected_folds
-        or len(selected_folds) != len(set(selected_folds))
-        or any(fold not in range(5) for fold in selected_folds)
-    ):
-        raise ValueError("folds must contain unique fold indices from 0 through 4")
+    selected_folds = _parse_folds(folds)
     revision = subprocess.check_output(
         ["git", "rev-parse", "HEAD"],
         cwd=PROJECT_ROOT.parent,
@@ -1976,6 +2173,36 @@ def finetune_full(
         )
     )
     print(json.dumps(sorted(results, key=lambda item: item["fold"]), indent=2))
+
+
+@app.local_entrypoint()
+def c1_finetune_full(
+    run_name: str,
+    crop_mm: int = 130,
+    folds: str = "0,1,2,3,4",
+    batch_size: int = 8,
+) -> None:
+    """Launch durable, resumable promoted-C1 folds in the active profile."""
+    import json
+
+    selected_folds = _parse_folds(folds)
+    revision = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"],
+        cwd=PROJECT_ROOT.parent,
+        text=True,
+    ).strip()
+    print(
+        json.dumps(
+            track_b_run_c1_finetune.remote(
+                run_name,
+                revision,
+                crop_mm,
+                batch_size,
+                ",".join(str(fold) for fold in selected_folds),
+            ),
+            indent=2,
+        )
+    )
 
 
 @app.local_entrypoint()

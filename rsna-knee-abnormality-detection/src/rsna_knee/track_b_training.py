@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import json
 import os
+import random
 import re
 import tempfile
 import time
@@ -805,13 +806,207 @@ def _atomic_bytes(path: Path, payload: bytes) -> None:
 
 
 def _atomic_torch_save(path: Path, value: object) -> None:
-    descriptor, temporary = tempfile.mkstemp(suffix=".pt", dir=path.parent)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        reservation = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError as exc:
+        raise FileExistsError(
+            f"refusing to overwrite Track B artifact: {path}"
+        ) from exc
+    os.close(reservation)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
     os.close(descriptor)
     try:
         torch.save(value, temporary)
-        _atomic_bytes(path, Path(temporary).read_bytes())
+        os.replace(temporary, path)
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
     finally:
         Path(temporary).unlink(missing_ok=True)
+
+
+def _cpu_tree(value: object) -> object:
+    """Recursively copy checkpoint tensors to CPU for GPU-neutral restores."""
+    if isinstance(value, Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, dict):
+        return {key: _cpu_tree(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_cpu_tree(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_cpu_tree(item) for item in value)
+    return value
+
+
+def _model_structure_fingerprint(model: nn.Module) -> str:
+    records = [
+        (name, tuple(value.shape), str(value.dtype))
+        for name, value in model.state_dict().items()
+    ]
+    return _sha256_bytes(
+        json.dumps(records, separators=(",", ":")).encode("utf-8")
+    )
+
+
+def _aligned_data_fingerprint(data: AlignedTBP0Data) -> str:
+    """Hash path-independent training identities, labels, weights and folds."""
+    digest = __import__("hashlib").sha256()
+    digest.update(b"aligned-tb-p0-data-v1\0")
+    for study_id, report_group in zip(
+        data.study_ids, data.report_groups, strict=True
+    ):
+        digest.update(str(study_id).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(report_group).encode("utf-8"))
+        digest.update(b"\0")
+    for values in (data.targets, data.weights, data.folds):
+        contiguous = np.ascontiguousarray(values)
+        digest.update(str(contiguous.dtype).encode("ascii"))
+        digest.update(str(contiguous.shape).encode("ascii"))
+        digest.update(contiguous.tobytes())
+    return digest.hexdigest()
+
+
+def _capture_tb_p0_rng_state(generator: torch.Generator) -> dict[str, object]:
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+        "loader_augmentation_generator": generator.get_state(),
+    }
+
+
+def _restore_tb_p0_rng_state(
+    state: object,
+    generator: torch.Generator,
+    device: torch.device,
+) -> None:
+    if not isinstance(state, dict):
+        raise ValueError("Track B resume checkpoint has invalid RNG state")
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    cuda_states = state.get("cuda", [])
+    if torch.cuda.is_available() and cuda_states:
+        if len(cuda_states) == torch.cuda.device_count():
+            torch.cuda.set_rng_state_all(cuda_states)
+        else:
+            torch.cuda.set_rng_state(cuda_states[0], device=device)
+    generator.set_state(state["loader_augmentation_generator"])
+
+
+def _optimizer_to_device(
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> None:
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if isinstance(value, Tensor):
+                state[key] = value.to(device)
+
+
+def _resume_identity(
+    *,
+    run_name: str,
+    fold: int,
+    config: TBP0Config,
+    git_revision: str,
+    source_manifest_sha256: str,
+    competition_cache_fingerprint: str,
+    data_fingerprint: str,
+    model_structure_fingerprint: str,
+    coverage_arm: Literal["c0", "c1"] | None,
+    matched_schedule: MatchedCoverageSchedule | None,
+) -> dict[str, object]:
+    return {
+        "run_name": run_name,
+        "fold": fold,
+        "labels": list(LABELS),
+        "config": asdict(config),
+        "git_revision": git_revision,
+        "source_manifest_sha256": source_manifest_sha256,
+        "competition_cache_fingerprint": competition_cache_fingerprint,
+        "data_fingerprint": data_fingerprint,
+        "model_structure_fingerprint": model_structure_fingerprint,
+        "coverage_arm": coverage_arm,
+        "matched_schedule_fingerprint": (
+            matched_schedule.fingerprint if matched_schedule is not None else None
+        ),
+    }
+
+
+def _validate_tb_p0_resume_state(
+    state: object,
+    expected_identity: dict[str, object],
+    *,
+    epochs: int,
+) -> None:
+    if (
+        not isinstance(state, dict)
+        or state.get("schema_version") != 2
+        or state.get("stage") != "TB-P0-epoch-resume"
+    ):
+        raise ValueError("Track B resume checkpoint has an unsupported schema")
+    if state.get("identity") != expected_identity:
+        raise ValueError("Track B resume checkpoint identity does not match")
+    next_epoch = state.get("next_epoch")
+    if type(next_epoch) is not int or not 1 <= next_epoch <= epochs:
+        raise ValueError("Track B resume checkpoint epoch is invalid")
+
+
+def _load_latest_tb_p0_resume(
+    resume_dir: Path,
+    expected_identity: dict[str, object],
+    *,
+    epochs: int,
+) -> tuple[dict[str, object] | None, Path | None]:
+    """Load the highest valid immutable epoch, including a portable lone snapshot."""
+    latest: dict[str, object] | None = None
+    latest_path: Path | None = None
+    latest_epoch = 0
+    for manifest_path in sorted(resume_dir.glob("epoch-*.json")):
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        completed_epoch = manifest.get("completed_epoch")
+        checkpoint_name = manifest.get("checkpoint")
+        if (
+            manifest.get("schema_version") != 1
+            or type(completed_epoch) is not int
+            or not 1 <= completed_epoch <= epochs
+            or checkpoint_name != f"epoch-{completed_epoch:03d}.pt"
+        ):
+            continue
+        checkpoint_path = resume_dir / checkpoint_name
+        if (
+            not checkpoint_path.is_file()
+            or manifest.get("sha256") != _sha256_file(checkpoint_path)
+        ):
+            continue
+        state = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=False,
+        )
+        _validate_tb_p0_resume_state(
+            state,
+            expected_identity,
+            epochs=epochs,
+        )
+        if state["next_epoch"] != completed_epoch:
+            raise ValueError("Track B resume checkpoint cursor is inconsistent")
+        if completed_epoch > latest_epoch:
+            latest_epoch = completed_epoch
+            latest = state
+            latest_path = checkpoint_path
+    return latest, latest_path
 
 
 @torch.no_grad()
@@ -853,17 +1048,24 @@ def train_tb_p0_fold(
     competition_cache_fingerprint: str,
     coverage_arm: Literal["c0", "c1"] | None = None,
     matched_schedule: MatchedCoverageSchedule | None = None,
+    resume: bool = True,
+    epoch_checkpoint_callback: (
+        Callable[[dict[str, object]], None] | None
+    ) = None,
 ) -> dict[str, object]:
     """Train one strict TB-P0 fold and create isolated, fingerprinted artifacts."""
     config = config or TBP0Config()
     validate_tb_p0_config(config)
     if type(fold) is not int or fold not in range(5):
         raise ValueError("fold must be an integer from 0 through 4")
-    if (coverage_arm is None) != (matched_schedule is None):
-        raise ValueError("coverage arm and matched schedule must be supplied together")
+    if matched_schedule is not None and coverage_arm is None:
+        raise ValueError("a matched schedule requires a coverage arm")
     if coverage_arm is not None:
         if coverage_arm not in ("c0", "c1"):
             raise ValueError("coverage arm must be c0 or c1")
+        if coverage_arm == "c0" and matched_schedule is None:
+            raise ValueError("the C0 control requires a matched schedule")
+    if matched_schedule is not None:
         if fold != 0 or matched_schedule.fold != 0:
             raise ValueError("the matched coverage gate is fold 0 only")
         if (
@@ -887,11 +1089,13 @@ def train_tb_p0_fold(
         "oof": output_dir / f"fold-{fold}.oof.csv",
         "metadata": output_dir / f"fold-{fold}.metadata.json",
     }
-    if coverage_arm is not None:
+    if matched_schedule is not None:
         paths["exposure"] = output_dir / f"fold-{fold}.exposure.json"
     existing = [str(path) for path in paths.values() if path.exists()]
     if existing:
         raise FileExistsError(f"Track B fold artifacts already exist: {existing}")
+    resume_dir = output_dir / f"fold-{fold}.resume"
+    resume_dir.mkdir(parents=True, exist_ok=True)
 
     train_indices = np.where(data.folds != fold)[0]
     valid_indices = np.where(data.folds == fold)[0]
@@ -969,9 +1173,66 @@ def train_tb_p0_fold(
         else None
     )
     observed_order: list[str] = []
+    data_fingerprint = _aligned_data_fingerprint(data)
+    resume_identity = _resume_identity(
+        run_name=run_name,
+        fold=fold,
+        config=config,
+        git_revision=git_revision,
+        source_manifest_sha256=source_manifest_sha256,
+        competition_cache_fingerprint=competition_cache_fingerprint,
+        data_fingerprint=data_fingerprint,
+        model_structure_fingerprint=_model_structure_fingerprint(model),
+        coverage_arm=coverage_arm,
+        matched_schedule=matched_schedule,
+    )
+    start_epoch = 0
+    resumed_from_epoch = 0
+    resume_checkpoint: Path | None = None
+    if resume:
+        resume_state, resume_checkpoint = _load_latest_tb_p0_resume(
+            resume_dir,
+            resume_identity,
+            epochs=config.epochs,
+        )
+        if resume_state is not None:
+            model.load_state_dict(resume_state["model_state"])
+            optimizer.load_state_dict(resume_state["optimizer_state"])
+            _optimizer_to_device(optimizer, torch_device)
+            scheduler.load_state_dict(resume_state["scheduler_state"])
+            start_epoch = int(resume_state["next_epoch"])
+            resumed_from_epoch = start_epoch
+            best_auc = float(resume_state["best_auc"])
+            best_epoch = int(resume_state["best_epoch"])
+            best_state = resume_state["best_model_state"]
+            history = list(resume_state["history"])
+            first_step_loss = float(resume_state["first_step_loss"])
+            last_step_loss = float(resume_state["last_step_loss"])
+            optimizer_updates = int(resume_state["optimizer_updates"])
+            saved_exposure = resume_state.get("exposure_counts")
+            if exposure_counts is not None:
+                if not isinstance(saved_exposure, np.ndarray):
+                    raise ValueError(
+                        "Track B resume checkpoint is missing exposure state"
+                    )
+                if saved_exposure.shape != exposure_counts.shape:
+                    raise ValueError(
+                        "Track B resume checkpoint exposure shape does not match"
+                    )
+                exposure_counts = saved_exposure.copy()
+                observed_order = list(resume_state["observed_order"])
+            elif saved_exposure is not None:
+                raise ValueError(
+                    "Track B resume checkpoint has unexpected exposure state"
+                )
+            _restore_tb_p0_rng_state(
+                resume_state["rng_state"],
+                generator,
+                torch_device,
+            )
     started = time.perf_counter()
     optimizer.zero_grad(set_to_none=True)
-    for epoch in range(config.epochs):
+    for epoch in range(start_epoch, config.epochs):
         if matched_schedule is not None:
             epoch_indices = matched_schedule.study_indices[epoch]
             choices = matched_schedule.c1_group_indices[epoch].copy()
@@ -1081,6 +1342,50 @@ def train_tb_p0_fold(
                 name: value.detach().cpu().clone()
                 for name, value in model.state_dict().items()
             }
+        completed_epoch = epoch + 1
+        epoch_path = resume_dir / f"epoch-{completed_epoch:03d}.pt"
+        epoch_manifest_path = resume_dir / f"epoch-{completed_epoch:03d}.json"
+        resume_state = {
+            "schema_version": 2,
+            "stage": "TB-P0-epoch-resume",
+            "identity": resume_identity,
+            "next_epoch": completed_epoch,
+            "model_state": _cpu_tree(model.state_dict()),
+            "optimizer_state": _cpu_tree(optimizer.state_dict()),
+            "scheduler_state": scheduler.state_dict(),
+            "scaler_state": None,
+            "best_auc": best_auc,
+            "best_epoch": best_epoch,
+            "best_model_state": best_state,
+            "optimizer_updates": optimizer_updates,
+            "first_step_loss": first_step_loss,
+            "last_step_loss": last_step_loss,
+            "history": history,
+            "rng_state": _capture_tb_p0_rng_state(generator),
+            "exposure_counts": exposure_counts,
+            "observed_order": observed_order,
+        }
+        _atomic_torch_save(epoch_path, resume_state)
+        epoch_manifest = {
+            "schema_version": 1,
+            "stage": "TB-P0-epoch-resume-manifest",
+            "run_name": run_name,
+            "fold": fold,
+            "completed_epoch": completed_epoch,
+            "next_epoch": completed_epoch,
+            "checkpoint": epoch_path.name,
+            "sha256": _sha256_file(epoch_path),
+            "competition_cache_fingerprint": competition_cache_fingerprint,
+            "data_fingerprint": data_fingerprint,
+        }
+        _atomic_bytes(
+            epoch_manifest_path,
+            (
+                json.dumps(epoch_manifest, indent=2, allow_nan=False) + "\n"
+            ).encode("utf-8"),
+        )
+        if epoch_checkpoint_callback is not None:
+            epoch_checkpoint_callback(epoch_manifest)
     if best_state is None:
         raise RuntimeError("TB-P0 training did not produce a checkpoint")
     model.load_state_dict(best_state)
@@ -1099,6 +1404,11 @@ def train_tb_p0_fold(
         "best_valid_auc": best_auc,
         "optimizer_updates": optimizer_updates,
         "expected_optimizer_updates": total_updates,
+        "resumed_from_epoch": resumed_from_epoch,
+        "resume_checkpoint": (
+            resume_checkpoint.name if resume_checkpoint is not None else None
+        ),
+        "resume_epochs": len(history),
         "coverage_arm": coverage_arm,
         "matched_schedule_fingerprint": (
             matched_schedule.fingerprint if matched_schedule is not None else None
@@ -1224,6 +1534,11 @@ def train_tb_p0_fold(
         "last_step_loss": last_step_loss,
         "optimizer_updates": optimizer_updates,
         "expected_optimizer_updates": total_updates,
+        "resumed_from_epoch": resumed_from_epoch,
+        "resume_checkpoint": (
+            resume_checkpoint.name if resume_checkpoint is not None else None
+        ),
+        "resume_directory": resume_dir.name,
         "coverage_arm": coverage_arm,
         "matched_schedule_fingerprint": (
             matched_schedule.fingerprint if matched_schedule is not None else None
