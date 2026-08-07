@@ -205,7 +205,7 @@ Changed `physical_crop_mm=130.0` → `150.0` in both `extract_feature_shard` and
 
 Gate: canary on `modal-tertiary`, shard 0 of 256 — **passed**. 18 studies, 0 failures, `feature_dim` 2304, 46 slices, 21.05 s (1.17 s/study), fingerprint `c7d193298d5809b1929ed1e113c90a2d1d17fdaf45d2cdf2a067b1a445dde6b2` (different from the phys130 canary's `29cc3fbb...`, confirming the crop change took effect), sha256 `997a74ab4709ae299a5a8a29f88ef588f3c41f9d840e85172a85f00cac5f50be`.
 
-### B1: cache preprocessed study tensors — code/canary done, full cache pending approval
+### B1: cache preprocessed study tensors — done
 
 Decoding one study takes ~2.5 s. At 3,525 training studies that is >2 h per epoch of pure I/O, which makes naive end-to-end training impossible. Cache once.
 
@@ -215,15 +215,13 @@ Commits `90808e1` and `0146e14` added CPU-only `cache_study_images`, `cache_imag
 
 The first canary used compressed uint8 NPZ: 18/18 studies, correctness passed, but mean size 10.24 MB projected ~45 GB, so the full run was stopped. A one-study compression audit selected lossless WebP. The second canary on `modal-secondary` passed: 18 written, 0 failures, 67.07 s, mean 6,801,254 bytes, max 8,497,144 bytes. Five studies rebuilt independently from DICOM matched all shapes/masks/positions/slot IDs; maximum normalized pixel error was 0.00875366 against the mathematically correct uint8/ImageNet bound 0.00875797.
 
-Canary projection: **29.973 GB (27.915 GiB) for 4,407 studies**, just under the planning target of 30 GB. The 30 GB figure is an internal storage target, not a Modal limit. The full 256-shard cache remains unlaunched pending explicit approval.
-
-**Gate for the full run:** 4,407 ZIP files, 0 failures, measured total near or below the canary projection, and the same five-study validation passes. Stop if projected total rises materially above 30 GB.
+The approved full run completed on `modal-secondary` across 256 shards, scaled from 16 to 40 CPU containers. Final result: **4,407/4,407 ZIP files**, all 256 shard results present, **0 failures**, and 256 failure manifests. Total storage calculated from each shard's study count and rounded mean file size is **30.669 GB (28.563 GiB)**, 2.3% above the canary projection but still near the 30 GB internal planning target and not a Modal limit. The final five-study independent DICOM rebuild passed again: masks, positions, slot IDs, and shapes matched, with maximum normalized pixel error 0.00875366 below the 0.00875797 bound. The full-run gate passed.
 
 This is the one lengthy DICOM preprocessing pass needed for Phases B/C/E. Those phases reuse the cache; do **not** rerun frozen DINO feature extraction. A future experiment that changes baked pixel geometry (for example 448 px or a different physical crop in Phase D) needs a separate image cache for that experiment, not a repeat of the current frozen-feature extraction.
 
-### B2: training module
+### B2: training module — local core done, Modal entry point pending
 
-New `src/rsna_knee/finetune.py`.
+`src/rsna_knee/finetune.py` now contains the strict cache dataset/model foundation (commit `343fd42`) and CPU-testable training core (commit `abce10a`). The training core includes pinned DINOv2 source, checkpointed trainable blocks, EfficientNetV2-S support, separate optimizer groups, warmup/cosine scheduling, accumulation, bf16, clipping, EMA, grouped validation AUC, early stopping, fold locking, and atomic fold-specific artifacts. Independent review findings were fixed; full suite: **122 passed**. No GPU training has run.
 
 **Dataset** `CachedStudyDataset` returns `images [46,3,336,336] float32` (ImageNet-normalized), `valid_mask [46]`, `positions [46]`, `slot_ids [46]`, `targets [12]`, `weights [12]`. Augmentation when enabled, applied consistently across the whole study: h-flip p=0.5 (laterality is already normalized, so this is a true augmentation), rotation ±10°, intensity scale [0.9,1.1] and shift ±0.05, per-slice dropout p=0.1 (never all of a slot), per-slot dropout p=0.1.
 
@@ -239,7 +237,7 @@ Import `weighted_soft_bce`, `sqrt_positive_class_weights`, and `pairwise_auc_los
 
 Both use the Phase A winning label file and `folds-v1.csv`.
 
-**Modal entry point** `train_finetune`, modelled on `train_heads`: both volumes mounted, a `fold` argument so five folds run as parallel containers via `.map()`, writes `fold-{k}.pt`, `oof-{k}.csv`, `metadata.json` under `heads/finetune-<name>/`, `timeout=21600`, A10, refuses to overwrite.
+**Modal entry point** `train_finetune`, modelled on `train_heads`: both volumes mounted, a `fold` argument so five folds run as parallel containers via `.map()`, writes `fold-{k}.pt`, `oof-{k}.csv`, and `fold-{k}.metadata.json` under `heads/finetune-<name>/`, `timeout=21600`, A10, and refuses to overwrite using an exclusive fold lock. A finalizer will aggregate fold metadata and OOF files after all folds finish.
 
 ### B3: smoke test
 
