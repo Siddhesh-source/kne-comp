@@ -120,6 +120,11 @@ The gate has not been launched. This is still not a five-fold training run.
   strict finalizer. The finalizer requires exactly 4,407 unique study identities and
   files, matching source hashes and unchanged archive sizes before it writes the cache
   manifest.
+- The full C1 cache finalized on August 8 with all 40 shards and 4,407 studies. It
+  contains 20,942,235,080 bytes (19.50 GiB), with a mean of 18.315 valid groups per
+  study and a range of 8–24. Valid-group counts were 8: 1, 12: 388, 16: 1,410,
+  20: 2,275 and 24: 333. The cache fingerprint is
+  `c22a5944d51da9d6af84c2d63fa777afbe10db78e3acb319f8b02d3ffd9afa33`.
 - The matched fold-0 gate now reads both arms from the same schema-v2 cache. It uses an
   explicit shared epoch-by-epoch study order, registered group zero for C0 and
   deterministic valid-group choices for C1. It rejects any mismatch in configuration,
