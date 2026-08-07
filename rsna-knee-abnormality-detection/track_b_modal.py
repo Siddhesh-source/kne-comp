@@ -1613,6 +1613,8 @@ def track_b_train_c1_fold(
     completed_metadata_path = output / f"fold-{fold}.metadata.json"
     if completed_metadata_path.is_file():
         completed = json.loads(completed_metadata_path.read_text(encoding="utf-8"))
+        completed_checkpoint = output / f"fold-{fold}.pt"
+        completed_oof = output / f"fold-{fold}.oof.csv"
         if (
             completed.get("run_name") != run_name
             or completed.get("fold") != fold
@@ -1620,6 +1622,14 @@ def track_b_train_c1_fold(
             or completed.get("git_revision") != git_revision
             or completed.get("competition_cache_fingerprint")
             != manifest.get("competition_cache_fingerprint")
+            or not completed_checkpoint.is_file()
+            or not completed_oof.is_file()
+            or completed.get("output_hashes", {}).get(
+                completed_checkpoint.name
+            )
+            != _sha256_file(completed_checkpoint)
+            or completed.get("output_hashes", {}).get(completed_oof.name)
+            != _sha256_file(completed_oof)
         ):
             raise ValueError(f"completed C1 fold {fold} is incompatible")
         return {
@@ -1864,16 +1874,48 @@ def track_b_finalize_finetune(run_name: str) -> dict[str, object]:
     data_volume.reload()
     artifact_volume.reload()
     folds_path = DATA_MOUNT / "metadata" / "folds-v1.csv"
-    if not folds_path.is_file():
-        raise FileNotFoundError(folds_path)
+    targets_path = DATA_MOUNT / "metadata" / "consensus-labels-v1.csv"
+    for path in (folds_path, targets_path):
+        if not path.is_file():
+            raise FileNotFoundError(path)
     metadata = finalize_tb_p0_run(
         TRACK_B_ROOT / "runs" / run_name,
         folds_path,
         run_name=run_name,
         expected_studies=4407,
+        targets=targets_path,
     )
     artifact_volume.commit()
     return metadata
+
+
+@app.function(
+    image=image,
+    cpu=2,
+    memory=8192,
+    timeout=1800,
+    max_containers=1,
+    volumes={DATA_MOUNT: data_volume, ARTIFACT_MOUNT: artifact_volume},
+)
+def track_b_evaluate_finetune(run_name: str) -> dict[str, object]:
+    """Write strict grouped OOF metrics after five-fold finalization."""
+    from rsna_knee.track_b_training import write_tb_p0_oof_metrics
+
+    data_volume.reload()
+    artifact_volume.reload()
+    folds_path = DATA_MOUNT / "metadata" / "folds-v1.csv"
+    targets_path = DATA_MOUNT / "metadata" / "consensus-labels-v1.csv"
+    for path in (folds_path, targets_path):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    metrics = write_tb_p0_oof_metrics(
+        TRACK_B_ROOT / "runs" / run_name,
+        folds_path,
+        targets_path,
+        expected_studies=4407,
+    )
+    artifact_volume.commit()
+    return metrics
 
 
 @app.function(
@@ -2243,3 +2285,11 @@ def finalize_finetune(run_name: str) -> None:
     import json
 
     print(json.dumps(track_b_finalize_finetune.remote(run_name), indent=2))
+
+
+@app.local_entrypoint()
+def evaluate_finetune(run_name: str) -> None:
+    """Calculate and persist strict grouped OOF metrics."""
+    import json
+
+    print(json.dumps(track_b_evaluate_finetune.remote(run_name), indent=2))

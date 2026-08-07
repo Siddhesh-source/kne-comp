@@ -27,13 +27,16 @@ from rsna_knee.track_b_training import (
     build_matched_coverage_schedule,
     build_tb_p0_optimizer,
     build_tb_p0_scheduler,
+    evaluate_tb_p0_oof,
     finalize_tb_p0_run,
     optimizer_updates_per_epoch,
     paired_report_group_bootstrap,
+    predict_tb_p0_fold_cache,
     tb_p0_parameter_groups,
     train_tb_p0_fold,
     validate_matched_coverage_results,
     verify_registered_c0_sample,
+    write_tb_p0_oof_metrics,
     write_matched_coverage_evidence,
 )
 
@@ -831,6 +834,55 @@ def test_matched_arms_have_equal_order_updates_and_presentations(tmp_path):
     assert all(row[1:] == [0, 0, 0] for row in c0_exposure["by_slot_group"])
 
 
+def test_promoted_c1_fold_predicts_grouped_cache_with_verified_artifact(tmp_path):
+    data, _ = matched_grouped_fixture(tmp_path)
+    output = tmp_path / "c1-inference-run"
+    config = TBP0Config(
+        feature_dim=8,
+        hidden_dim=6,
+        epochs=1,
+        batch_size=3,
+        seed=101,
+    )
+    train_tb_p0_fold(
+        data,
+        output,
+        2,
+        run_name="tb-c1-inference-test",
+        config=config,
+        model_factory=TinyTBP0Model,
+        device="cpu",
+        git_revision="revision",
+        source_manifest_sha256="source",
+        competition_cache_fingerprint="cache",
+        coverage_arm="c1",
+    )
+
+    result = predict_tb_p0_fold_cache(
+        tmp_path / "matched-grouped",
+        output,
+        2,
+        model_factory=TinyTBP0Model,
+        device="cpu",
+    )
+
+    assert result[ID_COLUMN].tolist() == sorted(data.study_ids.tolist())
+    assert list(result.columns) == [ID_COLUMN, *LABELS]
+    assert np.isfinite(result.loc[:, LABELS].to_numpy()).all()
+    metadata_path = output / "fold-2.metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["output_hashes"]["fold-2.pt"] = "0" * 64
+    metadata_path.write_text(json.dumps(metadata))
+    with pytest.raises(ValueError, match="provenance"):
+        predict_tb_p0_fold_cache(
+            tmp_path / "matched-grouped",
+            output,
+            2,
+            model_factory=TinyTBP0Model,
+            device="cpu",
+        )
+
+
 def test_tb_p0_finalizer_requires_exact_five_fold_oof(tmp_path):
     data = aligned_cache_fixture(tmp_path)
     output = tmp_path / "five-fold-run"
@@ -853,6 +905,7 @@ def test_tb_p0_finalizer_requires_exact_five_fold_oof(tmp_path):
             git_revision="test-revision",
             source_manifest_sha256="manifest-fingerprint",
             competition_cache_fingerprint="cache-fingerprint",
+            coverage_arm="c1",
         )
     folds = pd.DataFrame(
         {
@@ -861,17 +914,62 @@ def test_tb_p0_finalizer_requires_exact_five_fold_oof(tmp_path):
             "fold": data.folds,
         }
     )
+    targets = pd.DataFrame(
+        {
+            ID_COLUMN: data.study_ids,
+            **{
+                label: data.targets[:, label_index]
+                for label_index, label in enumerate(LABELS)
+            },
+        }
+    )
+    fold_zero_oof = output / "fold-0.oof.csv"
+    original_oof = fold_zero_oof.read_bytes()
+    fold_zero_oof.write_bytes(original_oof + b"\n")
+    with pytest.raises(ValueError, match="artifact hash"):
+        finalize_tb_p0_run(
+            output,
+            folds,
+            run_name="tb-p0-five-fold",
+            expected_studies=10,
+            targets=targets,
+        )
+    fold_zero_oof.write_bytes(original_oof)
     metadata = finalize_tb_p0_run(
         output,
         folds,
         run_name="tb-p0-five-fold",
         expected_studies=10,
+        targets=targets,
     )
     oof = pd.read_csv(output / "oof.csv")
     assert metadata["folds"] == [0, 1, 2, 3, 4]
     assert metadata["studies"] == 10
+    assert metadata["oof_metrics"]["macro_auc"] == pytest.approx(
+        evaluate_tb_p0_oof(
+            oof,
+            folds,
+            targets,
+            expected_studies=10,
+        )["macro_auc"]
+    )
     assert oof[ID_COLUMN].tolist() == data.study_ids.tolist()
     assert not oof[ID_COLUMN].duplicated().any()
+    metrics = write_tb_p0_oof_metrics(
+        output,
+        folds,
+        targets,
+        expected_studies=10,
+    )
+    assert metrics["studies"] == 10
+    assert (output / "metrics.json").is_file()
+    with pytest.raises(FileExistsError, match="already finalized"):
+        write_tb_p0_oof_metrics(
+            output,
+            folds,
+            targets,
+            expected_studies=10,
+        )
     with pytest.raises(FileExistsError, match="already finalized"):
         finalize_tb_p0_run(
             output,

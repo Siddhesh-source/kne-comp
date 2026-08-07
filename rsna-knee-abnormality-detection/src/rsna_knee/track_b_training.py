@@ -780,6 +780,52 @@ class TBP0CachedDataset(Dataset):
         }
 
 
+class TBP0InferenceDataset(Dataset):
+    """Strict label-free reader for schema-v2 grouped Track B caches."""
+
+    def __init__(self, cache_paths: list[Path] | tuple[Path, ...]) -> None:
+        self.cache_paths = tuple(Path(path) for path in cache_paths)
+        if not self.cache_paths:
+            raise ValueError("Track B inference cache is empty")
+        study_ids = [path.stem for path in self.cache_paths]
+        if len(study_ids) != len(set(study_ids)):
+            raise ValueError("Track B inference cache contains duplicate study IDs")
+
+    def __len__(self) -> int:
+        return len(self.cache_paths)
+
+    def __getitem__(self, item: int) -> dict[str, Tensor | str]:
+        path = self.cache_paths[item]
+        decoded = read_track_b_cache(path, normalize=False)
+        images = decoded.get("images")
+        valid_mask = decoded.get("valid_group_mask")
+        metadata = decoded.get("metadata")
+        if (
+            not isinstance(images, Tensor)
+            or images.ndim != 5
+            or images.shape[:2] != (
+                len(TB_P0_SLOT_NAMES),
+                valid_mask.shape[1] if isinstance(valid_mask, Tensor) else -1,
+            )
+            or not isinstance(valid_mask, Tensor)
+            or valid_mask.shape != images.shape[:2]
+            or not isinstance(metadata, dict)
+            or metadata.get("schema_version") != 2
+            or metadata.get("study_id") != path.stem
+        ):
+            raise ValueError(f"invalid schema-v2 inference cache: {path}")
+        images = images.float().div_(255)
+        mean = images.new_tensor((0.485, 0.456, 0.406)).view(1, 1, 3, 1, 1)
+        std = images.new_tensor((0.229, 0.224, 0.225)).view(1, 1, 3, 1, 1)
+        images = (images - mean) / std
+        images[~valid_mask] = 0
+        return {
+            "study_id": path.stem,
+            "images": images,
+            "valid_mask": valid_mask,
+        }
+
+
 def _atomic_bytes(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -1032,6 +1078,83 @@ def _predict_tb_p0(
         np.concatenate(targets),
         study_ids,
     )
+
+
+@torch.no_grad()
+def predict_tb_p0_fold_cache(
+    cache_root: str | Path,
+    run_dir: str | Path,
+    fold: int,
+    *,
+    batch_size: int | None = None,
+    model_factory: Callable[[], nn.Module] | None = None,
+    device: str | torch.device = "cuda",
+) -> pd.DataFrame:
+    """Predict one grouped cache with a validated promoted-C1 fold artifact."""
+    if type(fold) is not int or fold not in range(5):
+        raise ValueError("fold must be an integer from 0 through 4")
+    run_dir = Path(run_dir)
+    checkpoint_path = run_dir / f"fold-{fold}.pt"
+    metadata_path = run_dir / f"fold-{fold}.metadata.json"
+    if not checkpoint_path.is_file() or not metadata_path.is_file():
+        raise FileNotFoundError(f"completed Track B fold {fold} is missing")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    declared_hash = metadata.get("output_hashes", {}).get(checkpoint_path.name)
+    if (
+        metadata.get("stage") != "TB-P0"
+        or metadata.get("fold") != fold
+        or metadata.get("coverage_arm") != "c1"
+        or metadata.get("checkpoint") != checkpoint_path.name
+        or declared_hash != _sha256_file(checkpoint_path)
+    ):
+        raise ValueError(f"Track B fold {fold} provenance is incompatible")
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=True,
+    )
+    if (
+        checkpoint.get("schema_version") != 1
+        or checkpoint.get("stage") != "TB-P0"
+        or checkpoint.get("run_name") != metadata.get("run_name")
+        or checkpoint.get("fold") != fold
+        or checkpoint.get("coverage_arm") != "c1"
+        or checkpoint.get("config") != metadata.get("config")
+    ):
+        raise ValueError(f"Track B fold {fold} checkpoint is incompatible")
+    config = TBP0Config(**checkpoint["config"])
+    validate_tb_p0_config(config)
+    effective_batch_size = batch_size or config.batch_size
+    if type(effective_batch_size) is not int or effective_batch_size < 1:
+        raise ValueError("inference batch size must be a positive integer")
+    cache_paths = sorted(Path(cache_root).glob("*.zip"))
+    dataset = TBP0InferenceDataset(cache_paths)
+    loader = DataLoader(
+        dataset,
+        batch_size=effective_batch_size,
+        shuffle=False,
+        num_workers=config.num_workers,
+    )
+    torch_device = torch.device(device)
+    model = (
+        model_factory() if model_factory is not None else create_tb_p0_model(config)
+    ).to(torch_device)
+    model.load_state_dict(checkpoint["model_state"])
+    model.eval()
+    predictions: list[np.ndarray] = []
+    study_ids: list[str] = []
+    for batch in loader:
+        logits = model(
+            batch["images"].to(torch_device),
+            batch["valid_mask"].to(torch_device),
+        )
+        predictions.append(torch.sigmoid(logits).float().cpu().numpy())
+        study_ids.extend(str(value) for value in batch["study_id"])
+    values = np.concatenate(predictions)
+    result = pd.DataFrame({ID_COLUMN: study_ids})
+    for label_index, label in enumerate(LABELS):
+        result[label] = values[:, label_index]
+    return result
 
 
 def train_tb_p0_fold(
@@ -1795,12 +1918,143 @@ def write_matched_coverage_evidence(
     return metadata
 
 
+def evaluate_tb_p0_oof(
+    oof: str | Path | pd.DataFrame,
+    folds: str | Path | pd.DataFrame,
+    targets: str | Path | pd.DataFrame,
+    *,
+    expected_studies: int = 4407,
+) -> dict[str, object]:
+    """Compute strict report-group macro and per-label AUC for complete OOF."""
+    oof_frame = (
+        pd.read_csv(oof, dtype={ID_COLUMN: str})
+        if not isinstance(oof, pd.DataFrame)
+        else oof.copy()
+    )
+    fold_frame = (
+        pd.read_csv(folds, dtype={ID_COLUMN: str})
+        if not isinstance(folds, pd.DataFrame)
+        else folds.copy()
+    )
+    validate_fold_assignments(fold_frame, 5)
+    fold_frame[ID_COLUMN] = fold_frame[ID_COLUMN].astype(str)
+    target_frame = (
+        pd.read_csv(targets, dtype={ID_COLUMN: str})
+        if not isinstance(targets, pd.DataFrame)
+        else targets.copy()
+    )
+    required_columns = {ID_COLUMN, *LABELS}
+    if (
+        expected_studies < 1
+        or len(fold_frame) != expected_studies
+        or set(oof_frame.columns) != required_columns
+        or not required_columns.issubset(target_frame.columns)
+        or oof_frame[ID_COLUMN].duplicated().any()
+        or target_frame[ID_COLUMN].duplicated().any()
+    ):
+        raise ValueError("Track B OOF inputs have invalid rows or schema")
+    oof_frame[ID_COLUMN] = oof_frame[ID_COLUMN].astype(str)
+    target_frame[ID_COLUMN] = target_frame[ID_COLUMN].astype(str)
+    expected_ids = set(fold_frame[ID_COLUMN])
+    if (
+        set(oof_frame[ID_COLUMN]) != expected_ids
+        or set(target_frame[ID_COLUMN]) != expected_ids
+    ):
+        raise ValueError("Track B OOF target or prediction identities do not match")
+    ordered_ids = fold_frame[ID_COLUMN].tolist()
+    target_values = target_frame.set_index(ID_COLUMN).loc[
+        ordered_ids, LABELS
+    ].to_numpy(dtype=np.float64)
+    prediction_values = oof_frame.set_index(ID_COLUMN).loc[
+        ordered_ids, LABELS
+    ].to_numpy(dtype=np.float64)
+    if (
+        not np.isfinite(target_values).all()
+        or np.any((target_values < 0) | (target_values > 1))
+        or not np.isfinite(prediction_values).all()
+        or np.any((prediction_values < 0) | (prediction_values > 1))
+    ):
+        raise ValueError("Track B OOF values must be finite probabilities")
+    groups = fold_frame.set_index(ID_COLUMN).loc[
+        ordered_ids, "report_group"
+    ].astype(str)
+    group_frame = pd.DataFrame({"group": groups.to_numpy()})
+    grouped_targets = (
+        pd.DataFrame(target_values).groupby(group_frame["group"], sort=True).mean()
+    )
+    grouped_predictions = (
+        pd.DataFrame(prediction_values)
+        .groupby(group_frame["group"], sort=True)
+        .mean()
+    )
+    binary = grouped_targets.to_numpy() > 0.5
+    from sklearn.metrics import roc_auc_score
+
+    per_label: dict[str, float] = {}
+    skipped: list[str] = []
+    for label_index, label in enumerate(LABELS):
+        if np.unique(binary[:, label_index]).size < 2:
+            skipped.append(label)
+            continue
+        per_label[label] = float(
+            roc_auc_score(
+                binary[:, label_index],
+                grouped_predictions.iloc[:, label_index],
+            )
+        )
+    if skipped:
+        raise ValueError(
+            f"Track B OOF AUC is undefined for labels: {sorted(skipped)}"
+        )
+    return {
+        "schema_version": 1,
+        "stage": "TB-P0-OOF-metrics",
+        "studies": len(oof_frame),
+        "report_groups": int(len(grouped_targets)),
+        "aggregation": "report_group_mean",
+        "target_binarization": ">0.5",
+        "macro_auc": float(np.mean(list(per_label.values()))),
+        "per_label_auc": per_label,
+        "skipped_labels": skipped,
+    }
+
+
+def write_tb_p0_oof_metrics(
+    output_dir: str | Path,
+    folds: str | Path | pd.DataFrame,
+    targets: str | Path | pd.DataFrame,
+    *,
+    expected_studies: int = 4407,
+) -> dict[str, object]:
+    """Write create-only metrics for a finalized five-fold OOF."""
+    output_dir = Path(output_dir)
+    oof_path = output_dir / "oof.csv"
+    metrics_path = output_dir / "metrics.json"
+    if not oof_path.is_file():
+        raise FileNotFoundError(oof_path)
+    if metrics_path.exists():
+        raise FileExistsError("Track B OOF metrics are already finalized")
+    metrics = evaluate_tb_p0_oof(
+        oof_path,
+        folds,
+        targets,
+        expected_studies=expected_studies,
+    )
+    metrics["outputs"] = {"oof.csv": _sha256_file(oof_path)}
+    _atomic_bytes(
+        metrics_path,
+        (json.dumps(metrics, indent=2, allow_nan=False) + "\n").encode("utf-8"),
+    )
+    return metrics
+
+
 def finalize_tb_p0_run(
     output_dir: str | Path,
     folds: str | Path | pd.DataFrame,
     *,
     run_name: str,
     expected_studies: int = 4407,
+    targets: str | Path | pd.DataFrame | None = None,
 ) -> dict[str, object]:
     """Create exactly one strict five-fold TB-P0 OOF without overwriting."""
     output_dir = Path(output_dir)
@@ -1827,6 +2081,8 @@ def finalize_tb_p0_run(
     frames: list[pd.DataFrame] = []
     fold_metadata: list[dict[str, object]] = []
     reference_config: object | None = None
+    reference_provenance: dict[str, object] | None = None
+    artifact_hashes: dict[str, str] = {}
     for fold in range(5):
         checkpoint_path = output_dir / f"fold-{fold}.pt"
         oof_path = output_dir / f"fold-{fold}.oof.csv"
@@ -1843,12 +2099,34 @@ def finalize_tb_p0_run(
             metadata.get("fold") != fold
             or metadata.get("run_name") != run_name
             or metadata.get("stage") != "TB-P0"
+            or metadata.get("coverage_arm") != "c1"
+            or metadata.get("checkpoint") != checkpoint_path.name
+            or metadata.get("oof") != oof_path.name
         ):
             raise ValueError(f"fold {fold} metadata is incompatible")
+        for path in (checkpoint_path, oof_path):
+            declared = metadata.get("output_hashes", {}).get(path.name)
+            actual = _sha256_file(path)
+            if declared != actual:
+                raise ValueError(f"fold {fold} artifact hash is invalid")
+            artifact_hashes[path.name] = actual
         if reference_config is None:
             reference_config = metadata.get("config")
         elif metadata.get("config") != reference_config:
             raise ValueError("TB-P0 fold configurations do not match")
+        provenance = {
+            key: metadata.get(key)
+            for key in (
+                "git_revision",
+                "source_manifest_sha256",
+                "competition_cache_fingerprint",
+                "backbone_repository_revision",
+            )
+        }
+        if reference_provenance is None:
+            reference_provenance = provenance
+        elif provenance != reference_provenance:
+            raise ValueError("TB-P0 fold provenance does not match")
         frame = pd.read_csv(oof_path, dtype={ID_COLUMN: str})
         required = {ID_COLUMN, *LABELS}
         if set(frame.columns) != required or frame[ID_COLUMN].duplicated().any():
@@ -1876,6 +2154,16 @@ def finalize_tb_p0_run(
     }
     combined["_order"] = combined[ID_COLUMN].map(order)
     combined = combined.sort_values("_order").drop(columns="_order")
+    oof_metrics = (
+        evaluate_tb_p0_oof(
+            combined,
+            fold_frame,
+            targets,
+            expected_studies=expected_studies,
+        )
+        if targets is not None
+        else None
+    )
     _atomic_bytes(
         final_paths["oof"],
         combined.to_csv(index=False).encode("utf-8"),
@@ -1887,11 +2175,17 @@ def finalize_tb_p0_run(
         "folds": list(range(5)),
         "studies": expected_studies,
         "config": reference_config,
+        "provenance": reference_provenance,
         "fold_metadata": [
             path.name
             for path in sorted(output_dir.glob("fold-*.metadata.json"))
         ],
+        "fold_best_valid_auc": [
+            float(item["best_valid_auc"]) for item in fold_metadata
+        ],
+        "oof_metrics": oof_metrics,
         "oof": final_paths["oof"].name,
+        "fold_artifact_hashes": artifact_hashes,
         "output_hashes": {
             final_paths["oof"].name: _sha256_file(final_paths["oof"])
         },
