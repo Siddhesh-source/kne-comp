@@ -197,13 +197,13 @@ Replaces the constant prior with a per-study LLM estimate instead of a flat numb
 
 This phase decides whether we finish near 0.80 or near 0.90. 2–3 weeks, ~30 A10h, ~$40. Expected LB **0.84–0.87**.
 
-### B0: switch the physical crop to 150 mm (do this first)
+### B0: switch the physical crop to 150 mm — done, committed `87301cc`
 
-Competition series have an exactly 150.0 mm FOV across all four acquisition matrices (960 px @ 0.1562 mm, 896 @ 0.1674, 800 @ 0.1875, 640 @ 0.2344 — every product is 150.0). Our 130 mm was a guess. This must land before the image cache, which bakes it in.
+Competition series have an exactly 150.0 mm FOV across all four acquisition matrices (960 px @ 0.1562 mm, 896 @ 0.1674, 800 @ 0.1875, 640 @ 0.2344 — every product is 150.0). Our 130 mm was a guess.
 
-Change `physical_crop_mm=130.0` → `150.0` in `extract_feature_shard` and `extract_test_features` in `modal_app.py`; bump the version string in `model_config.py` and `V2_PREPROCESSING_VERSION` in `dino_features.py` to `dino336-2p5d-l9l12-phys150-v3`; update the README commands and any test asserting the old string.
+Changed `physical_crop_mm=130.0` → `150.0` in both `extract_feature_shard` and `extract_test_features` in `modal_app.py`; bumped the version string in `model_config.py` and `V2_PREPROCESSING_VERSION` in `dino_features.py` to `dino336-2p5d-l9l12-phys150-v3`; updated the README commands and `test_kaggle_scaffolding.py`. `93 passed`.
 
-Gate: tests pass, and one canary shard on `modal-tertiary` reports `failures: 0`, `studies: 18`, `feature_dim: 2304`, and a fingerprint different from `29cc3fbb3b5840ef0f7d43728b7730f2f887d7060eacf72edecbd5df5a1d865b`.
+Gate: canary on `modal-tertiary`, shard 0 of 256 — **passed**. 18 studies, 0 failures, `feature_dim` 2304, 46 slices, 21.05 s (1.17 s/study), fingerprint `c7d193298d5809b1929ed1e113c90a2d1d17fdaf45d2cdf2a067b1a445dde6b2` (different from the phys130 canary's `29cc3fbb...`, confirming the crop change took effect), sha256 `997a74ab4709ae299a5a8a29f88ef588f3c41f9d840e85172a85f00cac5f50be`.
 
 ### B1: cache preprocessed study tensors
 
@@ -334,7 +334,7 @@ Actual/planned IDs: `A0`–`A4-p05` Phase A (closed, see Section 6), `E006` opti
 
 **Reference notebooks** (Kaggle-displayed scores, Aug 6): DINOv2 at meniscus resolution 0.802; Pilkwang baseline v1 0.770; DINOv2 fork 0.668; EDA to 2.5D 0.630; DINOsaur V2 0.621. A sweep of the cached sources in `references/notebooks/` on Aug 7 found only one score stated in notebook text (0.621, superseded by its own author). Treat the cached copies as sources of technique, not verified score. Unadopted techniques worth taking: the 150 mm crop (task B0), bootstrap-gated blend weights (A7), two-position-set slot assignment for unusual protocols. **Every public result above 0.77 puts gradients into the encoder** — independent confirmation of Phase B.
 
-**v3 preprocessing.** Committed at `79d3f97`. Canary on `modal-tertiary`, Aug 7: 18 studies, 0 failures, 2,304 dim, 46 slices, 53.1 s, 2.95 s/study, fingerprint `29cc3fbb...`, sha256 `d57a690a...`. Contents: 2.5D adjacent-slice triplets, DINO blocks 9 and 12, per-series windowing p1–p99.5, PixelSpacing-aware physical crop with 90% center-crop fallback, laterality normalization (right-knee sagittal reversal, coronal/axial flip), persisted fractional positions and slot IDs. Reused verbatim by Phase B through `build_study_images`.
+**v3 preprocessing.** Committed at `79d3f97`, physical crop corrected 130mm → 150mm at `87301cc` (B0). First canary (130mm, superseded) on `modal-tertiary`, Aug 7: 18 studies, 0 failures, 2,304 dim, 46 slices, 53.1 s, 2.95 s/study, fingerprint `29cc3fbb...`. Current canary (150mm) same day: 18 studies, 0 failures, 2,304 dim, 46 slices, 21.05 s, 1.17 s/study, fingerprint `c7d19329...`, sha256 `997a74ab...`. Contents: 2.5D adjacent-slice triplets, DINO blocks 9 and 12, per-series windowing p1–p99.5, PixelSpacing-aware 150mm physical crop with 90% center-crop fallback, laterality normalization (right-knee sagittal reversal, coronal/axial flip), persisted fractional positions and slot IDs. Reused verbatim by Phase B through `build_study_images`.
 
 **Links:** [competition](https://www.kaggle.com/competitions/rsna-knee-abnormality-detection) · [notebooks](https://www.kaggle.com/competitions/rsna-knee-abnormality-detection/code) · [meniscus resolution](https://www.kaggle.com/code/wguesdon/rsna-knee-dinov2-at-meniscus-resolution) · [pilkwang baseline](https://www.kaggle.com/code/pilkwang/rsna-knee-baseline-v1)
 </content>
