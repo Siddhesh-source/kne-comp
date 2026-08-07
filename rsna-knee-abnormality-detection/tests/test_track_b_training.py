@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from types import SimpleNamespace
 
@@ -551,7 +553,7 @@ class TinyTBP0Model(nn.Module):
         return self.head(torch.tanh(self.slice_backbone(values)))
 
 
-def test_cpu_fold_training_writes_create_only_tb_p0_artifacts(tmp_path):
+def test_cpu_fold_training_writes_create_only_tb_p0_artifacts(tmp_path, capsys):
     data = aligned_cache_fixture(tmp_path)
     output = tmp_path / "run"
     config = TBP0Config(
@@ -574,6 +576,17 @@ def test_cpu_fold_training_writes_create_only_tb_p0_artifacts(tmp_path):
         source_manifest_sha256="manifest-fingerprint",
         competition_cache_fingerprint="cache-fingerprint",
     )
+    events = [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if line.strip()
+    ]
+    assert [event["event"] for event in events] == [
+        "epoch_complete",
+        "epoch_complete",
+    ]
+    assert [event["epoch"] for event in events] == [1, 2]
+    assert all(event["epochs"] == 2 for event in events)
     assert metadata["stage"] == "TB-P0"
     assert metadata["valid_rows"] == 2
     assert metadata["optimizer_updates"] == metadata["expected_optimizer_updates"]

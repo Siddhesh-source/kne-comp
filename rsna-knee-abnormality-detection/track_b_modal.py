@@ -1424,7 +1424,7 @@ def track_b_train_fold(
 
 @app.function(
     image=image,
-    gpu="A10",
+    gpu="H100",
     cpu=16,
     memory=65536,
     ephemeral_disk=524288,
@@ -1477,10 +1477,29 @@ def track_b_train_coverage_arm(
         or manifest.get("studies") != 4407
     ):
         raise ValueError("full Track B C1 cache manifest is incompatible")
+    print(
+        json.dumps(
+            {
+                "event": "arm_start",
+                "arm": arm,
+                "run_name": run_name,
+                "studies": manifest["studies"],
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
     staging = _stage_cache_locally(
         grouped_root,
         Path("/tmp/track-b-coverage-cache"),
         expected_studies=4407,
+    )
+    print(
+        json.dumps(
+            {"event": "cache_staged", "arm": arm, **staging},
+            sort_keys=True,
+        ),
+        flush=True,
     )
     grouped_root = Path(str(staging["root"]))
     targets = pd.read_csv(targets_path, dtype={"StudyInstanceUID": str})
@@ -1688,6 +1707,44 @@ def track_b_finalize_finetune(run_name: str) -> dict[str, object]:
     )
     artifact_volume.commit()
     return metadata
+
+
+@app.function(
+    image=image,
+    cpu=1,
+    memory=2048,
+    timeout=43200,
+    max_containers=1,
+)
+def track_b_run_coverage_gate(
+    run_name: str,
+    git_revision: str,
+    crop_mm: int = 130,
+    batch_size: int = 8,
+    bootstrap_resamples: int = 2000,
+    arms: str = "c0,c1",
+) -> dict[str, object]:
+    """Keep parallel arm execution and CPU finalization alive remotely."""
+    selected_arms = _parse_coverage_arms(arms)
+    results = list(
+        track_b_train_coverage_arm.starmap(
+            (
+                (run_name, git_revision, arm, crop_mm, batch_size)
+                for arm in selected_arms
+            ),
+            order_outputs=False,
+        )
+    )
+    final = track_b_finalize_coverage_gate.remote(
+        run_name,
+        git_revision,
+        crop_mm,
+        bootstrap_resamples,
+    )
+    return {
+        "arms": sorted(results, key=lambda item: item["arm"]),
+        "final": final,
+    }
 
 
 @app.local_entrypoint()
@@ -1938,23 +1995,15 @@ def coverage_gate(
         cwd=PROJECT_ROOT.parent,
         text=True,
     ).strip()
-    results = list(
-        track_b_train_coverage_arm.starmap(
-            (
-                (run_name, revision, arm, crop_mm, batch_size)
-                for arm in selected_arms
-            ),
-            order_outputs=False,
-        )
-    )
-    print(json.dumps(sorted(results, key=lambda item: item["arm"]), indent=2))
     print(
         json.dumps(
-            track_b_finalize_coverage_gate.remote(
+            track_b_run_coverage_gate.remote(
                 run_name,
                 revision,
                 crop_mm,
+                batch_size,
                 bootstrap_resamples,
+                ",".join(selected_arms),
             ),
             indent=2,
         )

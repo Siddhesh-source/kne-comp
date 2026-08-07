@@ -130,7 +130,7 @@ The gate has not been launched. This is still not a five-fold training run.
   deterministic valid-group choices for C1. It rejects any mismatch in configuration,
   schedule fingerprint, optimizer updates, study presentations or study-order
   fingerprint.
-- C0 and C1 run as independent parallel A10 tasks. Each task stages the completed
+- C0 and C1 run as independent parallel H100 tasks. Each task stages the completed
   grouped cache once onto a 512 GiB ephemeral SSD with 16 copy workers, then trains all
   epochs from local storage. Either arm can be resumed alone without rerunning a
   completed arm. A separate CPU finalizer rebuilds the schedule, checks both arm

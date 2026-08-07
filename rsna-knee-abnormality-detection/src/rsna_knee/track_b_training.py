@@ -1058,6 +1058,22 @@ def train_tb_p0_fold(
                 "valid_auc": auc,
             }
         )
+        print(
+            json.dumps(
+                {
+                    "event": "epoch_complete",
+                    "run_name": run_name,
+                    "coverage_arm": coverage_arm,
+                    "epoch": epoch + 1,
+                    "epochs": config.epochs,
+                    "train_loss": history[-1]["train_loss"],
+                    "valid_auc": auc,
+                    "elapsed_seconds": time.perf_counter() - started,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
         if auc > best_auc:
             best_auc = auc
             best_epoch = epoch
