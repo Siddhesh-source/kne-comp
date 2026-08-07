@@ -970,6 +970,8 @@ def _train_finetune_fold_locked(
     best_state: dict[str, Tensor] | None = None
     stale_epochs = 0
     optimizer_updates = 0
+    first_step_loss: float | None = None
+    last_step_loss: float | None = None
     history: list[dict[str, float | int]] = []
     for epoch in range(config.epochs):
         model.train()
@@ -1006,7 +1008,11 @@ def _train_finetune_fold_locked(
                 len(train_loader) - window_start,
             )
             (loss / window_size).backward()
-            loss_sum += float(loss.detach().cpu())
+            step_loss = float(loss.detach().cpu())
+            if first_step_loss is None:
+                first_step_loss = step_loss
+            last_step_loss = step_loss
+            loss_sum += step_loss
             batch_count += 1
             update = (
                 (batch_index + 1) % config.gradient_accumulation_steps == 0
@@ -1060,6 +1066,8 @@ def _train_finetune_fold_locked(
 
     if best_state is None:
         raise RuntimeError("training did not produce a checkpoint")
+    if first_step_loss is None or last_step_loss is None:
+        raise RuntimeError("training did not execute any optimization steps")
     model.load_state_dict(best_state)
     predictions, validation_targets, validation_weights, study_ids = (
         _predict_study_model(model, valid_loader, torch_device)
@@ -1087,6 +1095,9 @@ def _train_finetune_fold_locked(
         "best_epoch": best_epoch,
         "best_train_loss": best_loss,
         "best_valid_auc": best_auc,
+        "first_step_loss": first_step_loss,
+        "last_step_loss": last_step_loss,
+        "step_loss_decreased": last_step_loss < first_step_loss,
         "optimizer_updates": optimizer_updates,
         "updates_per_epoch": updates_per_epoch,
         "warmup_updates": warmup_updates,

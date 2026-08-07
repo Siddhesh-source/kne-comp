@@ -668,6 +668,11 @@ def test_single_fold_training_controls_and_atomic_artifacts(tmp_path):
     assert metadata["updates_per_epoch"] == 2
     assert metadata["optimizer_updates"] == metadata["updates_per_epoch"] * metadata["epochs_trained"]
     assert metadata["warmup_updates"] == 2
+    assert np.isfinite(metadata["first_step_loss"])
+    assert np.isfinite(metadata["last_step_loss"])
+    assert metadata["step_loss_decreased"] == (
+        metadata["last_step_loss"] < metadata["first_step_loss"]
+    )
     assert set(observed_targets[0].ravel()) <= {0.0, 1.0}
     assert (tmp_path / "fold-0.pt").is_file()
     assert (tmp_path / "oof-0.csv").is_file()

@@ -1427,6 +1427,9 @@ def train_finetune_fold(
         "valid_rows": metadata["valid_rows"],
         "best_epoch": metadata["best_epoch"],
         "best_valid_auc": metadata["best_valid_auc"],
+        "first_step_loss": metadata["first_step_loss"],
+        "last_step_loss": metadata["last_step_loss"],
+        "step_loss_decreased": metadata["step_loss_decreased"],
         "peak_cuda_memory_bytes": peak_bytes,
         "output": str(output),
     }
