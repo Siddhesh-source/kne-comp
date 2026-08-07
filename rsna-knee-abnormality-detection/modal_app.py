@@ -550,10 +550,12 @@ def cache_study_images(
     shard_count: int,
 ) -> dict[str, object]:
     """Cache one deterministic shard of preprocessed training studies."""
+    from io import BytesIO
     import time
 
     import numpy as np
     import pandas as pd
+    from PIL import Image
 
     from rsna_knee.constants import ID_COLUMN
     from rsna_knee.dicom_extraction import (
@@ -580,7 +582,7 @@ def cache_study_images(
         for study, frame in manifest.groupby(ID_COLUMN, sort=False)
     }
     output_root = (
-        ARTIFACT_MOUNT / "cache" / "images-336-v3" / "train"
+        ARTIFACT_MOUNT / "cache" / "images-336-v3-webp" / "train"
     )
     output_root.mkdir(parents=True, exist_ok=True)
     manifest_root = output_root.parent / "manifests"
@@ -597,7 +599,7 @@ def cache_study_images(
         flush=True,
     )
     for study_number, study_id in enumerate(study_ids, start=1):
-        destination = output_root / f"{study_id}.npz"
+        destination = output_root / f"{study_id}.zip"
         if destination.is_file():
             size = destination.stat().st_size
             skipped += 1
@@ -609,7 +611,7 @@ def cache_study_images(
             if series_id:
                 series_path = train_root / study_id / series_id
                 slot_series[str(row.slot)] = sorted(series_path.glob("*.dcm"))
-        temporary = destination.with_suffix(".npz.partial")
+        temporary = destination.with_suffix(".zip.partial")
         try:
             images, valid_mask, positions, slot_ids = build_study_images(
                 slot_series,
@@ -625,14 +627,40 @@ def cache_study_images(
                 0,
                 255,
             ).astype(np.uint8)
-            with temporary.open("wb") as handle:
-                np.savez_compressed(
-                    handle,
-                    images=uint8_images,
-                    valid_mask=valid_mask.numpy(),
-                    positions=positions,
-                    slot_ids=slot_ids,
-                )
+            sprite = uint8_images.transpose(0, 2, 3, 1).reshape(
+                uint8_images.shape[0] * uint8_images.shape[2],
+                uint8_images.shape[3],
+                3,
+            )
+            image_buffer = BytesIO()
+            Image.fromarray(sprite).save(
+                image_buffer,
+                format="WEBP",
+                lossless=True,
+                quality=100,
+                method=4,
+            )
+            with zipfile.ZipFile(
+                temporary,
+                "w",
+                compression=zipfile.ZIP_STORED,
+            ) as archive:
+                archive.writestr("images.webp", image_buffer.getvalue())
+                for name, array in (
+                    ("valid_mask", valid_mask.numpy()),
+                    ("positions", positions),
+                    ("slot_ids", slot_ids),
+                ):
+                    array_buffer = BytesIO()
+                    np.lib.format.write_array(
+                        array_buffer,
+                        array,
+                        allow_pickle=False,
+                    )
+                    archive.writestr(
+                        f"{name}.npy",
+                        array_buffer.getvalue(),
+                    )
             temporary.replace(destination)
             size = destination.stat().st_size
             written += 1
@@ -710,8 +738,11 @@ def validate_study_image_cache(
     sample_size: int = 5,
 ) -> dict[str, object]:
     """Compare cached uint8 studies with fresh normalized preprocessing."""
+    from io import BytesIO
+
     import numpy as np
     import pandas as pd
+    from PIL import Image
 
     from rsna_knee.constants import ID_COLUMN
     from rsna_knee.dicom_extraction import (
@@ -739,10 +770,12 @@ def validate_study_image_cache(
         str(study): frame
         for study, frame in manifest.groupby(ID_COLUMN, sort=False)
     }
-    cache_root = ARTIFACT_MOUNT / "cache" / "images-336-v3" / "train"
+    cache_root = (
+        ARTIFACT_MOUNT / "cache" / "images-336-v3-webp" / "train"
+    )
     checked: list[dict[str, object]] = []
     for study_id in study_ids:
-        cache_path = cache_root / f"{study_id}.npz"
+        cache_path = cache_root / f"{study_id}.zip"
         if not cache_path.is_file():
             continue
         slot_series: dict[str, list[Path]] = {}
@@ -760,11 +793,24 @@ def validate_study_image_cache(
             return_metadata=True,
             normalize=True,
         )
-        with np.load(cache_path, allow_pickle=False) as cached:
-            images = cached["images"]
-            cached_mask = cached["valid_mask"]
-            cached_positions = cached["positions"]
-            cached_slot_ids = cached["slot_ids"]
+        with zipfile.ZipFile(cache_path) as archive:
+            sprite = np.asarray(
+                Image.open(BytesIO(archive.read("images.webp"))),
+                dtype=np.uint8,
+            )
+            images = sprite.reshape(46, 336, 336, 3).transpose(0, 3, 1, 2)
+            cached_mask = np.load(
+                BytesIO(archive.read("valid_mask.npy")),
+                allow_pickle=False,
+            )
+            cached_positions = np.load(
+                BytesIO(archive.read("positions.npy")),
+                allow_pickle=False,
+            )
+            cached_slot_ids = np.load(
+                BytesIO(archive.read("slot_ids.npy")),
+                allow_pickle=False,
+            )
         if images.shape != (46, 3, 336, 336) or images.dtype != np.uint8:
             raise ValueError(f"invalid cached image tensor for {study_id}")
         if cached_mask.shape != (46,) or cached_mask.dtype != np.bool_:
