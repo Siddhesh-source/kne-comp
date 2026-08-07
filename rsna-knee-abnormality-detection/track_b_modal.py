@@ -1427,7 +1427,7 @@ def track_b_train_fold(
     gpu="A10",
     cpu=16,
     memory=65536,
-    ephemeral_disk=65536,
+    ephemeral_disk=524288,
     timeout=43200,
     max_containers=2,
     volumes={DATA_MOUNT: data_volume, ARTIFACT_MOUNT: artifact_volume},
