@@ -205,17 +205,21 @@ Changed `physical_crop_mm=130.0` → `150.0` in both `extract_feature_shard` and
 
 Gate: canary on `modal-tertiary`, shard 0 of 256 — **passed**. 18 studies, 0 failures, `feature_dim` 2304, 46 slices, 21.05 s (1.17 s/study), fingerprint `c7d193298d5809b1929ed1e113c90a2d1d17fdaf45d2cdf2a067b1a445dde6b2` (different from the phys130 canary's `29cc3fbb...`, confirming the crop change took effect), sha256 `997a74ab4709ae299a5a8a29f88ef588f3c41f9d840e85172a85f00cac5f50be`.
 
-### B1: cache preprocessed study tensors
+### B1: cache preprocessed study tensors — code/canary done, full cache pending approval
 
 Decoding one study takes ~2.5 s. At 3,525 training studies that is >2 h per epoch of pure I/O, which makes naive end-to-end training impossible. Cache once.
 
-`build_study_images` (`dicom_extraction.py:694`) already returns exactly what a trainer needs: `[46, 3, 336, 336]`, valid mask, fractional positions, slot IDs. It returns ImageNet-normalized floats, so add `normalize: bool = True` to `preprocess_slice_triplets` (431), `preprocess_slices` (495), and `build_study_images` (694), returning the pre-normalization tensor when False. Default stays True so nothing existing changes. Test: with `normalize=False` all values lie in [0,1], and normalizing that output reproduces the normalized path within 1e-5.
+`build_study_images` returns exactly what a trainer needs: `[46, 3, 336, 336]`, valid mask, fractional positions, slot IDs. Commit `1e2440f` added `normalize: bool = True` to `preprocess_slice_triplets`, `preprocess_slices`, and `build_study_images`, returning the pre-normalization tensor when False while preserving all existing callers. Three tests verify [0,1] bounds, exact mean/std round-trip within 1e-5, and uint8 round-trip. Full suite: `96 passed`.
 
-Add a `cache_study_images` Modal function modelled on `extract_feature_shard` (same sharding, logging, failure manifest) that skips DINOv2 entirely, calls `build_study_images(..., normalize=False, return_metadata=True)` with the v3 params (`input_mode="2p5d"`, `crop_fraction=0.9`, `physical_crop_mm=150.0`, `image_size=336`), converts to uint8 via `np.clip(np.rint(images * 255), 0, 255)`, and writes one `np.savez_compressed` per study to `cache/images-336-v3/train/{study_id}.npz` with `images`, `valid_mask`, `positions`, `slot_ids`. Prefer a CPU-only function; no GPU is needed and it cuts cost ~10x.
+Commits `90808e1` and `0146e14` added CPU-only `cache_study_images`, `cache_images`, `cache_one`, and `validate_study_image_cache`. The cache skips DINOv2, calls `build_study_images(..., normalize=False, return_metadata=True)` with the v3 parameters, converts to uint8, and writes one atomic ZIP per study under `cache/images-336-v3-webp/train/`. Each ZIP contains one vertically stacked **lossless WebP** plus NPY mask/position/slot metadata. Lossless means the uint8 pixels reconstruct byte-for-byte; it does not reduce model quality. Decode benchmark: ~153 ms/study, suitable for parallel data-loader workers.
 
-Run shard 0 first and check average file size: expect 3–6 MB/study. If any study exceeds 16 MB, compression is not working and the full cache blows past 70 GB — stop and fix.
+The first canary used compressed uint8 NPZ: 18/18 studies, correctness passed, but mean size 10.24 MB projected ~45 GB, so the full run was stopped. A one-study compression audit selected lossless WebP. The second canary on `modal-secondary` passed: 18 written, 0 failures, 67.07 s, mean 6,801,254 bytes, max 8,497,144 bytes. Five studies rebuilt independently from DICOM matched all shapes/masks/positions/slot IDs; maximum normalized pixel error was 0.00875366 against the mathematically correct uint8/ImageNet bound 0.00875797.
 
-**Gate:** 4,407 files, total under 30 GB, and a 5-study spot check where `uint8/255` normalized with ImageNet stats matches `build_study_images(..., normalize=True)` within 2/255.
+Canary projection: **29.973 GB (27.915 GiB) for 4,407 studies**, just under the planning target of 30 GB. The 30 GB figure is an internal storage target, not a Modal limit. The full 256-shard cache remains unlaunched pending explicit approval.
+
+**Gate for the full run:** 4,407 ZIP files, 0 failures, measured total near or below the canary projection, and the same five-study validation passes. Stop if projected total rises materially above 30 GB.
+
+This is the one lengthy DICOM preprocessing pass needed for Phases B/C/E. Those phases reuse the cache; do **not** rerun frozen DINO feature extraction. A future experiment that changes baked pixel geometry (for example 448 px or a different physical crop in Phase D) needs a separate image cache for that experiment, not a repeat of the current frozen-feature extraction.
 
 ### B2: training module
 
