@@ -74,6 +74,21 @@ def test_finetune_runtime_controls_are_bounded(
         _validate_finetune_runtime(batch_size, accumulation, workers)
 
 
+@pytest.mark.parametrize(
+    ("epochs", "patience", "message"),
+    (
+        (0, 3, "epochs"),
+        (21, 3, "epochs"),
+        (12, -1, "early_stopping_patience"),
+        (12, 11, "early_stopping_patience"),
+        (True, 3, "epochs"),
+    ),
+)
+def test_finetune_epoch_controls_are_bounded(epochs, patience, message):
+    with pytest.raises(ValueError, match=message):
+        _validate_finetune_runtime(8, 1, 2, epochs, patience)
+
+
 def _write_complete_finetune_run(root: Path, folds_path: Path) -> list[str]:
     study_ids = [
         f"study-{index:04d}" for index in range(FINETUNE_STUDY_COUNT)

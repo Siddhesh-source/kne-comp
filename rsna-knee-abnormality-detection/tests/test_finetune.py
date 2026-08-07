@@ -1,3 +1,4 @@
+from dataclasses import asdict
 from io import BytesIO
 from pathlib import Path
 import zipfile
@@ -724,6 +725,133 @@ def test_parallel_folds_use_distinct_metadata_files(tmp_path):
 
     assert (tmp_path / "fold-0.metadata.json").is_file()
     assert (tmp_path / "fold-1.metadata.json").is_file()
+
+
+def test_fold_resumes_exactly_from_epoch_checkpoint(tmp_path):
+    config = FinetuneConfig(
+        epochs=3,
+        batch_size=2,
+        gradient_accumulation_steps=1,
+        warmup_epochs=0,
+        ema_decay=0.5,
+        early_stopping_patience=0,
+        hard_target_mix=0,
+        pairwise_auc_weight=0,
+        use_sqrt_class_balance=False,
+        gold_oversample_fraction=0,
+        seed=17,
+    )
+    dataset_factory = (
+        lambda data, indices, training, seed: TinyStudyDataset(data, indices)
+    )
+    uninterrupted = tmp_path / "uninterrupted"
+    resumed = tmp_path / "resumed"
+    uninterrupted.mkdir()
+    resumed.mkdir()
+    expected = train_finetune_fold(
+        _tiny_training_data(),
+        uninterrupted,
+        0,
+        config=config,
+        model_factory=TinyStudyModel,
+        dataset_factory=dataset_factory,
+        device="cpu",
+    )
+
+    def interrupt_after_first_epoch(progress):
+        if progress["epoch"] == 1:
+            raise RuntimeError("simulated interruption")
+
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        train_finetune_fold(
+            _tiny_training_data(),
+            resumed,
+            0,
+            config=config,
+            model_factory=TinyStudyModel,
+            dataset_factory=dataset_factory,
+            device="cpu",
+            epoch_callback=interrupt_after_first_epoch,
+        )
+    assert (resumed / "fold-0.resume.pt").is_file()
+    assert (resumed / "fold-0.progress.json").is_file()
+
+    actual = train_finetune_fold(
+        _tiny_training_data(),
+        resumed,
+        0,
+        config=config,
+        model_factory=TinyStudyModel,
+        dataset_factory=dataset_factory,
+        device="cpu",
+    )
+
+    assert actual["resumed_from_epoch"] == 1
+    for actual_epoch, expected_epoch in zip(
+        actual["history"], expected["history"], strict=True
+    ):
+        assert {
+            key: value
+            for key, value in actual_epoch.items()
+            if key != "elapsed_seconds"
+        } == {
+            key: value
+            for key, value in expected_epoch.items()
+            if key != "elapsed_seconds"
+        }
+    expected_checkpoint = torch.load(
+        uninterrupted / "fold-0.pt", weights_only=True
+    )
+    actual_checkpoint = torch.load(resumed / "fold-0.pt", weights_only=True)
+    for key, expected_value in expected_checkpoint["state_dict"].items():
+        torch.testing.assert_close(
+            actual_checkpoint["state_dict"][key], expected_value
+        )
+    assert not (resumed / "fold-0.resume.pt").exists()
+
+
+def test_resume_rejects_changed_configuration(tmp_path):
+    config = FinetuneConfig(
+        epochs=2,
+        batch_size=2,
+        gradient_accumulation_steps=1,
+        warmup_epochs=0,
+        ema_decay=0,
+        early_stopping_patience=0,
+        hard_target_mix=0,
+        pairwise_auc_weight=0,
+        use_sqrt_class_balance=False,
+        gold_oversample_fraction=0,
+    )
+
+    def interrupt(progress):
+        raise RuntimeError(f"stop at {progress['epoch']}")
+
+    with pytest.raises(RuntimeError, match="stop at 1"):
+        train_finetune_fold(
+            _tiny_training_data(),
+            tmp_path,
+            0,
+            config=config,
+            model_factory=TinyStudyModel,
+            dataset_factory=lambda data, indices, training, seed: TinyStudyDataset(
+                data, indices
+            ),
+            device="cpu",
+            epoch_callback=interrupt,
+        )
+    with pytest.raises(ValueError, match="config does not match"):
+        train_finetune_fold(
+            _tiny_training_data(),
+            tmp_path,
+            0,
+            config=FinetuneConfig(**{**asdict(config), "batch_size": 1}),
+            model_factory=TinyStudyModel,
+            dataset_factory=lambda data, indices, training, seed: TinyStudyDataset(
+                data, indices
+            ),
+            device="cpu",
+        )
 
 
 def test_fold_lock_is_acquired_exclusively(tmp_path):

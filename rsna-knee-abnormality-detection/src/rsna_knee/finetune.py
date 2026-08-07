@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import random
 import tempfile
+import time
 from typing import Callable, Iterable
 import zipfile
 
@@ -817,8 +818,10 @@ def train_finetune_fold(
         [AlignedCachedTrainingData, np.ndarray, bool, int], Dataset
     ] = _default_dataset_factory,
     device: str = "cuda",
+    resume: bool = True,
+    epoch_callback: Callable[[dict[str, object]], None] | None = None,
 ) -> dict[str, object]:
-    """Train one image fold and atomically write its checkpoint and OOF artifacts."""
+    """Train one image fold with resumable epoch checkpoints."""
     config = config or FinetuneConfig()
     _validate_finetune_config(config, fold)
     output_dir = Path(output_dir)
@@ -833,6 +836,8 @@ def train_finetune_fold(
             model_factory=model_factory,
             dataset_factory=dataset_factory,
             device=device,
+            resume=resume,
+            epoch_callback=epoch_callback,
         )
 
 
@@ -847,11 +852,15 @@ def _train_finetune_fold_locked(
         [AlignedCachedTrainingData, np.ndarray, bool, int], Dataset
     ],
     device: str,
+    resume: bool,
+    epoch_callback: Callable[[dict[str, object]], None] | None,
 ) -> dict[str, object]:
     """Train one fold while its caller holds the exclusive artifact lock."""
     checkpoint_path = output_dir / f"fold-{fold}.pt"
     oof_path = output_dir / f"oof-{fold}.csv"
     metadata_path = output_dir / f"fold-{fold}.metadata.json"
+    resume_path = output_dir / f"fold-{fold}.resume.pt"
+    progress_path = output_dir / f"fold-{fold}.progress.json"
     existing = [path for path in (checkpoint_path, oof_path, metadata_path) if path.exists()]
     if existing:
         raise FileExistsError(
@@ -973,7 +982,35 @@ def _train_finetune_fold_locked(
     first_step_loss: float | None = None
     last_step_loss: float | None = None
     history: list[dict[str, float | int]] = []
-    for epoch in range(config.epochs):
+    start_epoch = 0
+    resumed_from_epoch = 0
+    if resume and resume_path.is_file():
+        state = torch.load(resume_path, map_location="cpu", weights_only=False)
+        _validate_resume_state(state, fold, config)
+        model.load_state_dict(state["model_state_dict"])
+        optimizer.load_state_dict(state["optimizer_state_dict"])
+        _optimizer_to_device(optimizer, torch_device)
+        scheduler.load_state_dict(state["scheduler_state_dict"])
+        if ema_model is not None:
+            ema_state = state.get("ema_state_dict")
+            if ema_state is None:
+                raise ValueError("resume checkpoint is missing EMA state")
+            ema_model.load_state_dict(ema_state)
+        start_epoch = int(state["next_epoch"])
+        resumed_from_epoch = start_epoch
+        best_auc = float(state["best_auc"])
+        best_epoch = int(state["best_epoch"])
+        best_loss = float(state["best_loss"])
+        best_state = state.get("best_state_dict")
+        stale_epochs = int(state["stale_epochs"])
+        optimizer_updates = int(state["optimizer_updates"])
+        first_step_loss = state.get("first_step_loss")
+        last_step_loss = state.get("last_step_loss")
+        history = list(state["history"])
+        _restore_rng_state(state["rng_state"], train_dataset, generator)
+    training_started = time.perf_counter()
+    for epoch in range(start_epoch, config.epochs):
+        epoch_started = time.perf_counter()
         model.train()
         optimizer.zero_grad(set_to_none=True)
         loss_sum = 0.0
@@ -1040,13 +1077,13 @@ def _train_finetune_fold_locked(
         validation_auc = grouped_macro_auc(
             validation_targets, predictions, validation_groups
         )
-        history.append(
-            {
-                "epoch": epoch + 1,
-                "train_loss": train_loss,
-                "valid_macro_auc": validation_auc,
-            }
-        )
+        epoch_record: dict[str, float | int] = {
+            "epoch": epoch + 1,
+            "train_loss": train_loss,
+            "valid_macro_auc": validation_auc,
+            "elapsed_seconds": time.perf_counter() - epoch_started,
+        }
+        history.append(epoch_record)
         if validation_auc > best_auc + 1e-5:
             best_auc = validation_auc
             best_epoch = epoch + 1
@@ -1058,11 +1095,54 @@ def _train_finetune_fold_locked(
             stale_epochs = 0
         else:
             stale_epochs += 1
-            if (
-                config.early_stopping_patience
-                and stale_epochs >= config.early_stopping_patience
-            ):
-                break
+        should_stop = bool(
+            config.early_stopping_patience
+            and stale_epochs >= config.early_stopping_patience
+        )
+        progress = {
+            "schema_version": 1,
+            "fold": fold,
+            "epoch": epoch + 1,
+            "epochs": config.epochs,
+            "best_epoch": best_epoch,
+            "best_valid_auc": best_auc,
+            "stale_epochs": stale_epochs,
+            "train_loss": train_loss,
+            "valid_macro_auc": validation_auc,
+            "epoch_elapsed_seconds": epoch_record["elapsed_seconds"],
+            "total_elapsed_seconds": time.perf_counter() - training_started,
+            "optimizer_updates": optimizer_updates,
+            "resumed_from_epoch": resumed_from_epoch,
+        }
+        resume_state = {
+            "schema_version": 1,
+            "fold": fold,
+            "labels": list(LABELS),
+            "config": asdict(config),
+            "next_epoch": epoch + 1,
+            "model_state_dict": _cpu_state_dict(model),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "ema_state_dict": (
+                _cpu_state_dict(ema_model) if ema_model is not None else None
+            ),
+            "best_auc": best_auc,
+            "best_epoch": best_epoch,
+            "best_loss": best_loss,
+            "best_state_dict": best_state,
+            "stale_epochs": stale_epochs,
+            "optimizer_updates": optimizer_updates,
+            "first_step_loss": first_step_loss,
+            "last_step_loss": last_step_loss,
+            "history": history,
+            "rng_state": _capture_rng_state(train_dataset, generator),
+        }
+        _atomic_torch_save(resume_state, resume_path)
+        _atomic_text_write(json.dumps(progress, indent=2) + "\n", progress_path)
+        if epoch_callback is not None:
+            epoch_callback(progress)
+        if should_stop:
+            break
 
     if best_state is None:
         raise RuntimeError("training did not produce a checkpoint")
@@ -1092,6 +1172,7 @@ def _train_finetune_fold_locked(
         "train_rows": len(train_indices),
         "valid_rows": len(valid_indices),
         "epochs_trained": len(history),
+        "resumed_from_epoch": resumed_from_epoch,
         "best_epoch": best_epoch,
         "best_train_loss": best_loss,
         "best_valid_auc": best_auc,
@@ -1109,6 +1190,7 @@ def _train_finetune_fold_locked(
     _atomic_text_write(
         json.dumps(metadata, indent=2) + "\n", metadata_path
     )
+    resume_path.unlink(missing_ok=True)
     return metadata
 
 
@@ -1238,6 +1320,90 @@ def _validation_groups(
         [data.report_groups[index_by_id[value]] for value in observed_study_ids],
         dtype=str,
     )
+
+
+def _cpu_state_dict(module: nn.Module) -> dict[str, Tensor]:
+    """Copy a module state to CPU so a progress checkpoint frees GPU memory."""
+    return {
+        key: value.detach().cpu().clone()
+        for key, value in module.state_dict().items()
+    }
+
+
+def _capture_rng_state(
+    dataset: Dataset,
+    dataloader_generator: torch.Generator,
+) -> dict[str, object]:
+    """Capture random state needed to continue at the next epoch boundary."""
+    augmentation = getattr(dataset, "augmentation", None)
+    augmentation_generator = getattr(augmentation, "generator", None)
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+        "dataloader_generator": dataloader_generator.get_state(),
+        "augmentation_generator": (
+            augmentation_generator.get_state()
+            if isinstance(augmentation_generator, torch.Generator)
+            else None
+        ),
+    }
+
+
+def _restore_rng_state(
+    state: object,
+    dataset: Dataset,
+    dataloader_generator: torch.Generator,
+) -> None:
+    """Restore an epoch-boundary random state from a trusted local checkpoint."""
+    if not isinstance(state, dict):
+        raise ValueError("resume checkpoint has invalid RNG state")
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    cuda_state = state.get("cuda", [])
+    if torch.cuda.is_available() and cuda_state:
+        torch.cuda.set_rng_state_all(cuda_state)
+    dataloader_generator.set_state(state["dataloader_generator"])
+    augmentation = getattr(dataset, "augmentation", None)
+    augmentation_generator = getattr(augmentation, "generator", None)
+    saved_augmentation = state.get("augmentation_generator")
+    if (
+        saved_augmentation is not None
+        and isinstance(augmentation_generator, torch.Generator)
+    ):
+        augmentation_generator.set_state(saved_augmentation)
+
+
+def _optimizer_to_device(
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> None:
+    """Move optimizer tensors loaded on CPU onto the training device."""
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if isinstance(value, Tensor):
+                state[key] = value.to(device)
+
+
+def _validate_resume_state(
+    state: object,
+    fold: int,
+    config: FinetuneConfig,
+) -> None:
+    """Reject stale or incompatible progress checkpoints."""
+    if not isinstance(state, dict) or state.get("schema_version") != 1:
+        raise ValueError("resume checkpoint has an unsupported schema")
+    if state.get("fold") != fold:
+        raise ValueError("resume checkpoint fold does not match")
+    if state.get("labels") != list(LABELS):
+        raise ValueError("resume checkpoint labels do not match")
+    if state.get("config") != asdict(config):
+        raise ValueError("resume checkpoint config does not match")
+    next_epoch = state.get("next_epoch")
+    if type(next_epoch) is not int or not 1 <= next_epoch <= config.epochs:
+        raise ValueError("resume checkpoint epoch is invalid")
 
 
 def _atomic_torch_save(value: object, path: Path) -> None:

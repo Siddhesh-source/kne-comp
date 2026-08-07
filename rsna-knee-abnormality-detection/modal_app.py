@@ -106,6 +106,8 @@ def _validate_finetune_runtime(
     batch_size: int,
     gradient_accumulation_steps: int,
     num_workers: int,
+    epochs: int = 12,
+    early_stopping_patience: int = 3,
 ) -> None:
     """Validate bounded runtime controls before allocating a GPU."""
     for name, value, minimum, maximum in (
@@ -117,6 +119,8 @@ def _validate_finetune_runtime(
             64,
         ),
         ("num_workers", num_workers, 0, 8),
+        ("epochs", epochs, 1, 20),
+        ("early_stopping_patience", early_stopping_patience, 0, 10),
     ):
         if type(value) is not int or not minimum <= value <= maximum:
             raise ValueError(
@@ -1397,6 +1401,9 @@ def train_finetune_fold(
     batch_size: int = 2,
     gradient_accumulation_steps: int = 4,
     num_workers: int = 0,
+    epochs: int = 12,
+    early_stopping_patience: int = 3,
+    resume: bool = True,
 ) -> dict[str, object]:
     """Fine-tune one image fold on an A10 from the committed image cache."""
     import torch
@@ -1410,10 +1417,14 @@ def train_finetune_fold(
     _validate_finetune_request(run_name, backbone, fold)
     if not isinstance(smoke, bool):
         raise ValueError("smoke must be a boolean")
+    if not isinstance(resume, bool):
+        raise ValueError("resume must be a boolean")
     _validate_finetune_runtime(
         batch_size,
         gradient_accumulation_steps,
         num_workers,
+        epochs,
+        early_stopping_patience,
     )
     data_volume.reload()
     artifact_volume.reload()
@@ -1436,6 +1447,8 @@ def train_finetune_fold(
         "batch_size": batch_size,
         "gradient_accumulation_steps": gradient_accumulation_steps,
         "num_workers": num_workers,
+        "epochs": epochs,
+        "early_stopping_patience": early_stopping_patience,
     }
     if smoke:
         overrides.update({"epochs": 1, "max_studies": 64})
@@ -1448,12 +1461,19 @@ def train_finetune_fold(
 
     torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
+
+    def commit_epoch(progress: dict[str, object]) -> None:
+        artifact_volume.commit()
+        print(json.dumps({"event": "epoch_complete", **progress}), flush=True)
+
     metadata = train_fold_core(
         data,
         output,
         fold,
         config=config,
         device="cuda",
+        resume=resume,
+        epoch_callback=commit_epoch,
     )
     elapsed_seconds = time.perf_counter() - started
     peak_bytes = int(torch.cuda.max_memory_allocated())
@@ -1463,6 +1483,7 @@ def train_finetune_fold(
         "backbone": backbone,
         "fold": fold,
         "smoke": smoke,
+        "resumed_from_epoch": metadata["resumed_from_epoch"],
         "studies": len(data.study_ids),
         "valid_rows": metadata["valid_rows"],
         "best_epoch": metadata["best_epoch"],
@@ -1951,6 +1972,9 @@ def train_finetune(
     batch_size: int = 2,
     gradient_accumulation_steps: int = 4,
     num_workers: int = 0,
+    epochs: int = 12,
+    early_stopping_patience: int = 3,
+    resume: bool = True,
 ) -> None:
     """Launch selected fine-tuning folds concurrently in the active profile."""
     _validate_finetune_request(run_name, backbone)
@@ -1958,6 +1982,8 @@ def train_finetune(
         batch_size,
         gradient_accumulation_steps,
         num_workers,
+        epochs,
+        early_stopping_patience,
     )
     selected_folds = _parse_finetune_folds(folds)
     results = list(
@@ -1971,6 +1997,9 @@ def train_finetune(
                     batch_size,
                     gradient_accumulation_steps,
                     num_workers,
+                    epochs,
+                    early_stopping_patience,
+                    resume,
                 )
                 for fold in selected_folds
             ),
