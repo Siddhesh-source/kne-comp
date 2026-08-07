@@ -1,651 +1,342 @@
-# RSNA knee abnormality detection: competition plan
+# RSNA knee abnormality detection: execution plan
 
-Last updated: August 6, 2026
+Last updated: August 7, 2026. Every fact below was verified against the repository and the Kaggle API on that date. If the repo disagrees, trust the repo and update this file.
 
-## Goal
+---
 
-Build the strongest reproducible knee MRI model we can, while keeping enough experimental discipline to know whether each change actually helps.
+## 1. Standing
 
-The public leaderboard is useful, but it is not our development set. We will track local out-of-fold results, label quality, per-condition results, runtime, and occasional Kaggle submissions. A public score increase that cannot be explained by local evidence will not automatically become our new baseline.
+| | |
+|---|---|
+| Public LB | 0.758 (submission 55308345) |
+| Rank | 122 / 312 |
+| Leader / 10th | 0.932 / 0.866 |
+| Deadline | 2026-10-22 (11 weeks) |
+| Best pseudo OOF | 0.793 (E005) |
+| Best gold OOF | 0.736 (E005) |
+| Label system gold AUC | 0.896 (E003) |
 
-## Competition summary
+Gap decomposition:
 
-The model receives a knee MRI study and predicts probabilities for 12 findings:
-
-1. ACL injury
-2. MCL injury
-3. Medial meniscus injury
-4. Lateral meniscus injury
-5. Medial osteoarthritis
-6. Lateral osteoarthritis
-7. Patellofemoral osteoarthritis
-8. Effusion
-9. Synovitis
-10. Baker's cyst
-11. Contusion
-12. Fracture
-
-This is multi-label classification. A study can contain several findings.
-
-### Scoring
-
-Kaggle calculates ROC AUC separately for each finding and averages the 12 values:
-
-```text
-score = mean(AUC_1, AUC_2, ..., AUC_12)
+```
+0.932  leader
+0.896  our label supervision ceiling     <- supervision loss, >= 0.036
+0.793  our pseudo OOF
+0.758  our public LB
+0.736  our gold OOF                      <- representation loss, ~0.160
 ```
 
-Each finding has equal weight. A rare fracture label contributes as much as effusion.
+Representation is the dominant term, supervision is a hard cap below the leader, head tuning is worth ~0.01. Effort follows that order.
 
-AUC measures ranking. If positive studies generally receive higher predictions than negative studies, the AUC is high. Probability calibration and a fixed 0.5 threshold do not affect the score as long as the ranking stays unchanged.
+E005 config, for reproduction:
 
-Useful score interpretations:
-
-- 1.00: perfect ranking
-- 0.90: excellent ranking
-- 0.80: strong ranking
-- 0.50: random ranking
-
-Improving one finding from 0.50 to 0.90 increases the final score by:
-
-```text
-(0.90 - 0.50) / 12 = 0.0333
+```
+features  dino336-v1, 1152 dim, fingerprint 673ec4355dd46e976fce0927ccdf1706bc3bbd47e20a6b546657cfe3e0e516b6
+head      gated_v2, hidden_dim 384, dropout 0.2, max_slices 46
+train     80 epochs, early stop patience 10, cosine, hard_target_mix 0.5, batch 64, lr 3e-4
+extras    pairwise_auc_weight 0.07, sqrt class balance, ema 0.995, clip 1.0,
+          gold_oversample 0.25, gold_weight_threshold 4.0, seed 20260828 (+2 seeds, rank-averaged)
 ```
 
-Weak labels cannot be ignored. One poor finding can keep the macro average below 0.90.
+---
 
-### Public and private leaderboards
+## 2. Defects (verified, not hypotheses)
 
-The public leaderboard uses only part of the hidden test set. Final rankings use the private portion. Repeatedly choosing models based on the public leaderboard will eventually overfit it.
+### D1: silent labels are trained as positives
 
-We will use public submissions as checkpoints, not as the main experiment loop.
+Silent labels are stored as probability **exactly 0.5**. Two places treat that as positive:
 
-## What we know about the data
+- `src/rsna_knee/fold_heads.py` ~line 274, in `train_fold_heads`: `hard_target_mix * (train_targets >= 0.5)`. With `hard_target_mix=0.5` a silent label gets an effective target of **0.75**.
+- `src/rsna_knee/fold_heads.py` ~line 585, in `_macro_binary_auc`: `binary = np.asarray(targets) >= 0.5`. Same mistake inside the metric that drives early stopping.
 
-Current public analysis reports:
+Silent share of the corpus: Baker's 46.2%, Fracture 42.5%, Lateral OA 26.4%, Contusion 24.8%, Medial OA 21.1%, PF OA 17.5%, MCL 9.8%, Lateral Meniscus 9.8%, ACL 7.9%, Medial Meniscus 5.6%. Effusion and Synovitis are at 0% because the specialist labeler forces a graded decision for those two. That is the pattern to copy.
 
-- 4,407 training studies
-- 24,371 training series
-- Roughly 730,000 DICOM slices
-- Roughly 265 GB of imaging data
-- 58 studies with all 12 verified labels
-- 4,349 studies without verified labels but with radiology reports
-- Reports appear only in training data
-- Test-time predictions must come from imaging and permitted metadata
-- Reports are multilingual
-- Some reports are duplicated across studies
-
-Only 1.3% of studies have verified labels. This makes label generation the central problem. The MRI architecture matters, but a model trained on poor pseudo-labels will learn those mistakes.
+Six labels above 17% silence are half the macro average.
 
-The 58 verified studies are also selected in a biased way. Public EDA found that all 58 contain at least one positive finding. They are useful for auditing label extraction and checking major regressions, but they are too small to provide a stable model ranking by themselves.
+### D2: the silence prior is a placeholder
 
-## Local data policy
+`label_prompt.py` tells the model to emit 0.5 when the report is silent; `consensus.py` turns confidence into weight via `0.25 + 0.75 * confidence`, landing near 0.4. Nobody estimated `P(present | silent)`. Reports are negative by omission, so the true prior is well below 0.5.
 
-We do not need to download the 265 GB MRI archive to the local computer.
+Supporting measurement: on the gold set, **every study our labeler called negative was truly negative**, all 12 labels. Negative precision is excellent; the failure mode is silence, not error.
 
-Use:
+### D3: the report is compressed into 12 numbers
 
-- Local machine for CSV analysis, report labeling, code development, and experiment tracking
-- Kaggle-mounted competition data for MRI preprocessing, training, and inference
-- Kaggle datasets or models for derived labels, cached features, and trained weights when the rules permit it
+Severity, location, grade, chronicity, secondary findings all discarded. A multilingual sentence embedding regressed as an auxiliary target is dense supervision at zero inference cost (reports are train-only).
 
-The five competition CSV files and selected public notebook sources are already stored locally.
+### D4: the head is saturated
 
-Before sending competition reports to any third-party LLM API, check the competition rules and data license. De-identification does not automatically grant permission to transmit the text to an external service. If external processing is not allowed, run an approved local or self-hosted model instead.
+E004 → E005 moved gold OOF 0.698 → 0.736 through head changes alone. Further head work over frozen features is worth ~0.01.
 
-## Findings from public notebooks
+---
 
-Public scores change as authors publish new versions. These were the displayed scores on August 6, 2026.
+## 3. Is fine-tuning the only way to 0.90
 
-| Notebook | Public score | Main idea | Reproducibility |
-|---|---:|---|---|
-| DINOv2 at meniscus resolution | 0.802 | 336 px frozen DINOv2, more slices, physical ordering, five protocol slots, strong report labels | Incomplete without its LLM-derived label input |
-| Pilkwang baseline v1 | 0.770 | Multilingual rule labels, 224 px DINOv2, six slots, partial fine-tuning | Strong reproducible baseline |
-| DINOv2 fork | 0.668 | Public DINOv2 multiple-instance learning | Reproducible with its dependencies |
-| EDA to 2.5D | 0.630 | Report teacher, 2.5D image student, attention pooling, TTA | Reproducible |
-| DINOsaur V2 | 0.621 | DINOv2 slice-level MIL over several sampling configurations | Reproducible |
+**No, but there is no path to 0.90 with a frozen encoder.** Gradient must reach the pixels. Fine-tuning a foundation model is the cheapest arrangement, not the only one.
 
-Other public notebooks currently sit between the listed scores, including DINO protocol fusion, a report teacher-student model, and a train/inference baseline. Kaggle's score-sorted CLI exposed their order but not every exact score.
+| Approach | Encoder trained | Ceiling | Cost |
+|---|---|---:|---|
+| Better head over frozen DINOv2 | no | 0.78–0.80 | hours (exhausted, D4) |
+| Better labels, frozen encoder | no | 0.80–0.82 | days, no GPU |
+| Bigger frozen backbone (ViT-B/L, DINOv3) | no | 0.80–0.83 | 10–20 A10h |
+| Ensemble of frozen backbones | no | 0.82–0.84 | 30 A10h |
+| Medical pretrained frozen encoder | no | 0.81–0.84 | 10 A10h |
+| 2.5D CNN end to end from ImageNet | yes | 0.84–0.88 | 15–25 A10h |
+| Partial unfreeze, last 6 DINOv2 blocks | yes | 0.85–0.89 | 10–20 A10h |
+| LoRA over full stack | yes | 0.85–0.89 | 10–20 A10h |
+| SSL on 730k unlabeled slices, then fine-tune | yes | 0.87–0.91 | 40–80 A10h |
+| Report-text distillation, then fine-tune | yes | 0.87–0.91 | 20–40 A10h |
 
-### What the 0.802 notebook does well
+Two points:
 
-The strongest public notebook changed several image-pipeline details at once:
+- **LoRA is not a strategy here.** ViT-S/14 is 21M params; unfreezing the last six blocks at low LR is simpler, has no adapter-placement risk, and is what the public 0.770 notebook does. LoRA matters when memory binds; at 336 px on an A10 it does not.
+- **The 2.5D CNN is a genuine second route**, not a fallback. Cheaper, faster, decorrelated errors. Worth as much in the ensemble as a second ViT. That is why Phase B runs both.
 
-- DINOv2 ViT-S/14 at 336 x 336
-- Five protocol-defined series slots
-- Up to 46 slices per study when all slots are present
-- Slice ordering from DICOM geometry rather than filename order
-- Per-series intensity normalization
-- Wider sampling windows for sagittal and axial series
-- CLS, patch-mean, and patch-max features from DINOv2
-- A ridge probe blended with an attention head
-- Five-fold training of the prediction head
-- LLM-derived soft labels for reports
+Levers by value per unit effort: (1) fix D1/D2, +0.01–0.03, no GPU. (2) train the encoder, +0.04–0.08, unavoidable. (3) report distillation, +0.01–0.03. (4) ensemble + TTA, +0.01–0.03. (5) SSL adaptation, +0.02–0.04. Stacked with overlap: 0.87–0.92.
 
-The resolution argument is sensible. At 126 px, a 14-pixel DINO patch covers a large physical area of the knee, and small meniscal tears may disappear during resizing. At 336 px, the same patch covers a much smaller physical area.
+---
 
-The score cannot be attributed to resolution alone. Its attached label source is an important part of the system.
+## 4. Environment
 
-### What the 0.770 baseline does well
+PowerShell 5.1: no `&&` or `||`, chain with `;`. Use `py`, not `python`.
 
-The Pilkwang baseline is the best starting point because its public version is largely self-contained:
+Tests: `cd rsna-knee-abnormality-detection; $env:PYTHONPATH="src"; py -m pytest` → **82 passed**. pytest writes a deprecation warning to stderr, so PowerShell reports a non-zero exit code even on success. Judge by the `N passed` line.
 
-- Multilingual report parser
-- Negation, uncertainty, anatomy, and severity handling
-- Confidence-weighted pseudo-labels for all 4,407 studies
-- Higher weights for the 58 verified studies
-- Six MRI series slots
-- Nine slices per slot at 224 x 224
-- Physical slice ordering and laterality normalization
-- Fine-tuning of the last six DINOv2 blocks
-- Duplicate-report grouping during validation
-- Rank-based submission predictions
-- Runtime around 41 minutes on two T4 GPUs in the displayed run
+Modal profiles are selected with `$env:MODAL_PROFILE`; `--profile` is not a flag on `modal volume`.
 
-We should reproduce this result before making major changes. If we cannot reproduce the baseline, later comparisons will be unreliable.
+| Profile | Workspace | Has DICOM data |
+|---|---|---|
+| `modal-secondary` | ththjyj755 | yes (default) |
+| `modal-tertiary` | bedsofearth | yes |
+| `vikstar814`, `modal-quaternary` | | unverified |
 
-## Proposed system
+Volumes per account: `rsna-knee-data` (`raw/`, `metadata/`, `models/`) and `rsna-knee-artifacts` (`features/`, `heads/`, `models/`, `submissions/`).
 
-The target system has separate label, image, validation, and ensemble components.
+**Known problem:** `rsna-knee-data` on `modal-tertiary` is at 169.7% of its inode allowance (848,447 / 500,000). Do not add file trees there; write to `rsna-knee-artifacts` or use `modal-secondary`.
 
-```text
-Training reports
-    |
-    +-- LLM labeler A
-    +-- LLM labeler B
-    +-- multilingual rule extractor
-    |
-    v
-Consensus soft labels and confidence weights
-    |
-    +-- 58 verified labels receive higher weight
-    |
-    v
-MRI models
-    |
-    +-- high-resolution global DINOv2
-    +-- anatomy-focused model
-    +-- 2.5D convolutional model
-    +-- protocol and metadata model
-    |
-    v
-Per-label rank ensemble
-    |
-    v
-submission.csv
-```
-
-Reports will never be required at test time. They provide training supervision only.
+Modal entry points: `smoke`, `preflight`, `unpack_data`, `extract_one`, `extract`, `extract_test`, `train_heads`, `train_probe`. `train_heads` exposes every E005 hyperparameter (`architecture`, `hard_target_mix`, `pairwise_auc_weight`, `ema_decay`, `gold_oversample_fraction`, etc.) and refuses to overwrite a non-empty output directory.
 
-## Label-generation plan
+CLI commands: `check-config smoke-llm inspect-data make-folds score init-registry estimate-labeling label-reports evaluate-labels label-specialist evaluate-specialist build-consensus label-quality build-protocol-manifest show-model-config validate-submission project-runtime feature-fingerprint ensemble-submission train-fold-heads predict-fold-heads`.
 
-Label quality is probably the highest-value area of work.
+Constants: 4,407 studies (58 gold, 4,349 pseudo), 4,257 report groups, 46 slices, 336 px, 5 slots, v1 features 1,152 dim, v3 features 2,304 dim, folds in `data/derived/folds-v1.csv` grouped by report hash. Label order is `constants.LABELS`.
 
-### Output format
-
-For every report and finding, each labeler should return:
-
-```json
-{
-  "probability": 0.86,
-  "confidence": 0.91,
-  "status": "present",
-  "evidence": "short quotation from the report"
-}
-```
-
-Allowed status values:
-
-- present
-- absent
-- uncertain
-- not mentioned
+---
 
-The probability and confidence are separate. A finding can have a low probability but high confidence when the report explicitly says it is absent.
+## 5. Evaluation protocol
 
-### Labeling rules
+Phase A changes the training targets. If you evaluate against the changed targets the score moves for free. **Evaluation targets are frozen at `data/derived/consensus-labels-v1.csv` and `data/raw/train.csv` regardless of which variant trained the model.**
 
-1. Deduplicate normalized reports before using an LLM.
-2. Preserve the mapping back to every StudyInstanceUID.
-3. Detect or provide the report language.
-4. Parse negation and uncertainty explicitly.
-5. Distinguish minor findings from clinically significant findings where the report provides severity.
-6. Require evidence text so labels can be audited.
-7. Reject malformed outputs rather than silently filling them.
-8. Store the prompt version, model name, sampling settings, and source-report hash.
-9. Never include test predictions or leaderboard information in label-generation prompts.
+Build `scripts/evaluate_oof.py` that takes one or more OOF CSVs and reports three numbers each:
 
-### Consensus labels
+1. **Gold macro AUC** — the 58 studies with all 12 columns non-null in `train.csv`, plus a 1,000-sample bootstrap 95% interval. The interval is roughly ±0.05; a change smaller than that is not evidence.
+2. **Mention-restricted pseudo macro AUC** (primary Phase A decision metric) — per label, keep only rows where `consensus-labels-v1.csv` is confident (`>= 0.65` positive, `<= 0.35` negative), drop everything else including all exact-0.5 rows, then AUC. Invariant to the silence prior, so variants compare fairly.
+3. **Full pseudo macro AUC** — old metric against `consensus-labels-v1.csv` with a `> 0.5` threshold, all 4,407 rows. Reported for continuity with E004/E005, not used for decisions.
 
-Start with three sources:
+**Task A0:** write the script, run it on `data/derived/gated-mix50-ensemble-oof.csv` and `data/derived/gated-auc-ema-gold25-s28/oof.csv`, and record the baseline numbers against E005 in `experiments.csv`.
 
-- LLM A
-- LLM B or a second prompt with a different reasoning approach
-- Multilingual rules from the public baseline
+---
 
-For source probabilities `p1`, `p2`, and `prule`, begin with:
+## 6. Phase A: label repair
 
-```text
-pseudo_probability = weighted_mean(p1, p2, prule)
-```
+No GPU beyond ~1 A10-hour of head retraining. 3–5 days. Expected LB **0.78–0.80**.
 
-Weights should depend on:
+### A1: fix D1
 
-- Agreement between sources
-- Explicit evidence in the report
-- Negation certainty
-- Whether the finding was mentioned
-- Source performance on the 58 verified studies
-- Language-specific audit results
+In `src/rsna_knee/fold_heads.py`, change `>= 0.5` to `> 0.5` in both places listed in D1. Gold targets are exactly 0.0/1.0, so only the silent entries move. Add a regression test asserting that with `hard_target_mix=0.5` a target of 0.5 maps to 0.25 and a target of 0.99 stays above 0.9.
 
-Do not force uncertain or unmentioned findings to hard zero. Give them low training weight.
+Gate: `83 passed`. Commit separately from A2.
 
-For the 58 verified studies:
+### A2: silence-prior module
 
-```text
-training target = verified label
-training weight = high
-```
+New `src/rsna_knee/silence_prior.py`:
 
-For all other studies:
+- `apply_silence_prior(table, prior, weight, *, placeholder=0.5, tolerance=1e-9) -> (DataFrame, dict[str, int])` — rewrites only rows where `|value - 0.5| <= tolerance` **and** `is_gold` is False, setting both `<label>` and `<label>__weight`; returns per-label rewrite counts. Validates `0 <= prior <= 1`, `weight >= 0`, and that all 24 label/weight columns exist.
+- `write_silence_prior_table(source_path, output_path, prior, weight) -> dict` — read, apply, write, return a summary with counts.
 
-```text
-training target = consensus soft label
-training weight = confidence-dependent
-```
+Add an `apply-silence-prior` CLI command (`--labels`, `--output`, `--prior`, `--weight` default 0.35) next to `build-consensus`; match the dispatch style at `cli.py:426` (the handler uses `args`, and `json` is already imported).
 
-### Label-quality measurements
+Tests: pseudo rows rewritten, gold rows untouched, confident values untouched, invalid prior rejected.
 
-Track these before training an image model:
+Gate: `87 passed`.
 
-- Per-label AUC against the 58 verified studies
-- Per-label balanced accuracy after applying a diagnostic threshold
-- Coverage rate, meaning how often a report provides usable evidence
-- Silence rate by label and language
-- LLM-to-LLM disagreement
-- LLM-to-rule disagreement
-- Malformed-output rate
-- Duplicate-report consistency
-- Manual error categories from a small audit sample
+### A3: generate variants
 
-The verified set is too small for precise estimates. Use it to catch obvious problems, not to tune dozens of prompt variants.
+From `consensus-labels-v1.csv`, produce `consensus-labels-v2-p25.csv`, `-p10.csv`, `-p05.csv` at priors 0.25 / 0.10 / 0.05, weight 0.35. Verify 4,407 rows each and ~2,036 rewritten Baker's entries at p05.
 
-## MRI preprocessing
+### A4: retrain and compare
 
-The image pipeline must be deterministic and cached where possible.
+Upload the three files to `metadata/` on `modal-secondary`, then run four `train_heads` jobs. Every parameter is the E005 config from section 1; **only `targets_path` and `output_directory` vary**:
 
-### Series selection
+| Run | targets | output |
+|---|---|---|
+| control | `metadata/consensus-labels-v1.csv` | `heads/dino336-v1/a4-p50-control` |
+| p25 | `metadata/consensus-labels-v2-p25.csv` | `heads/dino336-v1/a4-p25` |
+| p10 | `metadata/consensus-labels-v2-p10.csv` | `heads/dino336-v1/a4-p10` |
+| p05 | `metadata/consensus-labels-v2-p05.csv` | `heads/dino336-v1/a4-p05` |
 
-Start with the five well-covered slots used by the 0.802 notebook:
+Fingerprint `673ec4355dd46e976fce0927ccdf1706bc3bbd47e20a6b546657cfe3e0e516b6`, features `features/dino336-v1/train`. ~5 min each. Download each `oof.csv` and run `scripts/evaluate_oof.py` on all four.
 
-| Plane | Contrast | Slice budget |
-|---|---|---:|
-| Sagittal | Fluid-sensitive | 12 |
-| Sagittal | Structural | 12 |
-| Coronal | Fluid-sensitive | 8 |
-| Coronal | Structural | 6 |
-| Axial | Fluid-sensitive | 8 |
+**Gate:** at least one variant beats the control on mention-restricted pseudo AUC, loses no more than 0.01 gold, and the gain is concentrated in Baker's, Fracture, Lateral OA, Contusion, Medial OA, PF OA. If the gain comes from elsewhere, investigate before proceeding. If nothing beats the control, stop and report — likely a rewrite bug, an upload mismatch, or a control that does not actually reproduce E005.
 
-Test six-slot alternatives as separate experiments. Do not mix series-selection changes with model changes in the same experiment.
+Record as E006a–E006d.
 
-### Slice handling
+### A5: submit the winner
 
-- Order slices using ImageOrientationPatient and ImagePositionPatient
-- Use InstanceNumber only as a fallback
-- Normalize left and right knees to a consistent orientation
-- Use per-series intensity windows
-- Record missing and failed series
-- Sample the useful physical range of each plane
-- Keep deterministic slice indexes for validation and inference
+Point the Kaggle inference notebook (`notebooks/`, `kaggle_hidden_inference/`) at the winning head directory. Submit once, description `A5 silence prior <value>`.
 
-### Caching
+**Gate:** LB above 0.758, expected 0.78–0.80. If local metrics improved but LB dropped, stop and report — that means the local protocol and hidden test disagree, which changes the plan.
 
-Potential cached artifacts:
+### A6 (optional): forced-decision silence resolution
 
-- DICOM headers and geometry
-- Selected series manifest
-- Normalized slice indexes
-- Frozen DINOv2 embeddings
-- Report labels and confidence weights
+Replaces the constant prior with a per-study estimate. Extend the specialist pattern (`specialist_prompt.py`, `specialist_labeler.py`) to the other 10 labels: a prompt that receives the report plus one silent label and returns a graded probability with evidence, forbidding 0.5. Run only on report groups with a silent entry for that label, merge into `consensus-labels-v3.csv`, retrain with the A4 command. Gate: beats the A4 winner on restricted pseudo AUC without losing more than 0.01 gold.
 
-Every cache must include a version fingerprint. Changing resolution, slot definitions, slice count, normalization, or backbone must invalidate the relevant cache.
+### A7 (optional, low value): bootstrap-gated blend weights
 
-## Image-model plan
+`specialist_labeler.py` ~line 190 already sweeps specialist weight over `(0, 0.25, 0.5, 0.75, 1.0)` and `consensus.py` takes one global value. Make it per label and only move off 0.5 when a 1,000-sample bootstrap over the gold set favours the alternative in ≥80% of resamples. Expected ≤0.005.
 
-### Model A: reproducible baseline
+---
 
-Recreate the 0.770 public pipeline as closely as possible.
+## 7. Phase B: end-to-end image training
 
-Purpose:
+This phase decides whether we finish near 0.80 or near 0.90. 2–3 weeks, ~30 A10h, ~$40. Expected LB **0.84–0.87**.
 
-- Verify the environment and submission process
-- Establish runtime
-- Establish our first local and public scores
-- Produce reusable DICOM and training code
+### B0: switch the physical crop to 150 mm (do this first)
 
-No improvements should be added until this run is reproducible.
+Competition series have an exactly 150.0 mm FOV across all four acquisition matrices (960 px @ 0.1562 mm, 896 @ 0.1674, 800 @ 0.1875, 640 @ 0.2344 — every product is 150.0). Our 130 mm was a guess. This must land before the image cache, which bakes it in.
 
-### Model B: high-resolution frozen DINOv2
+Change `physical_crop_mm=130.0` → `150.0` in `extract_feature_shard` and `extract_test_features` in `modal_app.py`; bump the version string in `model_config.py` and `V2_PREPROCESSING_VERSION` in `dino_features.py` to `dino336-2p5d-l9l12-phys150-v3`; update the README commands and any test asserting the old string.
 
-Use the 0.802 notebook's image setup:
+Gate: tests pass, and one canary shard on `modal-tertiary` reports `failures: 0`, `studies: 18`, `feature_dim: 2304`, and a fingerprint different from `29cc3fbb3b5840ef0f7d43728b7730f2f887d7060eacf72edecbd5df5a1d865b`.
 
-- DINOv2 ViT-S/14
-- 336 x 336 input
-- Five protocol slots
-- More slices per study
-- Frozen image backbone
-- Ridge probe and slice-attention head
+### B1: cache preprocessed study tensors
 
-This isolates the value of preprocessing, resolution, and labels without the instability of full backbone training.
+Decoding one study takes ~2.5 s. At 3,525 training studies that is >2 h per epoch of pure I/O, which makes naive end-to-end training impossible. Cache once.
 
-### Model C: partially fine-tuned DINOv2
+`build_study_images` (`dicom_extraction.py:694`) already returns exactly what a trainer needs: `[46, 3, 336, 336]`, valid mask, fractional positions, slot IDs. It returns ImageNet-normalized floats, so add `normalize: bool = True` to `preprocess_slice_triplets` (431), `preprocess_slices` (495), and `build_study_images` (694), returning the pre-normalization tensor when False. Default stays True so nothing existing changes. Test: with `normalize=False` all values lie in [0,1], and normalizing that output reproduces the normalized path within 1e-5.
 
-Fine-tune the final four to six transformer blocks with:
+Add a `cache_study_images` Modal function modelled on `extract_feature_shard` (same sharding, logging, failure manifest) that skips DINOv2 entirely, calls `build_study_images(..., normalize=False, return_metadata=True)` with the v3 params (`input_mode="2p5d"`, `crop_fraction=0.9`, `physical_crop_mm=150.0`, `image_size=336`), converts to uint8 via `np.clip(np.rint(images * 255), 0, 255)`, and writes one `np.savez_compressed` per study to `cache/images-336-v3/train/{study_id}.npz` with `images`, `valid_mask`, `positions`, `slot_ids`. Prefer a CPU-only function; no GPU is needed and it cuts cost ~10x.
 
-- Lower learning rate for the backbone
-- Higher learning rate for the prediction head
-- Confidence-weighted soft-label loss
-- Stronger weight for verified labels
-- Gradient clipping
-- Exponential moving average weights
-- Early stopping based on grouped out-of-fold predictions
+Run shard 0 first and check average file size: expect 3–6 MB/study. If any study exceeds 16 MB, compression is not working and the full cache blows past 70 GB — stop and fix.
 
-Compare four and six unfrozen blocks. Do not jump directly to full fine-tuning.
+**Gate:** 4,407 files, total under 30 GB, and a 5-study spot check where `uint8/255` normalized with ImageNet stats matches `build_study_images(..., normalize=True)` within 2/255.
 
-### Model D: anatomy-focused model
+### B2: training module
 
-The full image wastes resolution on irrelevant tissue. Add high-resolution crops for small structures:
+New `src/rsna_knee/finetune.py`.
 
-- Medial and lateral meniscus
-- ACL region
-- MCL region
-- Patellofemoral compartment
-- Posterior knee for Baker's cyst
+**Dataset** `CachedStudyDataset` returns `images [46,3,336,336] float32` (ImageNet-normalized), `valid_mask [46]`, `positions [46]`, `slot_ids [46]`, `targets [12]`, `weights [12]`. Augmentation when enabled, applied consistently across the whole study: h-flip p=0.5 (laterality is already normalized, so this is a true augmentation), rotation ±10°, intensity scale [0.9,1.1] and shift ±0.05, per-slice dropout p=0.1 (never all of a slot), per-slot dropout p=0.1.
 
-The first version can use fixed, geometry-based crops. A later version can learn a locator.
+**Model** `StudyEncoder`: configurable backbone with `trainable_blocks`; slice transformer (2 layers, 8 heads, dim 384) with positional and slot embeddings; per-label gated attention pooling (reuse the logic in `MaskedAttentionHead`); a 12-logit classification head plus a 384-dim auxiliary head for Phase C.
 
-Use condition-specific attention so each label relies on suitable planes and regions.
+Forward: `[B,46,3,336,336]` → run **only valid slices** through the backbone → scatter back to `[B,46,384]` with zeros for invalid → add position and slot embeddings → slice transformer with the valid mask as key padding mask → gated pooling → logits.
 
-### Model E: 2.5D convolutional model
+Import `weighted_soft_bce`, `sqrt_positive_class_weights`, and `pairwise_auc_loss` from `fold_heads.py`; do not reimplement them.
 
-Train a different architecture for ensemble diversity:
+**Run B1 (DINOv2 partial unfreeze):** `dinov2_vits14`, `trainable_blocks=6`, backbone LR 1e-5, head LR 1e-3, weight decay 0.05, cosine with 1-epoch warmup, 12 epochs, effective batch 8 studies (batch 2 × accum 4), bf16 autocast, gradient checkpointing, clip 1.0, EMA 0.999, early stop on grouped OOF macro AUC patience 3, `hard_target_mix=0.5`, `pairwise_auc_weight=0.07`, `gold_oversample_fraction=0.25`, seed 20260828.
 
-- Three adjacent slices as channels
-- ConvNeXt or EfficientNetV2 backbone
-- Study-level attention pooling
-- Same pseudo-label and fold definitions as DINOv2
+**Run B2 (2.5D CNN):** `tf_efficientnetv2_s` from timm with ImageNet weights, everything trainable, LR 3e-4 throughout, 16 epochs, otherwise identical.
 
-A slightly weaker but genuinely different model can improve the final rank ensemble.
+Both use the Phase A winning label file and `folds-v1.csv`.
 
-### Model F: MRI-adapted representation
+**Modal entry point** `train_finetune`, modelled on `train_heads`: both volumes mounted, a `fold` argument so five folds run as parallel containers via `.map()`, writes `fold-{k}.pt`, `oof-{k}.csv`, `metadata.json` under `heads/finetune-<name>/`, `timeout=21600`, A10, refuses to overwrite.
 
-Continue self-supervised training on the competition's unlabeled MRI slices before supervised fine-tuning.
+### B3: smoke test
 
-Possible objectives:
+One fold, one epoch, 64 studies. Gate: completes, loss falls between first and last logged step, checkpoint written, GPU memory under 22 GiB. If memory overflows, drop batch to 1 and raise accumulation to 8 before changing anything else.
 
-- DINO-style teacher-student learning
-- Masked image modeling
-- Contrastive learning between nearby slices
+### B4: full runs
 
-This is expensive and belongs late in the plan. First prove that the baseline, labels, and validation are working.
+B1 five folds on `modal-secondary`, B2 five folds on `modal-tertiary`, in parallel. 2–4 h wall clock each. Concatenate fold OOFs into single 4,407-row files and evaluate.
 
-## Validation design
+**Gate for the whole phase:** at least one run reaches gold macro AUC > 0.82 **and** restricted pseudo macro AUC > 0.85.
 
-No single validation score is trustworthy enough. We will use three layers.
+If neither clears it, diagnose in this order:
 
-### Gold out-of-fold score
+1. Overfitting (val AUC peaks epoch 2–3 then declines) → `trainable_blocks` 6 → 4, stronger augmentation, label smoothing.
+2. Underfitting (never beats the frozen baseline) → backbone LR 3e-5, more epochs.
+3. Data-loading bug (AUC ≈ 0.5) → dump 10 cached studies to PNG and look at them. Worth doing once regardless.
+4. Label or fold misalignment (high train AUC, random val AUC) → assert study IDs at every join.
 
-Create out-of-fold predictions for all 58 verified studies and calculate:
+Do not enter Phase C until the gate passes. Record as E007/E008 and submit the better run.
 
-- Macro ROC AUC
-- Per-label ROC AUC
-- Bootstrap confidence interval
+---
 
-The folds must keep duplicate reports together. If a fold has no positive or no negative case for a label, calculate AUC on the pooled out-of-fold predictions rather than averaging fold AUCs.
+## 8. Phases C–F
 
-This score measures agreement with verified labels, but its uncertainty will be large.
+**C, report distillation (weeks 4–6, may overlap B).** Embed every report with a multilingual model (e.g. `intfloat/multilingual-e5-base`), PCA to 384 dims, store aligned to `report_group`, add a cosine auxiliary loss at weight 0.3, rerun the better of B1/B2 changing nothing else. Gate: gold AUC improves over the same seed and folds without the auxiliary loss. Expected +0.01–0.03, zero inference cost.
 
-### Pseudo-label out-of-fold score
+**D, anatomy and resolution (weeks 5–8, only after B passes).** Fixed geometry crops at higher resolution for the meniscal horns, ACL, MCL, patellofemoral compartment, and popliteal fossa; per-label plane gating (fracture and contusion lean fluid-sensitive, OA labels lean structural); a 448 px experiment restricted to the smallest structures. Gate: the labels a crop targets must improve — macro drift is not acceptance.
 
-Use all training studies, grouped by normalized report hash.
+**E, ensemble and packaging (weeks 8–11).** Rank-average B, C, D models plus the frozen v3 head model if it exists; per-label weights from OOF with bootstrap gating, never from the LB; h-flip and slice-offset TTA; a full offline dry run of the Kaggle notebook with measured runtime. Gate: beats every component on both frozen metrics and finishes under 4 h on the T4 pair, leaving margin under the 9 h limit. Expected 0.88–0.92.
 
-Track:
+**F, optional SSL adaptation.** DINO or MIM on the 730k unlabeled slices for 20–40 A10h, then repeat Phase B from the adapted weights. Highest ceiling on the list, but the gain overlaps Phase C. Only with real time to spare.
 
-- Macro AUC against consensus pseudo-labels
-- Per-label AUC
-- Weighted binary cross-entropy
-- Performance by language
-- Performance by scanner or protocol group where available
+---
 
-This score is stable enough for model development but measures agreement with the label-generation system. It does not prove clinical correctness.
+## 9. Budget and tracking
 
-### Kaggle public score
+| Item | A10h | Wall | Cost |
+|---|---:|---|---:|
+| Phase A retrains (4) | 1 | 30 min | $2 |
+| B0 canary | 0.1 | 5 min | $0.20 |
+| B1 image cache (CPU preferred) | 2 | 40 min | $3 |
+| B1 fine-tune, 5 folds | 15 | 3 h | $20 |
+| B2 CNN, 5 folds | 12 | 2.5 h | $16 |
+| Phase C | 15 | 3 h | $20 |
+| Phase D | 20 | 4 h | $27 |
+| Phase E | 5 | 2 h | $7 |
+| **Total without F** | **70** | | **$95** |
+| Phase F | 40 | 12 h | $54 |
 
-Submit only at planned gates:
+Compute is not the constraint; deciding what to run is.
 
-1. Reproduced baseline
-2. Improved label system
-3. High-resolution DINOv2
-4. Fine-tuned or anatomy-aware model
-5. First ensemble
-6. Final candidate ensemble
+One row per run in `experiments.csv` (existing columns: `experiment_id, parent_id, change, label_version, fold_version, gold_oof_auc, pseudo_oof_auc, public_lb_auc, runtime_minutes, git_revision, decision, notes`). Put the gold bootstrap interval and the restricted pseudo AUC in `notes`.
 
-If submission limits allow more runs, reserve them for debugging and clearly label them as such.
+Planned IDs: E006a control, E006b/c/d priors 0.25/0.10/0.05, E006e optional LLM silence resolution, E007 DINOv2 partial unfreeze, E008 EfficientNetV2-S, E009 report distillation, E010 anatomy crops, E011 final ensemble.
 
-## Experiment tracking
+**Promotion criteria** — all five: restricted pseudo AUC improves; gold does not fall more than 0.01 and shows no broad per-label regression; the gain is not one label improving while several decline; projected inference stays under 4 h on the T4 pair; the pipeline writes a valid submission even when a component fails.
 
-Maintain one row per experiment:
+---
 
-| ID | Parent | Single main change | Label version | Fold version | Gold OOF | Pseudo OOF | Public LB | Runtime | Decision |
-|---|---|---|---|---|---:|---:|---:|---:|---|
-| E000 | none | Constant baseline | none | F1 | 0.500 | 0.500 | 0.500 | - | sanity check |
-| E001 | E000 | Public 0.770 reproduction | rules-v1 | F1 | TBD | TBD | TBD | TBD | pending |
+## 10. Risks and stop conditions
 
-Also store:
+| Risk | Detection | Response |
+|---|---|---|
+| Supervision ceiling 0.896 | gold AUC of the labels themselves | Phase A must move it; if A4 and A6 both fail, build a second independent labeler before more imaging work |
+| Gold set too small | bootstrap interval ±0.05 | never promote on gold alone |
+| Fine-tuning overfits | val AUC peaks by epoch 3 | 6 → 4 trainable blocks, stronger augmentation, keep EMA |
+| Cached images wrong | AUC ≈ 0.5 | dump 10 studies to PNG |
+| Inference runtime | measure sec/study in Phase E | cap ensemble size, drop TTA before dropping models |
+| Leakage | duplicate reports across folds | `folds-v1.csv` is grouped by report hash; never regenerate |
+| Tertiary inodes | 169.7% of limit | write to `rsna-knee-artifacts` or use secondary |
+| LB overfitting | >6 submissions without a prior hypothesis | stop submitting, return to local evidence |
 
-- Git commit or notebook version
-- Random seed
-- Per-label AUC values
-- Training loss curves
-- Number of studies and slices used
-- Missing-series and DICOM failure counts
-- Peak memory
-- Inference runtime projection
-- Submission filename and Kaggle submission ID
+**Hard stops — report, do not improvise:** a Phase A variant improves locally but drops the LB below 0.758; Phase B fails its gate after both the overfit and underfit remedies; any single launch would exceed 10 A10 hours; anything asks to delete or overwrite existing artifacts.
 
-### Experiment rule
+---
 
-Change one major factor at a time:
+## 11. Do not
 
-- Label source
-- Resolution
-- Number of slices
-- Series slots
-- Backbone
-- Fine-tuning depth
-- Pooling
-- Crop strategy
-- Ensemble weights
+1. **Do not run the full 256-shard frozen v3 extraction.** The canary proved the code works; the ceiling is 0.78–0.81, which Phase A and B pass through anyway. 5.6 A10h for a result we discard. Revisit only in Phase E if a cheap extra ensemble member is wanted.
+2. Do not tune on the public leaderboard.
+3. Do not regenerate the folds.
+4. Do not evaluate a label variant against its own targets.
+5. Do not pass `--overwrite` to Modal training jobs.
+6. Do not add file trees to `rsna-knee-data` on `modal-tertiary`.
+7. Do not chase backbone swaps (DINOv3, C-RADIO) before Phase B. Frozen-feature swaps are worth 0.01–0.03; Phase B is worth 0.04–0.08. OrthoFoundation is unusable: CC BY-NC-ND, no public weights.
 
-Combining several changes may improve the score, but it prevents us from knowing why.
+---
 
-### Promotion criteria
+## 12. Reference
 
-Promote an experiment when:
+**Task.** Predict 12 findings per knee MRI study: ACL, MCL, medial meniscus, lateral meniscus, medial OA, lateral OA, PF OA, effusion, synovitis, Baker's, contusion, fracture. Score is the mean of 12 per-finding ROC AUCs, equal weight, so a rare fracture counts as much as effusion. AUC is ranking-only; calibration is irrelevant. Moving one finding 0.50 → 0.90 adds 0.0333 — which is why the six labels damaged by D1 matter.
 
-1. Pseudo-label OOF improves on most folds.
-2. Gold OOF does not show a broad per-label regression.
-3. The gain is not caused by one condition while several others decline.
-4. Runtime remains compatible with the nine-hour inference limit.
-5. The pipeline processes every expected test study and always writes a valid submission.
+**Data.** 4,407 training studies, 24,371 series, ~730k slices, ~265 GB. 4,257 unique report groups. 58 studies with all 12 verified labels (all contain at least one positive, so prevalence is biased up), 4,349 with reports only. Reports are train-only, multilingual, with duplicates. Test-time series metadata: `Fluid_Sensitive`, `Fat_Suppression`, `Anatomical_Plane`. FOV is exactly 150.0 mm.
 
-Because gold validation is noisy, do not require every promoted model to improve its macro score. Review its per-label predictions and confidence interval.
+**Policy.** The 265 GB archive stays off the local machine — local is CSVs, labeling, code, tracking; Modal does preprocessing, caching, extraction, training; Kaggle does final inference. Confirm competition rules and license before sending reports to any third-party LLM API.
 
-## Phased execution plan
+**Reference notebooks** (Kaggle-displayed scores, Aug 6): DINOv2 at meniscus resolution 0.802; Pilkwang baseline v1 0.770; DINOv2 fork 0.668; EDA to 2.5D 0.630; DINOsaur V2 0.621. A sweep of the cached sources in `references/notebooks/` on Aug 7 found only one score stated in notebook text (0.621, superseded by its own author). Treat the cached copies as sources of technique, not verified score. Unadopted techniques worth taking: the 150 mm crop (task B0), bootstrap-gated blend weights (A7), two-position-set slot assignment for unusual protocols. **Every public result above 0.77 puts gradients into the encoder** — independent confirmation of Phase B.
 
-### Phase 0: rules, environment, and tracking
+**v3 preprocessing.** Committed at `79d3f97`. Canary on `modal-tertiary`, Aug 7: 18 studies, 0 failures, 2,304 dim, 46 slices, 53.1 s, 2.95 s/study, fingerprint `29cc3fbb...`, sha256 `d57a690a...`. Contents: 2.5D adjacent-slice triplets, DINO blocks 9 and 12, per-series windowing p1–p99.5, PixelSpacing-aware physical crop with 90% center-crop fallback, laterality normalization (right-knee sagittal reversal, coronal/axial flip), persisted fractional positions and slot IDs. Reused verbatim by Phase B through `build_study_images`.
 
-Deliverables:
-
-- Confirm competition rules for LLM processing and derived datasets
-- Create experiment registry
-- Create fixed fold assignments
-- Add metric code and submission validation
-- Reproduce a constant 0.5 sanity submission
-
-Exit condition:
-
-- Metrics and submission checks run deterministically
-
-### Phase 1: reproduce the 0.770 baseline
-
-Deliverables:
-
-- Multilingual rule labels
-- DICOM slot selection and physical ordering
-- 224 px DINOv2 training
-- Grouped out-of-fold predictions
-- Kaggle submission
-
-Exit condition:
-
-- Successful notebook run and public score close enough to the published result to explain any difference
-
-### Phase 2: build better report labels
-
-Run label experiments in this order:
-
-1. Public rules only
-2. LLM A only
-3. LLM A plus rules
-4. LLM A plus LLM B
-5. LLM consensus plus rules
-6. Confidence calibration using the 58 verified studies
-
-Keep the image model fixed during this phase.
-
-Exit condition:
-
-- Better pseudo-label OOF and no clear regression on verified labels
-
-### Phase 3: reproduce the 0.802 image pipeline
-
-Keep the best Phase 2 labels fixed and test:
-
-1. 224 px, existing slice count
-2. 336 px only
-3. 336 px plus five protocol slots
-4. 336 px plus increased slice coverage
-5. Ridge probe
-6. Attention head
-7. Fixed rank blend
-
-Exit condition:
-
-- Identify which parts of the 0.802 system produce repeatable gains
-
-### Phase 4: fine-tuning and anatomy
-
-Experiments:
-
-- Unfreeze final four DINOv2 blocks
-- Unfreeze final six blocks
-- Condition-specific plane attention
-- Fixed anatomy crops
-- Learned region locator if fixed crops help
-- MRI self-supervised adaptation if compute allows
-
-Exit condition:
-
-- At least one model improves local evidence and public score without exceeding runtime
-
-### Phase 5: diverse model and ensemble
-
-Train a 2.5D ConvNeXt or EfficientNetV2 model using the same folds and labels.
-
-Test:
-
-- Global rank averaging
-- Per-label rank averaging
-- Weights chosen from out-of-fold predictions
-- Leave-one-model-out ensemble analysis
-
-Never choose ensemble weights directly on the public leaderboard.
-
-Exit condition:
-
-- Ensemble beats every component locally and remains within inference limits
-
-### Phase 6: final packaging
-
-Separate training and inference.
-
-The final Kaggle notebook should:
-
-- Run with internet disabled
-- Load attached public models, derived labels where needed, and trained weights
-- Process the complete hidden test set
-- Finish within nine hours
-- Write `submission.csv`
-- Assert row identity, column order, finite values, and probability range
-- Fall back safely if a non-critical component fails
-- Log runtime for each pipeline stage
-
-Run at least one full dry run before selecting final submissions.
-
-## Score expectations
-
-These are planning ranges, not promises:
-
-| Milestone | Approximate public target |
-|---|---:|
-| Reproduced baseline | 0.75 to 0.78 |
-| Better report labels | 0.78 to 0.83 |
-| High-resolution DINOv2 | 0.81 to 0.86 |
-| Fine-tuning and anatomy models | 0.84 to 0.89 |
-| Strong diverse ensemble | 0.87 to 0.91 |
-
-Crossing 0.90 is possible, but it requires strong performance across nearly every label. It is more useful to target a robust private score than a fragile public 0.90.
-
-## Main risks
-
-### Label ceiling
-
-An image model cannot reliably outperform incorrect supervision. Invest in report-label audits before scaling the network.
-
-### Validation noise
-
-The 58 verified studies cannot precisely rank small improvements. Use grouped pseudo-label OOF, gold OOF, and sparse public submissions together.
-
-### Public leaderboard overfitting
-
-Record every submission and its prior hypothesis. Do not keep a change solely because it gained a few public leaderboard points.
-
-### Data leakage
-
-Duplicate reports must stay in one fold. Derived labels, cached features, and fold assignments must never include test outcomes.
-
-### Runtime
-
-High resolution and many slices multiply inference cost. Measure seconds per study early and project it to the expected hidden test size.
-
-### Reproducibility
-
-Public notebooks can change after scoring. Save exact notebook versions, dependencies, prompts, model identifiers, and derived-data hashes.
-
-## Immediate next actions
-
-1. Read and record the exact competition rules for external LLM processing and derived labels.
-2. Create the experiment registry and fixed grouped folds.
-3. Reproduce the 0.770 baseline without modifications.
-4. Build and audit the first LLM labeler.
-5. Compare rules, LLM labels, and consensus labels while keeping the image model fixed.
-6. Reproduce the 336 px frozen-DINO pipeline.
-7. Submit only after each planned gate passes local checks.
-
-## Reference links
-
-- Competition: <https://www.kaggle.com/competitions/rsna-knee-abnormality-detection>
-- Public notebooks: <https://www.kaggle.com/competitions/rsna-knee-abnormality-detection/code>
-- DINOv2 at meniscus resolution: <https://www.kaggle.com/code/wguesdon/rsna-knee-dinov2-at-meniscus-resolution>
-- Pilkwang baseline v1: <https://www.kaggle.com/code/pilkwang/rsna-knee-baseline-v1>
+**Links:** [competition](https://www.kaggle.com/competitions/rsna-knee-abnormality-detection) · [notebooks](https://www.kaggle.com/competitions/rsna-knee-abnormality-detection/code) · [meniscus resolution](https://www.kaggle.com/code/wguesdon/rsna-knee-dinov2-at-meniscus-resolution) · [pilkwang baseline](https://www.kaggle.com/code/pilkwang/rsna-knee-baseline-v1)
+</content>
