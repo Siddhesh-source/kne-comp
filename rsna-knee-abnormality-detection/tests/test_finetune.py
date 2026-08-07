@@ -428,6 +428,19 @@ def test_encoder_output_shapes():
     assert auxiliary.shape == (2, 8)
 
 
+def test_encoder_scatter_handles_autocast_backbone_dtype():
+    model = _make_encoder(RecordingBackbone())
+    images, mask, positions, slots = _encoder_inputs()
+
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        logits, auxiliary = model(images, mask, positions, slots)
+
+    assert logits.shape == (2, len(LABELS))
+    assert auxiliary.shape == (2, 8)
+    assert torch.isfinite(logits).all()
+    assert torch.isfinite(auxiliary).all()
+
+
 class FakeDino(nn.Module):
     def __init__(self):
         super().__init__()

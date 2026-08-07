@@ -493,7 +493,8 @@ class StudyEncoder(nn.Module):
                 raise ValueError(
                     "slice backbone must return [valid_slices, slice_feature_dim]"
                 )
-            encoded[flat_mask] = self.slice_projection(features)
+            projected = self.slice_projection(features)
+            encoded[flat_mask] = projected.to(encoded.dtype)
         encoded = encoded.view(images.shape[0], images.shape[1], self.hidden_dim)
         safe_positions = positions.clamp(0, 1).unsqueeze(-1).to(images.dtype)
         safe_slots = slot_ids.clamp(0, self.slot_embedding.num_embeddings - 1)
