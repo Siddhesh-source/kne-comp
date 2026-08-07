@@ -1,6 +1,6 @@
 # RSNA knee abnormality detection: execution plan
 
-Last updated: August 7, 2026. Every fact below was verified against the repository and the Kaggle API on that date. If the repo disagrees, trust the repo and update this file.
+Last updated: August 7, 2026 (Phase A closed same day). Every fact below was verified against the repository and the Kaggle API on that date. If the repo disagrees, trust the repo and update this file.
 
 ---
 
@@ -28,6 +28,8 @@ Gap decomposition:
 
 Representation is the dominant term, supervision is a hard cap below the leader, head tuning is worth ~0.01. Effort follows that order.
 
+**Phase A closed 2026-08-07** (Section 6). The D1 fix is real (+0.013 gold AUC, single seed) and is now merged into `main`. The silence-prior calibration (D2) added nothing measurable on top of it. The numbers above are still E005's registered values; they have not been re-ensembled or resubmitted with the fix (that is the deferred A5 decision). Effort now moves to Phase B.
+
 E005 config, for reproduction:
 
 ```
@@ -42,22 +44,24 @@ extras    pairwise_auc_weight 0.07, sqrt class balance, ema 0.995, clip 1.0,
 
 ## 2. Defects (verified, not hypotheses)
 
-### D1: silent labels are trained as positives
+### D1: silent labels are trained as positives — FIXED (`924933f`)
 
-Silent labels are stored as probability **exactly 0.5**. Two places treat that as positive:
+Silent labels are stored as probability **exactly 0.5**. Two places treated that as positive:
 
-- `src/rsna_knee/fold_heads.py` ~line 274, in `train_fold_heads`: `hard_target_mix * (train_targets >= 0.5)`. With `hard_target_mix=0.5` a silent label gets an effective target of **0.75**.
+- `src/rsna_knee/fold_heads.py` ~line 274, in `train_fold_heads`: `hard_target_mix * (train_targets >= 0.5)`. With `hard_target_mix=0.5` a silent label got an effective target of **0.75**.
 - `src/rsna_knee/fold_heads.py` ~line 585, in `_macro_binary_auc`: `binary = np.asarray(targets) >= 0.5`. Same mistake inside the metric that drives early stopping.
 
-Silent share of the corpus: Baker's 46.2%, Fracture 42.5%, Lateral OA 26.4%, Contusion 24.8%, Medial OA 21.1%, PF OA 17.5%, MCL 9.8%, Lateral Meniscus 9.8%, ACL 7.9%, Medial Meniscus 5.6%. Effusion and Synovitis are at 0% because the specialist labeler forces a graded decision for those two. That is the pattern to copy.
+Both now compare with `> 0.5`. Verified by measurement (A4, single seed, everything else held at the E005 config): gold macro AUC 0.6983 → 0.7113 (+0.0130), pseudo full macro AUC 0.7115 → 0.7317 (+0.0202). Both regression tests were confirmed to fail against the reverted (buggy) code before the fix was restored.
 
-Six labels above 17% silence are half the macro average.
+Silent share of the corpus: Baker's 46.2%, Fracture 42.5%, Lateral OA 26.4%, Contusion 24.8%, Medial OA 21.1%, PF OA 17.5%, MCL 9.8%, Lateral Meniscus 9.8%, ACL 7.9%, Medial Meniscus 5.6%. Effusion and Synovitis are at 0% because the specialist labeler forces a graded decision for those two.
 
-### D2: the silence prior is a placeholder
+### D2: the silence prior is a placeholder — TESTED, NO MEASURABLE EFFECT (A4)
 
 `label_prompt.py` tells the model to emit 0.5 when the report is silent; `consensus.py` turns confidence into weight via `0.25 + 0.75 * confidence`, landing near 0.4. Nobody estimated `P(present | silent)`. Reports are negative by omission, so the true prior is well below 0.5.
 
 Supporting measurement: on the gold set, **every study our labeler called negative was truly negative**, all 12 labels. Negative precision is excellent; the failure mode is silence, not error.
+
+`silence_prior.py` (`866ec62`) rewrites the 0.5 placeholder to a supplied prior for non-gold rows. Tested at priors 0.25, 0.10, 0.05 (weight 0.35) on top of the D1 fix (A4): gold 0.7119 / 0.7116 / 0.7109, pseudo restricted 0.7602 / 0.7598 / 0.7597 — all within noise of the D1-fix-only control (gold 0.7113, pseudo restricted 0.7603) and of each other. **The head apparently already learns to score ambiguous/silent studies low once they stop being forced toward 1; recalibrating the placeholder value itself buys nothing further at this scale.** D2 is deprioritized; D1 was the real defect.
 
 ### D3: the report is compressed into 12 numbers
 
@@ -99,7 +103,7 @@ Levers by value per unit effort: (1) fix D1/D2, +0.01–0.03, no GPU. (2) train 
 
 PowerShell 5.1: no `&&` or `||`, chain with `;`. Use `py`, not `python`.
 
-Tests: `cd rsna-knee-abnormality-detection; $env:PYTHONPATH="src"; py -m pytest` → **82 passed**. pytest writes a deprecation warning to stderr, so PowerShell reports a non-zero exit code even on success. Judge by the `N passed` line.
+Tests: `cd rsna-knee-abnormality-detection; $env:PYTHONPATH="src"; py -m pytest` → **93 passed** (82 at the start of Phase A, +2 for the D1 regression tests, +9 for `silence_prior.py`). pytest writes a deprecation warning to stderr, so PowerShell reports a non-zero exit code even on success. Judge by the `N passed` line.
 
 Modal profiles are selected with `$env:MODAL_PROFILE`; `--profile` is not a flag on `modal volume`.
 
@@ -135,63 +139,57 @@ Build `scripts/evaluate_oof.py` that takes one or more OOF CSVs and reports thre
 
 ---
 
-## 6. Phase A: label repair
+## 6. Phase A: label repair — CLOSED 2026-08-07
 
-No GPU beyond ~1 A10-hour of head retraining. 3–5 days. Expected LB **0.78–0.80**.
+No GPU beyond ~30 A10-minutes of head retraining. Actual wall time: under one day. **Actual LB movement: none yet** — nothing has been resubmitted. **Actual local movement: +0.013 gold AUC, +0.020 pseudo full**, entirely from A1; A2/A3/A4 (the silence prior) found nothing further.
 
-### A1: fix D1
+### A0: frozen baseline — done
 
-In `src/rsna_knee/fold_heads.py`, change `>= 0.5` to `> 0.5` in both places listed in D1. Gold targets are exactly 0.0/1.0, so only the silent entries move. Add a regression test asserting that with `hard_target_mix=0.5` a target of 0.5 maps to 0.25 and a target of 0.99 stays above 0.9.
+`scripts/evaluate_oof.py` scores an OOF file against targets frozen at `consensus-labels-v1.csv`/`train.csv` regardless of which variant trained it: gold macro AUC + bootstrap 95% CI, mention-restricted pseudo macro AUC (primary decision metric, invariant to the silence prior), full pseudo macro AUC (continuity with E004/E005). Run against the registered E005 ensemble and its best single seed:
 
-Gate: `83 passed`. Commit separately from A2.
+| | gold (CI95) | pseudo restricted | pseudo full |
+|---|---|---|---|
+| E005 ensemble | 0.7358 [0.679, 0.782] | 0.8079 | 0.7392 |
+| E005 best single seed | 0.6983 [0.646, 0.748] | 0.7594 | 0.7115 |
 
-### A2: silence-prior module
+Gold matched the registered E005 value almost exactly, confirming the script. Recorded as row `A0` in `experiments.csv`. This is the frozen bar every later row is compared against — single seed vs. single seed, ensemble vs. ensemble, never mixed.
 
-New `src/rsna_knee/silence_prior.py`:
+### A1: fix D1 — done, committed `924933f`
 
-- `apply_silence_prior(table, prior, weight, *, placeholder=0.5, tolerance=1e-9) -> (DataFrame, dict[str, int])` — rewrites only rows where `|value - 0.5| <= tolerance` **and** `is_gold` is False, setting both `<label>` and `<label>__weight`; returns per-label rewrite counts. Validates `0 <= prior <= 1`, `weight >= 0`, and that all 24 label/weight columns exist.
-- `write_silence_prior_table(source_path, output_path, prior, weight) -> dict` — read, apply, write, return a summary with counts.
+Changed `>= 0.5` to `> 0.5` in both places listed in D1. Added two regression tests, each verified to fail on the reverted (buggy) line before the fix was restored. `84 passed` (82 + 2).
 
-Add an `apply-silence-prior` CLI command (`--labels`, `--output`, `--prior`, `--weight` default 0.35) next to `build-consensus`; match the dispatch style at `cli.py:426` (the handler uses `args`, and `json` is already imported).
+### A2: silence-prior module — done, committed `866ec62`
 
-Tests: pseudo rows rewritten, gold rows untouched, confident values untouched, invalid prior rejected.
+`src/rsna_knee/silence_prior.py`: `apply_silence_prior(table, prior, weight, *, placeholder=0.5, tolerance=1e-9) -> (DataFrame, dict[str, int])` rewrites only non-gold rows where a label sits at exactly 0.5; `write_silence_prior_table` wraps it for file-to-file use. Wired up as the `apply-silence-prior` CLI command (`--labels`, `--output`, `--prior`, `--weight` default 0.35) next to `build-consensus`. 9 new tests. `93 passed`. Smoke-tested against the real `consensus-labels-v1.csv`: 9,327 total rewrites (Baker's 2034, Fracture 1872, Effusion 1, Synovitis 2), matching the D1 silence-share table.
 
-Gate: `87 passed`.
+### A3: generate variants — done
 
-### A3: generate variants
+`consensus-labels-v2-p25.csv`, `-p10.csv`, `-p05.csv` at priors 0.25 / 0.10 / 0.05, weight 0.35. 4,407 rows each, identical 9,327 rewrites, only the written value differs.
 
-From `consensus-labels-v1.csv`, produce `consensus-labels-v2-p25.csv`, `-p10.csv`, `-p05.csv` at priors 0.25 / 0.10 / 0.05, weight 0.35. Verify 4,407 rows each and ~2,036 rewritten Baker's entries at p05.
+### A4: retrain and compare — done, results recorded, decision: hold
 
-### A4: retrain and compare
+Uploaded the three files to `metadata/` on `modal-secondary`, ran four `train_heads` jobs in parallel. Every parameter was the E005 config from Section 1; only `targets_path` and `output_directory` varied (control = `consensus-labels-v1.csv`, i.e. the D1 fix with no prior change). All single seed (20260828), ~6 minutes each, ~$2 total.
 
-Upload the three files to `metadata/` on `modal-secondary`, then run four `train_heads` jobs. Every parameter is the E005 config from section 1; **only `targets_path` and `output_directory` vary**:
+| Run | gold | pseudo restricted | pseudo full | vs. control |
+|---|---|---|---|---|
+| control (fix only) | 0.7113 | 0.7603 | 0.7317 | — (+0.0130 / +0.0009 / +0.0202 vs. A0 single seed) |
+| p25 | 0.7119 | 0.7602 | 0.7350 | +0.0006 / −0.0001 / +0.0033 |
+| p10 | 0.7116 | 0.7598 | 0.7366 | +0.0003 / −0.0005 / +0.0049 |
+| p05 | 0.7109 | 0.7597 | 0.7371 | −0.0004 / −0.0006 / +0.0054 |
 
-| Run | targets | output |
-|---|---|---|
-| control | `metadata/consensus-labels-v1.csv` | `heads/dino336-v1/a4-p50-control` |
-| p25 | `metadata/consensus-labels-v2-p25.csv` | `heads/dino336-v1/a4-p25` |
-| p10 | `metadata/consensus-labels-v2-p10.csv` | `heads/dino336-v1/a4-p10` |
-| p05 | `metadata/consensus-labels-v2-p05.csv` | `heads/dino336-v1/a4-p05` |
+Recorded as rows `A4-p50-control`, `A4-p25`, `A4-p10`, `A4-p05` in `experiments.csv`, decision `hold`. None of the three priors clears the gate (beat control on restricted pseudo AUC without losing gold) by a margin distinguishable from noise (bootstrap CI width ~±0.05). The D1 fix alone accounts for essentially all of the measured gain; D2 does not matter at this scale. **Phase A gate for moving to Phase B is met by the fix alone** — no further label-only work is expected to move the needle before Phase B lands.
 
-Fingerprint `673ec4355dd46e976fce0927ccdf1706bc3bbd47e20a6b546657cfe3e0e516b6`, features `features/dino336-v1/train`. ~5 min each. Download each `oof.csv` and run `scripts/evaluate_oof.py` on all four.
+### A5 (deferred): promote the fix into a submitted ensemble
 
-**Gate:** at least one variant beats the control on mention-restricted pseudo AUC, loses no more than 0.01 gold, and the gain is concentrated in Baker's, Fracture, Lateral OA, Contusion, Medial OA, PF OA. If the gain comes from elsewhere, investigate before proceeding. If nothing beats the control, stop and report — likely a rewrite bug, an upload mismatch, or a control that does not actually reproduce E005.
+Not yet done, and not blocking Phase B. Retrain a 3-seed ensemble on `consensus-labels-v1.csv` with the fix (matching E005's seeds), evaluate, record as `E006`, and decide whether to submit. Cheap (~15 A10-minutes) and low-risk since it changes no architecture, only the already-verified label semantics — but it competes for time against Phase B, which has a much larger ceiling. Revisit once Phase B has a first working checkpoint, or sooner if a low-risk submission is wanted to confirm the local-to-LB relationship still holds.
 
-Record as E006a–E006d.
+### A6 (deferred, likely low value given A4): forced-decision silence resolution
 
-### A5: submit the winner
+Replaces the constant prior with a per-study LLM estimate instead of a flat number. Given that A4 showed the flat prior itself does not matter, a per-study prior is unlikely to matter either — the head already handles ambiguity well once it is not forced toward 1. Keep on the list only as a fallback if Phase B stalls and D2 needs re-examination with better evidence.
 
-Point the Kaggle inference notebook (`notebooks/`, `kaggle_hidden_inference/`) at the winning head directory. Submit once, description `A5 silence prior <value>`.
+### A7 (deferred, low value): bootstrap-gated blend weights
 
-**Gate:** LB above 0.758, expected 0.78–0.80. If local metrics improved but LB dropped, stop and report — that means the local protocol and hidden test disagree, which changes the plan.
-
-### A6 (optional): forced-decision silence resolution
-
-Replaces the constant prior with a per-study estimate. Extend the specialist pattern (`specialist_prompt.py`, `specialist_labeler.py`) to the other 10 labels: a prompt that receives the report plus one silent label and returns a graded probability with evidence, forbidding 0.5. Run only on report groups with a silent entry for that label, merge into `consensus-labels-v3.csv`, retrain with the A4 command. Gate: beats the A4 winner on restricted pseudo AUC without losing more than 0.01 gold.
-
-### A7 (optional, low value): bootstrap-gated blend weights
-
-`specialist_labeler.py` ~line 190 already sweeps specialist weight over `(0, 0.25, 0.5, 0.75, 1.0)` and `consensus.py` takes one global value. Make it per label and only move off 0.5 when a 1,000-sample bootstrap over the gold set favours the alternative in ≥80% of resamples. Expected ≤0.005.
+`specialist_labeler.py` ~line 190 already sweeps specialist weight over `(0, 0.25, 0.5, 0.75, 1.0)` and `consensus.py` takes one global value. Make it per label and only move off 0.5 when a 1,000-sample bootstrap over the gold set favours the alternative in ≥80% of resamples. Expected ≤0.005 — not worth doing before Phase B.
 
 ---
 
@@ -233,7 +231,7 @@ Import `weighted_soft_bce`, `sqrt_positive_class_weights`, and `pairwise_auc_los
 
 **Run B1 (DINOv2 partial unfreeze):** `dinov2_vits14`, `trainable_blocks=6`, backbone LR 1e-5, head LR 1e-3, weight decay 0.05, cosine with 1-epoch warmup, 12 epochs, effective batch 8 studies (batch 2 × accum 4), bf16 autocast, gradient checkpointing, clip 1.0, EMA 0.999, early stop on grouped OOF macro AUC patience 3, `hard_target_mix=0.5`, `pairwise_auc_weight=0.07`, `gold_oversample_fraction=0.25`, seed 20260828.
 
-**Run B2 (2.5D CNN):** `tf_efficientnetv2_s` from timm with ImageNet weights, everything trainable, LR 3e-4 throughout, 16 epochs, otherwise identical.
+**Run B2 (2.5D CNN):** `tf_efficientnetv2_s` from timm with ImageNet weights, everything trainable, LR 3e-4 throughout, 16 epochs, otherwise identical. `timm` is not currently in `gpu_image`'s `uv_pip_install` list in `modal_app.py` (verified 2026-08-07) — add it there before B2 runs, and let the B3 smoke test catch any version conflict with the pinned `torch==2.7.1`.
 
 Both use the Phase A winning label file and `folds-v1.csv`.
 
@@ -291,7 +289,7 @@ Compute is not the constraint; deciding what to run is.
 
 One row per run in `experiments.csv` (existing columns: `experiment_id, parent_id, change, label_version, fold_version, gold_oof_auc, pseudo_oof_auc, public_lb_auc, runtime_minutes, git_revision, decision, notes`). Put the gold bootstrap interval and the restricted pseudo AUC in `notes`.
 
-Planned IDs: E006a control, E006b/c/d priors 0.25/0.10/0.05, E006e optional LLM silence resolution, E007 DINOv2 partial unfreeze, E008 EfficientNetV2-S, E009 report distillation, E010 anatomy crops, E011 final ensemble.
+Actual/planned IDs: `A0`–`A4-p05` Phase A (closed, see Section 6), `E006` optional 3-seed fix-only ensemble (A5, deferred), `E007` DINOv2 partial unfreeze, `E008` EfficientNetV2-S, `E009` report distillation, `E010` anatomy crops, `E011` final ensemble.
 
 **Promotion criteria** — all five: restricted pseudo AUC improves; gold does not fall more than 0.01 and shows no broad per-label regression; the gain is not one label improving while several decline; projected inference stays under 4 h on the T4 pair; the pipeline writes a valid submission even when a component fails.
 
