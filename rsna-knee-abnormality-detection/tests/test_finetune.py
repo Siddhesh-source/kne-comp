@@ -1,4 +1,5 @@
 from io import BytesIO
+from pathlib import Path
 import zipfile
 
 import numpy as np
@@ -13,13 +14,23 @@ from torch import nn
 from rsna_knee.constants import ID_COLUMN, LABELS
 from rsna_knee.dicom_extraction import IMAGENET_MEAN, IMAGENET_STD
 from rsna_knee.finetune import (
+    AlignedCachedTrainingData,
     CACHE_IMAGE_SIZE,
     CACHE_SLICE_COUNT,
     CachedStudyDataset,
+    DINOV2_REPOSITORY,
+    DinoV2SliceBackbone,
+    FinetuneConfig,
     StudyAugmentation,
     StudyEncoder,
     align_cached_training_data,
+    build_optimizer_parameter_groups,
+    configure_dinov2_backbone,
+    create_slice_backbone,
     decode_cached_study,
+    grouped_macro_auc,
+    seed_dataloader_worker,
+    train_finetune_fold,
 )
 
 
@@ -415,3 +426,301 @@ def test_encoder_output_shapes():
 
     assert logits.shape == (2, len(LABELS))
     assert auxiliary.shape == (2, 8)
+
+
+class FakeDino(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.patch_embed = nn.Linear(2, 2)
+        self.blocks = nn.ModuleList([nn.Linear(2, 2) for _ in range(4)])
+        self.norm = nn.LayerNorm(2)
+
+
+def test_dino_partial_unfreeze_and_parameter_groups():
+    backbone = FakeDino()
+    configure_dinov2_backbone(
+        backbone, trainable_blocks=2, gradient_checkpointing=True
+    )
+    encoder = nn.Module()
+    encoder.slice_backbone = backbone
+    encoder.head = nn.Linear(2, 1)
+
+    groups = build_optimizer_parameter_groups(
+        encoder,
+        backbone_learning_rate=1e-5,
+        head_learning_rate=1e-3,
+        weight_decay=0.05,
+    )
+
+    assert not any(parameter.requires_grad for parameter in backbone.patch_embed.parameters())
+    assert not any(parameter.requires_grad for parameter in backbone.blocks[1].parameters())
+    assert all(parameter.requires_grad for parameter in backbone.blocks[2].parameters())
+    assert all(parameter.requires_grad for parameter in backbone.norm.parameters())
+    assert [group["name"] for group in groups] == ["backbone", "head"]
+    assert [group["lr"] for group in groups] == [1e-5, 1e-3]
+    assert not (
+        {id(value) for value in groups[0]["params"]}
+        & {id(value) for value in groups[1]["params"]}
+    )
+
+
+class FakeOfficialDino(FakeDino):
+    embed_dim = 2
+
+    def prepare_tokens_with_masks(self, images):
+        return images.unsqueeze(1)
+
+
+def test_dino_adapter_checkpoints_trainable_blocks(monkeypatch):
+    backbone = FakeOfficialDino()
+    configure_dinov2_backbone(
+        backbone,
+        trainable_blocks=2,
+        gradient_checkpointing=True,
+    )
+    calls = []
+
+    def recording_checkpoint(block, tokens, **kwargs):
+        calls.append((block, kwargs))
+        return block(tokens)
+
+    monkeypatch.setattr(
+        "rsna_knee.finetune.checkpoint",
+        recording_checkpoint,
+    )
+    adapter = DinoV2SliceBackbone(
+        backbone,
+        gradient_checkpointing=True,
+    ).train()
+
+    result = adapter(torch.ones(3, 2))
+
+    assert result.shape == (3, 2)
+    assert [call[0] for call in calls] == list(backbone.blocks[-2:])
+    assert all(call[1] == {"use_reentrant": False} for call in calls)
+
+
+def test_dino_factory_uses_pinned_repository(monkeypatch):
+    observed = {}
+
+    def fake_load(repository, model_name, **kwargs):
+        observed.update(
+            repository=repository,
+            model_name=model_name,
+            kwargs=kwargs,
+        )
+        return FakeOfficialDino()
+
+    monkeypatch.setattr(torch.hub, "load", fake_load)
+
+    adapter, feature_dim = create_slice_backbone(
+        "dinov2_vits14",
+        pretrained=False,
+        trainable_blocks=2,
+    )
+
+    assert isinstance(adapter, DinoV2SliceBackbone)
+    assert feature_dim == 2
+    assert observed["repository"] == DINOV2_REPOSITORY
+    assert observed["model_name"] == "dinov2_vits14"
+    assert observed["kwargs"]["trust_repo"] is True
+    assert observed["kwargs"]["skip_validation"] is True
+
+
+def test_grouped_auc_averages_duplicate_report_groups():
+    targets = np.repeat([[0.0], [1.0], [0.0], [1.0]], len(LABELS), axis=1)
+    predictions = np.repeat([[0.1], [0.2], [0.8], [0.9]], len(LABELS), axis=1)
+
+    score = grouped_macro_auc(
+        targets,
+        predictions,
+        np.array(["negative", "positive", "negative", "positive"]),
+    )
+
+    assert score == 1.0
+
+
+def test_worker_seed_controls_all_rngs_and_augmentation(monkeypatch):
+    import random
+
+    augmentation = StudyAugmentation()
+    dataset = type("Dataset", (), {"augmentation": augmentation})()
+    info = type("Info", (), {"dataset": dataset})()
+    monkeypatch.setattr(torch.utils.data, "get_worker_info", lambda: info)
+
+    torch.manual_seed(123)
+    seed_dataloader_worker(0)
+    first = (
+        random.random(),
+        np.random.random(),
+        torch.rand(()).item(),
+        augmentation.generator.initial_seed(),
+    )
+    torch.manual_seed(123)
+    seed_dataloader_worker(0)
+    second = (
+        random.random(),
+        np.random.random(),
+        torch.rand(()).item(),
+        augmentation.generator.initial_seed(),
+    )
+
+    assert first == second
+
+
+class TinyStudyDataset(torch.utils.data.Dataset):
+    def __init__(self, data, indices):
+        self.data = data
+        self.indices = np.asarray(indices)
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, item):
+        index = int(self.indices[item])
+        value = float(index)
+        return {
+            "study_id": str(self.data.study_ids[index]),
+            "images": torch.full((1, 3, 2, 2), value),
+            "valid_mask": torch.ones(1, dtype=torch.bool),
+            "positions": torch.zeros(1),
+            "slot_ids": torch.zeros(1, dtype=torch.int64),
+            "targets": torch.from_numpy(self.data.targets[index].copy()),
+            "weights": torch.from_numpy(self.data.weights[index].copy()),
+        }
+
+
+class TinyStudyModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.slice_backbone = nn.Linear(1, 2)
+        self.head = nn.Linear(2, len(LABELS))
+
+    def forward(self, images, valid_mask, positions, slot_ids):
+        del valid_mask, positions, slot_ids
+        values = images.mean(dim=(1, 2, 3, 4)).unsqueeze(1)
+        features = torch.tanh(self.slice_backbone(values))
+        return self.head(features), features
+
+
+def _tiny_training_data():
+    count = 8
+    targets = np.zeros((count, len(LABELS)), dtype=np.float32)
+    for index in range(count):
+        targets[index] = (index // 2) % 2
+    targets[1, 0] = 0.5
+    return AlignedCachedTrainingData(
+        study_ids=np.asarray([f"study-{index}" for index in range(count)]),
+        cache_paths=tuple(Path(f"unused-{index}") for index in range(count)),
+        targets=targets,
+        weights=np.ones_like(targets),
+        folds=np.arange(count) % 2,
+        report_groups=np.asarray([f"group-{index}" for index in range(count)]),
+    )
+
+
+def test_single_fold_training_controls_and_atomic_artifacts(tmp_path):
+    observed_targets = []
+
+    def dataset_factory(data, indices, training, seed):
+        del seed
+        if training:
+            observed_targets.append(data.targets[indices].copy())
+        return TinyStudyDataset(data, indices)
+
+    config = FinetuneConfig(
+        epochs=5,
+        batch_size=1,
+        gradient_accumulation_steps=3,
+        warmup_epochs=1,
+        ema_decay=0.5,
+        early_stopping_patience=1,
+        hard_target_mix=1.0,
+        pairwise_auc_weight=0.01,
+        use_sqrt_class_balance=True,
+        gold_oversample_fraction=0,
+        seed=9,
+    )
+    metadata = train_finetune_fold(
+        _tiny_training_data(),
+        tmp_path,
+        0,
+        config=config,
+        model_factory=TinyStudyModel,
+        dataset_factory=dataset_factory,
+        device="cpu",
+    )
+
+    assert metadata["epochs_trained"] <= 2
+    assert metadata["updates_per_epoch"] == 2
+    assert metadata["optimizer_updates"] == metadata["updates_per_epoch"] * metadata["epochs_trained"]
+    assert metadata["warmup_updates"] == 2
+    assert set(observed_targets[0].ravel()) <= {0.0, 1.0}
+    assert (tmp_path / "fold-0.pt").is_file()
+    assert (tmp_path / "oof-0.csv").is_file()
+    assert (tmp_path / "fold-0.metadata.json").is_file()
+    checkpoint = torch.load(tmp_path / "fold-0.pt", weights_only=True)
+    assert checkpoint["labels"] == list(LABELS)
+    oof = pd.read_csv(tmp_path / "oof-0.csv")
+    assert list(oof.columns) == [ID_COLUMN, *LABELS]
+    assert len(oof) == metadata["valid_rows"]
+    assert not list(tmp_path.glob("*.tmp"))
+
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        train_finetune_fold(
+            _tiny_training_data(),
+            tmp_path,
+            0,
+            config=config,
+            model_factory=TinyStudyModel,
+            dataset_factory=dataset_factory,
+            device="cpu",
+        )
+
+
+def test_parallel_folds_use_distinct_metadata_files(tmp_path):
+    config = FinetuneConfig(
+        epochs=1,
+        batch_size=2,
+        gradient_accumulation_steps=1,
+        warmup_epochs=0,
+        ema_decay=0,
+        early_stopping_patience=0,
+        hard_target_mix=0,
+        pairwise_auc_weight=0,
+        use_sqrt_class_balance=False,
+        gold_oversample_fraction=0,
+    )
+    for fold in (0, 1):
+        train_finetune_fold(
+            _tiny_training_data(),
+            tmp_path,
+            fold,
+            config=config,
+            model_factory=TinyStudyModel,
+            dataset_factory=lambda data, indices, training, seed: TinyStudyDataset(
+                data, indices
+            ),
+            device="cpu",
+        )
+
+    assert (tmp_path / "fold-0.metadata.json").is_file()
+    assert (tmp_path / "fold-1.metadata.json").is_file()
+
+
+def test_fold_lock_is_acquired_exclusively(tmp_path):
+    lock = tmp_path / ".fold-0.lock"
+    lock.write_text("held\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="already running"):
+        train_finetune_fold(
+            _tiny_training_data(),
+            tmp_path,
+            0,
+            config=FinetuneConfig(epochs=1),
+            model_factory=TinyStudyModel,
+            dataset_factory=lambda data, indices, training, seed: TinyStudyDataset(
+                data, indices
+            ),
+            device="cpu",
+        )
