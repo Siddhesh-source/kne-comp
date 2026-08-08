@@ -66,6 +66,95 @@ def _coverage_cache_name(crop_mm: int, group_count: int) -> str:
     return f"tb-c1-sixslot-g{group_count}-{crop_mm}-v1"
 
 
+def _validate_window_config(slice_count: int, window_size: int) -> None:
+    if type(slice_count) is not int or slice_count != 12:
+        raise ValueError("slice_count must be exactly 12")
+    if type(window_size) is not int or window_size != 3:
+        raise ValueError("window_size must be exactly 3")
+
+
+def _window_cache_name(
+    crop_mm: int,
+    slice_count: int = 12,
+    window_size: int = 3,
+) -> str:
+    """Return the isolated name of the approved schema-v3 cache."""
+    _validate_crop(crop_mm)
+    _validate_window_config(slice_count, window_size)
+    return f"tb-c2-window-s{slice_count}-w{window_size}-{crop_mm}-v1"
+
+
+def _validate_window_cache_metadata(
+    metadata: object,
+    *,
+    study_id: str,
+    crop_mm: int,
+    preprocessing_fingerprint: str,
+    slice_count: int = 12,
+    window_size: int = 3,
+) -> None:
+    """Strictly validate the identity and preprocessing contract of one C2 file."""
+    _validate_crop(crop_mm)
+    _validate_window_config(slice_count, window_size)
+    expected_window = {
+        "slice_count": slice_count,
+        "window_size": window_size,
+        "window_count": slice_count - window_size + 1,
+        "slice_band_start": 0.20,
+        "slice_band_end": 0.80,
+    }
+    fingerprint = (
+        metadata.get("fingerprint") if isinstance(metadata, dict) else None
+    )
+    valid_fingerprint = isinstance(fingerprint, str) and len(fingerprint) == 64
+    if valid_fingerprint:
+        try:
+            int(fingerprint, 16)
+        except ValueError:
+            valid_fingerprint = False
+    if not isinstance(metadata, dict) or any(
+        (
+            metadata.get("schema_version") != 3,
+            metadata.get("study_id") != study_id,
+            metadata.get("crop_mm") != crop_mm,
+            metadata.get("slice_count") != slice_count,
+            metadata.get("window_size") != window_size,
+            metadata.get("window_count") != slice_count - window_size + 1,
+            metadata.get("window_config") != expected_window,
+            metadata.get("preprocessing_fingerprint")
+            != preprocessing_fingerprint,
+            not valid_fingerprint,
+        )
+    ):
+        raise ValueError(f"incompatible Track B C2 cache metadata for {study_id}")
+
+
+def _window_cache_payload_fingerprint(path: Path) -> str:
+    """Recompute the schema-v3 payload fingerprint stored by the cache writer."""
+    import json
+    import zipfile
+
+    with zipfile.ZipFile(path) as archive:
+        payloads = {
+            name: archive.read(name)
+            for name in (
+                "images.npy",
+                "valid_slot_mask.npy",
+                "source_slice_indices.npy",
+            )
+        }
+        metadata = json.loads(archive.read("metadata.json"))
+    metadata.pop("fingerprint", None)
+    payloads["metadata.json"] = json.dumps(
+        metadata, sort_keys=True, allow_nan=False
+    ).encode("utf-8")
+    digest = hashlib.sha256()
+    for name in sorted(payloads):
+        digest.update(name.encode("utf-8"))
+        digest.update(payloads[name])
+    return digest.hexdigest()
+
+
 def _parse_coverage_arms(value: str) -> list[str]:
     arms = [item.strip().lower() for item in value.split(",")]
     if (
@@ -396,6 +485,127 @@ def _prepare_one_study_coverage(
             "laterality_source": laterality.source,
             "selected_series_evidence": evidence,
         },
+    }
+
+
+def _prepare_one_study_window_cache(
+    study_id: str,
+    study_rows,
+    *,
+    train_root: Path,
+    crop_mm: int,
+    slice_count: int,
+    window_size: int,
+) -> dict[str, object]:
+    """Build the approved ordered stack and selection evidence in memory."""
+    from rsna_knee.track_b_data import (
+        TBP0DataConfig,
+        TBWindowConfig,
+        build_windowed_six_slot_images,
+        classify_series,
+        derive_laterality,
+        preprocessing_fingerprint,
+        select_slot_series,
+    )
+
+    _validate_crop(crop_mm)
+    _validate_window_config(slice_count, window_size)
+    probes = []
+    for row in study_rows.itertuples(index=False):
+        directory = train_root / study_id / str(row.SeriesInstanceUID)
+        probe = _probe_series(study_id, row, directory)
+        if probe is not None:
+            probes.append(probe)
+    if not probes:
+        raise ValueError(f"study {study_id} has no readable series")
+    metadata_by_id = {item.series_id: item for item, _, _ in probes}
+    files_by_id = {item.series_id: files for item, _, files in probes}
+    selected = select_slot_series(list(metadata_by_id.values()))
+    laterality = derive_laterality([geometry for _, geometry, _ in probes])
+    slot_series = {
+        slot: files_by_id[item.series_id]
+        for slot, item in selected.items()
+        if item is not None
+    }
+    data_config = TBP0DataConfig(crop_mm=float(crop_mm))
+    window = TBWindowConfig(
+        slice_count=slice_count,
+        window_size=window_size,
+    )
+    images, mask, indices = build_windowed_six_slot_images(
+        slot_series,
+        laterality,
+        config=data_config,
+        window=window,
+    )
+    evidence = {}
+    for slot, item in selected.items():
+        if item is not None:
+            evidence[slot] = {
+                "series_id": item.series_id,
+                "slice_count": item.slice_count,
+                "decision": classify_series(item).__dict__,
+            }
+    return {
+        "images": images,
+        "mask": mask,
+        "indices": indices,
+        "metadata": {
+            "study_id": study_id,
+            "crop_mm": crop_mm,
+            "window_config": {
+                "slice_count": window.slice_count,
+                "window_size": window.window_size,
+                "window_count": window.window_count,
+                "slice_band_start": window.slice_band_start,
+                "slice_band_end": window.slice_band_end,
+            },
+            "preprocessing_fingerprint": preprocessing_fingerprint(data_config),
+            "laterality": laterality.value,
+            "laterality_source": laterality.source,
+            "selected_series_evidence": evidence,
+        },
+    }
+
+
+def _build_one_study_window_cache(
+    study_id: str,
+    study_rows,
+    *,
+    train_root: Path,
+    cache_root: Path,
+    crop_mm: int,
+    slice_count: int,
+    window_size: int,
+) -> dict[str, object]:
+    """Create one immutable schema-v3 ordered-stack cache file."""
+    from rsna_knee.track_b_data import write_windowed_six_slot_cache
+
+    prepared = _prepare_one_study_window_cache(
+        study_id,
+        study_rows,
+        train_root=train_root,
+        crop_mm=crop_mm,
+        slice_count=slice_count,
+        window_size=window_size,
+    )
+    destination = cache_root / f"{study_id}.zip"
+    if destination.exists():
+        raise FileExistsError(f"Track B C2 cache already exists: {destination}")
+    fingerprint = write_windowed_six_slot_cache(
+        destination,
+        prepared["images"],
+        prepared["mask"],
+        prepared["indices"],
+        metadata=prepared["metadata"],
+        window_size=window_size,
+    )
+    return {
+        "study_id": study_id,
+        "valid_slots": int(prepared["mask"].sum()),
+        "laterality_source": prepared["metadata"]["laterality_source"],
+        "cache_bytes": destination.stat().st_size,
+        "fingerprint": fingerprint,
     }
 
 
@@ -1249,6 +1459,362 @@ def track_b_finalize_coverage_cache(
         "maximum_groups": max(groups),
         "valid_group_histogram": {
             str(key): value for key, value in sorted(group_histogram.items())
+        },
+        "total_cache_bytes": int(sizes.sum()),
+        "mean_cache_bytes": float(sizes.mean()),
+        "p50_cache_bytes": float(np.quantile(sizes, 0.50)),
+        "p95_cache_bytes": float(np.quantile(sizes, 0.95)),
+        "maximum_cache_bytes": int(sizes.max()),
+        "laterality_sources": dict(sorted(laterality.items())),
+        "shard_count": shard_count,
+    }
+    descriptor = os.open(manifest_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2)
+        handle.write("\n")
+    artifact_volume.commit()
+    return {**manifest, "manifest": str(manifest_path), "cache_root": str(cache_root)}
+
+
+@app.function(
+    image=image,
+    cpu=8,
+    memory=32768,
+    timeout=7200,
+    volumes={DATA_MOUNT: data_volume, ARTIFACT_MOUNT: artifact_volume},
+)
+def track_b_build_window_cache_canary(
+    crop_mm: int = 130,
+    limit: int = 16,
+    slice_count: int = 12,
+    window_size: int = 3,
+) -> dict[str, object]:
+    """Build a bounded, create-only schema-v3 ordered-stack canary."""
+    import json
+
+    import pandas as pd
+
+    cache_name = _window_cache_name(crop_mm, slice_count, window_size)
+    _validate_limit(limit, maximum=64)
+    data_volume.reload()
+    artifact_volume.reload()
+    series_path = DATA_MOUNT / "metadata" / "train_series.csv"
+    if not series_path.is_file():
+        series_path = DATA_MOUNT / "raw" / "train_series.csv"
+    train_root = DATA_MOUNT / "raw" / "train_series"
+    if not series_path.is_file() or not train_root.is_dir():
+        raise FileNotFoundError("competition series metadata or DICOM root is missing")
+    series = pd.read_csv(series_path, dtype={"StudyInstanceUID": str})
+    study_ids = sorted(series["StudyInstanceUID"].astype(str).unique())[:limit]
+    cache_base = TRACK_B_ROOT / "cache" / cache_name / "canary"
+    cache_root = cache_base / "train"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    results = []
+    for study_id in study_ids:
+        rows = series.loc[series["StudyInstanceUID"].astype(str).eq(study_id)]
+        results.append(
+            _build_one_study_window_cache(
+                study_id,
+                rows,
+                train_root=train_root,
+                cache_root=cache_root,
+                crop_mm=crop_mm,
+                slice_count=slice_count,
+                window_size=window_size,
+            )
+        )
+    manifest = {
+        "schema_version": 3,
+        "stage": "TB-C2-window-cache-canary",
+        "crop_mm": crop_mm,
+        "slice_count": slice_count,
+        "window_size": window_size,
+        "studies": len(results),
+        "series_source_sha256": _sha256_file(series_path),
+        "results": results,
+    }
+    manifest_path = cache_base / "manifest.json"
+    if manifest_path.exists():
+        raise FileExistsError(f"Track B C2 canary manifest exists: {manifest_path}")
+    descriptor = os.open(manifest_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2)
+        handle.write("\n")
+    artifact_volume.commit()
+    return {
+        "studies": len(results),
+        "minimum_slots": min(item["valid_slots"] for item in results),
+        "mean_cache_bytes": (
+            sum(item["cache_bytes"] for item in results) / len(results)
+        ),
+        "manifest": str(manifest_path),
+        "cache_root": str(cache_root),
+    }
+
+
+@app.function(
+    image=image,
+    cpu=8,
+    memory=32768,
+    timeout=21600,
+    retries=1,
+    max_containers=40,
+    volumes={DATA_MOUNT: data_volume, ARTIFACT_MOUNT: artifact_volume},
+)
+def track_b_build_window_cache_shard(
+    crop_mm: int,
+    slice_count: int,
+    window_size: int,
+    shard_index: int,
+    shard_count: int,
+) -> dict[str, object]:
+    """Build one resumable shard of the full schema-v3 ordered-stack cache."""
+    import json
+    from collections import Counter
+
+    import pandas as pd
+
+    from rsna_knee.track_b_data import (
+        TBP0DataConfig,
+        preprocessing_fingerprint,
+        read_windowed_six_slot_cache,
+    )
+
+    cache_name = _window_cache_name(crop_mm, slice_count, window_size)
+    if type(shard_count) is not int or not 1 <= shard_count <= 128:
+        raise ValueError("shard_count must be an integer from 1 through 128")
+    if type(shard_index) is not int or not 0 <= shard_index < shard_count:
+        raise ValueError("shard_index is outside the shard range")
+    data_volume.reload()
+    artifact_volume.reload()
+    series_path = DATA_MOUNT / "metadata" / "train_series.csv"
+    if not series_path.is_file():
+        series_path = DATA_MOUNT / "raw" / "train_series.csv"
+    train_root = DATA_MOUNT / "raw" / "train_series"
+    if not series_path.is_file() or not train_root.is_dir():
+        raise FileNotFoundError("competition series metadata or DICOM root is missing")
+    series = pd.read_csv(series_path, dtype={"StudyInstanceUID": str})
+    study_ids = sorted(series["StudyInstanceUID"].astype(str).unique())
+    selected_ids = study_ids[shard_index::shard_count]
+    cache_base = TRACK_B_ROOT / "cache" / cache_name / "full"
+    cache_root = cache_base / "train"
+    shard_root = cache_base / "shards"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    shard_root.mkdir(parents=True, exist_ok=True)
+    shard_path = shard_root / f"shard-{shard_index:03d}-of-{shard_count:03d}.json"
+    if shard_path.exists():
+        raise FileExistsError(f"Track B C2 shard already completed: {shard_path}")
+
+    preprocessing = preprocessing_fingerprint(
+        TBP0DataConfig(crop_mm=float(crop_mm))
+    )
+    results = []
+    skipped = 0
+    for study_id in selected_ids:
+        destination = cache_root / f"{study_id}.zip"
+        if destination.exists():
+            decoded = read_windowed_six_slot_cache(destination, normalize=False)
+            metadata = decoded["metadata"]
+            _validate_window_cache_metadata(
+                metadata,
+                study_id=study_id,
+                crop_mm=crop_mm,
+                preprocessing_fingerprint=preprocessing,
+                slice_count=slice_count,
+                window_size=window_size,
+            )
+            if (
+                _window_cache_payload_fingerprint(destination)
+                != metadata["fingerprint"]
+            ):
+                raise ValueError(
+                    f"existing C2 cache fingerprint mismatch: {destination}"
+                )
+            results.append(
+                {
+                    "study_id": study_id,
+                    "valid_slots": int(decoded["valid_slot_mask"].sum()),
+                    "laterality_source": metadata.get(
+                        "laterality_source", "unknown"
+                    ),
+                    "cache_bytes": destination.stat().st_size,
+                    "fingerprint": metadata["fingerprint"],
+                }
+            )
+            skipped += 1
+            continue
+        rows = series.loc[series["StudyInstanceUID"].astype(str).eq(study_id)]
+        results.append(
+            _build_one_study_window_cache(
+                study_id,
+                rows,
+                train_root=train_root,
+                cache_root=cache_root,
+                crop_mm=crop_mm,
+                slice_count=slice_count,
+                window_size=window_size,
+            )
+        )
+    laterality = Counter(item["laterality_source"] for item in results)
+    payload = {
+        "schema_version": 3,
+        "stage": "TB-C2-window-cache-shard",
+        "crop_mm": crop_mm,
+        "slice_count": slice_count,
+        "window_size": window_size,
+        "shard_index": shard_index,
+        "shard_count": shard_count,
+        "series_source_sha256": _sha256_file(series_path),
+        "preprocessing_fingerprint": preprocessing,
+        "studies": len(results),
+        "skipped_existing": skipped,
+        "laterality_sources": dict(sorted(laterality.items())),
+        "results": results,
+    }
+    descriptor = os.open(shard_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+    artifact_volume.commit()
+    slots = [int(item["valid_slots"]) for item in results]
+    sizes = [int(item["cache_bytes"]) for item in results]
+    return {
+        "shard_index": shard_index,
+        "studies": len(results),
+        "skipped_existing": skipped,
+        "minimum_slots": min(slots),
+        "mean_slots": sum(slots) / len(slots),
+        "maximum_slots": max(slots),
+        "mean_cache_bytes": sum(sizes) / len(sizes),
+        "laterality_sources": dict(sorted(laterality.items())),
+    }
+
+
+@app.function(
+    image=image,
+    cpu=4,
+    memory=16384,
+    timeout=3600,
+    max_containers=1,
+    volumes={DATA_MOUNT: data_volume, ARTIFACT_MOUNT: artifact_volume},
+)
+def track_b_finalize_window_cache(
+    crop_mm: int,
+    slice_count: int,
+    window_size: int,
+    shard_count: int,
+) -> dict[str, object]:
+    """Strictly validate 4,407 C2 files and create one immutable manifest."""
+    import json
+    from collections import Counter
+
+    import numpy as np
+    import pandas as pd
+
+    cache_name = _window_cache_name(crop_mm, slice_count, window_size)
+    if type(shard_count) is not int or not 1 <= shard_count <= 128:
+        raise ValueError("shard_count must be an integer from 1 through 128")
+    data_volume.reload()
+    artifact_volume.reload()
+    series_path = DATA_MOUNT / "metadata" / "train_series.csv"
+    if not series_path.is_file():
+        series_path = DATA_MOUNT / "raw" / "train_series.csv"
+    expected_ids = sorted(
+        pd.read_csv(series_path, dtype={"StudyInstanceUID": str})[
+            "StudyInstanceUID"
+        ].astype(str).unique()
+    )
+    if len(expected_ids) != 4407:
+        raise ValueError("Track B C2 source must contain exactly 4,407 studies")
+    cache_base = TRACK_B_ROOT / "cache" / cache_name / "full"
+    cache_root = cache_base / "train"
+    manifest_path = cache_base / "manifest.json"
+    if manifest_path.exists():
+        raise FileExistsError(f"Track B C2 cache already finalized: {manifest_path}")
+    records = []
+    series_hashes = set()
+    preprocessing_hashes = set()
+    for shard_index in range(shard_count):
+        path = (
+            cache_base
+            / "shards"
+            / f"shard-{shard_index:03d}-of-{shard_count:03d}.json"
+        )
+        if not path.is_file():
+            raise ValueError(f"missing Track B C2 shard: {path.name}")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            payload.get("schema_version") != 3
+            or payload.get("stage") != "TB-C2-window-cache-shard"
+            or payload.get("crop_mm") != crop_mm
+            or payload.get("slice_count") != slice_count
+            or payload.get("window_size") != window_size
+            or payload.get("shard_index") != shard_index
+            or payload.get("shard_count") != shard_count
+            or payload.get("studies") != len(payload.get("results", ()))
+        ):
+            raise ValueError(f"incompatible Track B C2 shard: {path.name}")
+        shard_ids = [str(item["study_id"]) for item in payload["results"]]
+        if shard_ids != expected_ids[shard_index::shard_count]:
+            raise ValueError(f"invalid Track B C2 shard identities: {path.name}")
+        records.extend(payload["results"])
+        series_hashes.add(payload["series_source_sha256"])
+        preprocessing_hashes.add(payload["preprocessing_fingerprint"])
+    identifiers = [str(item["study_id"]) for item in records]
+    if (
+        len(records) != 4407
+        or len(set(identifiers)) != 4407
+        or set(identifiers) != set(expected_ids)
+    ):
+        raise ValueError("full Track B C2 cache must contain exactly 4,407 studies")
+    if (
+        len(series_hashes) != 1
+        or next(iter(series_hashes)) != _sha256_file(series_path)
+    ):
+        raise ValueError("C2 cache shards used incompatible series metadata")
+    from rsna_knee.track_b_data import TBP0DataConfig, preprocessing_fingerprint
+
+    expected_preprocessing = preprocessing_fingerprint(
+        TBP0DataConfig(crop_mm=float(crop_mm))
+    )
+    if (
+        len(preprocessing_hashes) != 1
+        or next(iter(preprocessing_hashes)) != expected_preprocessing
+    ):
+        raise ValueError("C2 cache shards used different preprocessing")
+    files = {path.stem: path for path in cache_root.glob("*.zip")}
+    if set(files) != set(expected_ids):
+        raise ValueError("full Track B C2 cache file identities are invalid")
+    for item in records:
+        path = files[str(item["study_id"])]
+        if path.stat().st_size != int(item["cache_bytes"]):
+            raise ValueError(f"C2 cache size changed after shard: {path.name}")
+        if _window_cache_payload_fingerprint(path) != item["fingerprint"]:
+            raise ValueError(f"C2 cache fingerprint changed after shard: {path.name}")
+    digest = hashlib.sha256()
+    for item in sorted(records, key=lambda value: str(value["study_id"])):
+        digest.update(str(item["study_id"]).encode())
+        digest.update(str(item["fingerprint"]).encode())
+    slots = [int(item["valid_slots"]) for item in records]
+    sizes = np.asarray([int(item["cache_bytes"]) for item in records])
+    laterality = Counter(item["laterality_source"] for item in records)
+    slot_histogram = Counter(slots)
+    manifest = {
+        "schema_version": 3,
+        "stage": "TB-C2-window-cache",
+        "crop_mm": crop_mm,
+        "slice_count": slice_count,
+        "window_size": window_size,
+        "window_count": slice_count - window_size + 1,
+        "studies": len(records),
+        "series_source_sha256": next(iter(series_hashes)),
+        "preprocessing_fingerprint": next(iter(preprocessing_hashes)),
+        "competition_cache_fingerprint": digest.hexdigest(),
+        "minimum_slots": min(slots),
+        "mean_slots": sum(slots) / len(slots),
+        "maximum_slots": max(slots),
+        "valid_slot_histogram": {
+            str(key): value for key, value in sorted(slot_histogram.items())
         },
         "total_cache_bytes": int(sizes.sum()),
         "mean_cache_bytes": float(sizes.mean()),
@@ -2226,6 +2792,98 @@ def track_b_run_c1_finetune(
 @app.local_entrypoint()
 def cache_smoke(crop_mm: int = 130, limit: int = 64) -> None:
     print(track_b_build_cache_smoke.remote(crop_mm, limit))
+
+
+@app.local_entrypoint()
+def window_cache_canary(
+    crop_mm: int = 130,
+    limit: int = 16,
+    slice_count: int = 12,
+    window_size: int = 3,
+) -> None:
+    """Build only the bounded schema-v3 ordered-stack canary."""
+    import json
+
+    print(
+        json.dumps(
+            track_b_build_window_cache_canary.remote(
+                crop_mm, limit, slice_count, window_size
+            ),
+            indent=2,
+        )
+    )
+
+
+@app.local_entrypoint()
+def window_cache_full(
+    crop_mm: int = 130,
+    slice_count: int = 12,
+    window_size: int = 3,
+    shard_count: int = 40,
+) -> None:
+    """Build all C2 shards concurrently and strictly finalize the cache."""
+    import json
+
+    _window_cache_name(crop_mm, slice_count, window_size)
+    if type(shard_count) is not int or not 1 <= shard_count <= 128:
+        raise ValueError("shard_count must be an integer from 1 through 128")
+    results = list(
+        track_b_build_window_cache_shard.starmap(
+            (
+                (crop_mm, slice_count, window_size, shard_index, shard_count)
+                for shard_index in range(shard_count)
+            ),
+            order_outputs=False,
+        )
+    )
+    print(json.dumps(sorted(results, key=lambda item: item["shard_index"]), indent=2))
+    print(
+        json.dumps(
+            track_b_finalize_window_cache.remote(
+                crop_mm, slice_count, window_size, shard_count
+            ),
+            indent=2,
+        )
+    )
+
+
+@app.local_entrypoint()
+def window_cache_resume(
+    shards: str,
+    crop_mm: int = 130,
+    slice_count: int = 12,
+    window_size: int = 3,
+    shard_count: int = 40,
+) -> None:
+    """Resume selected missing C2 shards and attempt strict finalization."""
+    import json
+
+    _window_cache_name(crop_mm, slice_count, window_size)
+    shard_indices = [int(value.strip()) for value in shards.split(",")]
+    if (
+        not shard_indices
+        or len(shard_indices) != len(set(shard_indices))
+        or any(index < 0 or index >= shard_count for index in shard_indices)
+    ):
+        raise ValueError("shards must contain unique valid shard indices")
+    results = list(
+        track_b_build_window_cache_shard.starmap(
+            (
+                (crop_mm, slice_count, window_size, shard_index, shard_count)
+                for shard_index in shard_indices
+            ),
+            order_outputs=False,
+        )
+    )
+    print(json.dumps(sorted(results, key=lambda item: item["shard_index"]), indent=2))
+    print(
+        json.dumps(
+            track_b_finalize_window_cache.remote(
+                crop_mm, slice_count, window_size, shard_count
+            ),
+            indent=2,
+        )
+    )
 
 
 @app.local_entrypoint()
