@@ -1477,6 +1477,29 @@ def read_track_b_cache(
     raise ValueError(f"unsupported Track B cache schema: {version}")
 
 
+def window_stack_to_groups(
+    images: Tensor,
+    valid_slot_mask: Tensor,
+    *,
+    window_size: int = 3,
+) -> tuple[Tensor, Tensor]:
+    """Form every contiguous RGB window from one schema-v3 grayscale stack."""
+    if (
+        images.ndim != 4
+        or images.shape[0] != len(TB_P0_SLOT_NAMES)
+        or valid_slot_mask.shape != (len(TB_P0_SLOT_NAMES),)
+        or valid_slot_mask.dtype != torch.bool
+        or type(window_size) is not int
+        or not 1 <= window_size <= images.shape[1]
+    ):
+        raise ValueError("invalid ordered stack or window size")
+    windows = images.unfold(1, window_size, 1).permute(0, 1, 4, 2, 3)
+    mask = valid_slot_mask[:, None].expand(-1, windows.shape[1]).clone()
+    windows = windows.contiguous()
+    windows[~mask] = 0
+    return windows, mask
+
+
 def derive_c0_from_grouped_cache(
     decoded: Mapping[str, object],
 ) -> tuple[Tensor, Tensor]:

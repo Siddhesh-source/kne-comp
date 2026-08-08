@@ -15,6 +15,7 @@ from rsna_knee.finetune import configure_dinov2_backbone
 from rsna_knee.track_b_data import (
     write_grouped_six_slot_cache,
     write_six_slot_cache,
+    write_windowed_six_slot_cache,
 )
 from rsna_knee.track_b_training import (
     MaskedPerLabelSlotAttention,
@@ -22,6 +23,7 @@ from rsna_knee.track_b_training import (
     SparseDinoCLSMeanBackbone,
     TBP0Config,
     TBP0CachedDataset,
+    TBP0InferenceDataset,
     TBP0RigidAugmentation,
     align_tb_p0_cached_data,
     build_matched_coverage_schedule,
@@ -351,6 +353,35 @@ def grouped_cache_fixture(tmp_path):
     return data
 
 
+def windowed_cache_fixture(tmp_path):
+    cache_root = tmp_path / "windowed-cache"
+    cache_root.mkdir()
+    study_id = "study-window"
+    images = torch.zeros(6, 12, 4, 4, dtype=torch.uint8)
+    for slice_index in range(12):
+        images[0, slice_index] = 10 + slice_index
+        images[1, slice_index] = 40 + slice_index
+    mask = torch.tensor([True, True, False, False, False, False])
+    indices = torch.full((6, 12), -1, dtype=torch.int32)
+    indices[0] = torch.arange(12, dtype=torch.int32)
+    indices[1] = torch.arange(4, 16, dtype=torch.int32)
+    path = cache_root / f"{study_id}.zip"
+    write_windowed_six_slot_cache(
+        path,
+        images,
+        mask,
+        indices,
+        metadata={"study_id": study_id},
+    )
+    data = SimpleNamespace(
+        study_ids=np.asarray([study_id]),
+        cache_paths=(path,),
+        targets=np.zeros((1, len(LABELS)), dtype=np.float32),
+        weights=np.ones((1, len(LABELS)), dtype=np.float32),
+    )
+    return data, path
+
+
 def matched_grouped_fixture(tmp_path):
     cache_root = tmp_path / "matched-grouped"
     legacy_root = tmp_path / "matched-legacy"
@@ -426,6 +457,42 @@ def test_grouped_dataset_samples_per_slot_for_training_and_keeps_all_for_validat
         False,
         False,
     ]
+
+
+def test_windowed_dataset_uses_shared_training_window_and_all_ten_for_validation(
+    tmp_path,
+):
+    data, path = windowed_cache_fixture(tmp_path)
+    torch.manual_seed(7)
+    train_item = TBP0CachedDataset(
+        data, np.asarray([0]), sample_groups=True
+    )[0]
+    valid_item = TBP0CachedDataset(data, np.asarray([0]))[0]
+    inference_item = TBP0InferenceDataset([path])[0]
+    assert train_item["images"].shape == (6, 3, 4, 4)
+    assert train_item["valid_mask"].shape == (6,)
+    assert valid_item["images"].shape == (6, 10, 3, 4, 4)
+    assert valid_item["valid_mask"].shape == (6, 10)
+    assert inference_item["images"].shape == (6, 10, 3, 4, 4)
+    mean = torch.tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1)
+    std = torch.tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1)
+    raw_train = ((train_item["images"] * std + mean) * 255).round()
+    assert torch.equal(raw_train[0, :, 0, 0] + 30, raw_train[1, :, 0, 0])
+    assert torch.equal(
+        raw_train[0, 1:, 0, 0],
+        raw_train[0, :-1, 0, 0] + 1,
+    )
+    raw_valid = (
+        (
+            valid_item["images"]
+            * std.view(1, 1, 3, 1, 1)
+            + mean.view(1, 1, 3, 1, 1)
+        )
+        * 255
+    ).round()
+    assert raw_valid[0, 0, :, 0, 0].tolist() == [10, 11, 12]
+    assert raw_valid[0, -1, :, 0, 0].tolist() == [19, 20, 21]
+    assert torch.equal(valid_item["images"], inference_item["images"])
 
 
 def test_cached_alignment_requires_exact_identities(tmp_path):

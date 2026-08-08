@@ -34,6 +34,7 @@ from .track_b_data import (
     derive_c0_from_grouped_cache,
     read_six_slot_cache,
     read_track_b_cache,
+    window_stack_to_groups,
 )
 
 
@@ -735,29 +736,58 @@ class TBP0CachedDataset(Dataset):
             normalize=False,
         )
         images = decoded["images"]
-        valid_mask = decoded.get("valid_group_mask", decoded.get("valid_mask"))
+        metadata = decoded.get("metadata")
+        schema_version = (
+            metadata.get("schema_version") if isinstance(metadata, dict) else None
+        )
+        if schema_version == 3:
+            valid_slot_mask = decoded.get("valid_slot_mask")
+            if not isinstance(valid_slot_mask, Tensor):
+                raise ValueError("schema-v3 cache is missing its valid-slot mask")
+            images, valid_mask = window_stack_to_groups(
+                images,
+                valid_slot_mask,
+                window_size=int(metadata.get("window_size", 0)),
+            )
+        else:
+            valid_mask = decoded.get(
+                "valid_group_mask", decoded.get("valid_mask")
+            )
         assert isinstance(images, Tensor) and isinstance(valid_mask, Tensor)
         if images.ndim == 5 and self.sample_groups:
-            selected_images = images.new_zeros(
-                images.shape[0], *images.shape[2:]
-            )
-            selected_mask = torch.zeros(images.shape[0], dtype=torch.bool)
-            for slot in range(images.shape[0]):
-                choices = torch.where(valid_mask[slot])[0]
-                if not len(choices):
-                    continue
-                if self.group_indices is None:
-                    choice = choices[torch.randint(len(choices), (1,)).item()]
-                else:
-                    choice = int(self.group_indices[item, slot])
-                    if choice < 0 or choice >= images.shape[1] or not valid_mask[
-                        slot, choice
-                    ]:
-                        raise ValueError("explicit group selection is not valid")
-                selected_images[slot] = images[slot, choice]
-                selected_mask[slot] = True
-            images = selected_images
-            valid_mask = selected_mask
+            if schema_version == 3:
+                if self.group_indices is not None:
+                    raise ValueError(
+                        "explicit per-slot groups are invalid for shared windows"
+                    )
+                choice = torch.randint(images.shape[1], (1,)).item()
+                images = images[:, choice]
+                valid_mask = valid_mask[:, choice]
+            else:
+                selected_images = images.new_zeros(
+                    images.shape[0], *images.shape[2:]
+                )
+                selected_mask = torch.zeros(images.shape[0], dtype=torch.bool)
+                for slot in range(images.shape[0]):
+                    choices = torch.where(valid_mask[slot])[0]
+                    if not len(choices):
+                        continue
+                    if self.group_indices is None:
+                        choice = choices[torch.randint(len(choices), (1,)).item()]
+                    else:
+                        choice = int(self.group_indices[item, slot])
+                        if (
+                            choice < 0
+                            or choice >= images.shape[1]
+                            or not valid_mask[slot, choice]
+                        ):
+                            raise ValueError(
+                                "explicit group selection is not valid"
+                            )
+                    selected_images[slot] = images[slot, choice]
+                    selected_mask[slot] = True
+                images = selected_images
+                valid_mask = selected_mask
         if self.augmentation is not None:
             if images.ndim != 4:
                 raise ValueError("augmentation requires one sampled group per slot")
@@ -781,7 +811,7 @@ class TBP0CachedDataset(Dataset):
 
 
 class TBP0InferenceDataset(Dataset):
-    """Strict label-free reader for schema-v2 grouped Track B caches."""
+    """Strict label-free reader for grouped or ordered-window Track B caches."""
 
     def __init__(self, cache_paths: list[Path] | tuple[Path, ...]) -> None:
         self.cache_paths = tuple(Path(path) for path in cache_paths)
@@ -798,8 +828,22 @@ class TBP0InferenceDataset(Dataset):
         path = self.cache_paths[item]
         decoded = read_track_b_cache(path, normalize=False)
         images = decoded.get("images")
-        valid_mask = decoded.get("valid_group_mask")
         metadata = decoded.get("metadata")
+        schema_version = (
+            metadata.get("schema_version") if isinstance(metadata, dict) else None
+        )
+        if schema_version == 3:
+            valid_slot_mask = decoded.get("valid_slot_mask")
+            if isinstance(images, Tensor) and isinstance(valid_slot_mask, Tensor):
+                images, valid_mask = window_stack_to_groups(
+                    images,
+                    valid_slot_mask,
+                    window_size=int(metadata.get("window_size", 0)),
+                )
+            else:
+                valid_mask = None
+        else:
+            valid_mask = decoded.get("valid_group_mask")
         if (
             not isinstance(images, Tensor)
             or images.ndim != 5
@@ -810,10 +854,10 @@ class TBP0InferenceDataset(Dataset):
             or not isinstance(valid_mask, Tensor)
             or valid_mask.shape != images.shape[:2]
             or not isinstance(metadata, dict)
-            or metadata.get("schema_version") != 2
+            or schema_version not in (2, 3)
             or metadata.get("study_id") != path.stem
         ):
-            raise ValueError(f"invalid schema-v2 inference cache: {path}")
+            raise ValueError(f"invalid grouped inference cache: {path}")
         images = images.float().div_(255)
         mean = images.new_tensor((0.485, 0.456, 0.406)).view(1, 1, 3, 1, 1)
         std = images.new_tensor((0.229, 0.224, 0.225)).view(1, 1, 3, 1, 1)
