@@ -23,6 +23,8 @@ from rsna_knee.track_b_data import (
     preprocessing_fingerprint,
     read_grouped_six_slot_cache,
     read_six_slot_cache,
+    read_track_b_cache,
+    read_windowed_six_slot_cache,
     select_slot_series,
     select_coverage_group_indices,
     select_three_slice_indices,
@@ -30,6 +32,7 @@ from rsna_knee.track_b_data import (
     validate_laterality_agreement,
     write_grouped_six_slot_cache,
     write_six_slot_cache,
+    write_windowed_six_slot_cache,
 )
 
 
@@ -444,6 +447,71 @@ def test_grouped_cache_round_trip_and_c0_derivation_are_strict(tmp_path):
             fractions,
             indices,
             metadata={"study_id": "study"},
+        )
+
+
+def test_windowed_cache_round_trip_is_create_only_and_dispatches(tmp_path):
+    path = tmp_path / "windowed.zip"
+    images = torch.zeros((6, 12, 8, 8), dtype=torch.uint8)
+    images[0] = torch.arange(12, dtype=torch.uint8).view(12, 1, 1)
+    mask = torch.tensor([True, False, False, False, False, False])
+    indices = torch.full((6, 12), -1, dtype=torch.int32)
+    indices[0] = torch.tensor(
+        [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15],
+        dtype=torch.int32,
+    )
+    fingerprint = write_windowed_six_slot_cache(
+        path,
+        images,
+        mask,
+        indices,
+        metadata={"study_id": "study-1"},
+    )
+    decoded = read_windowed_six_slot_cache(path)
+    dispatched = read_track_b_cache(path)
+    assert decoded["images"].shape == (6, 12, 8, 8)
+    assert torch.allclose(
+        decoded["images"][0, :, 0, 0],
+        images[0, :, 0, 0] / 255,
+    )
+    assert torch.equal(decoded["valid_slot_mask"], mask)
+    assert torch.equal(decoded["source_slice_indices"], indices)
+    assert decoded["metadata"]["window_count"] == 10
+    assert decoded["metadata"]["fingerprint"] == fingerprint
+    assert dispatched["metadata"]["schema_version"] == 3
+    with pytest.raises(FileExistsError, match="overwrite"):
+        write_windowed_six_slot_cache(
+            path,
+            images,
+            mask,
+            indices,
+            metadata={"study_id": "study-1"},
+        )
+
+
+def test_windowed_cache_rejects_invalid_indices_and_report_metadata(tmp_path):
+    images = torch.zeros((6, 12, 8, 8), dtype=torch.uint8)
+    images[0] = 1
+    mask = torch.tensor([True, False, False, False, False, False])
+    indices = torch.full((6, 12), -1, dtype=torch.int32)
+    indices[0] = torch.arange(12, dtype=torch.int32)
+    indices[0, 6] = 2
+    with pytest.raises(ValueError, match="source indices"):
+        write_windowed_six_slot_cache(
+            tmp_path / "bad-indices.zip",
+            images,
+            mask,
+            indices,
+            metadata={"study_id": "study-1"},
+        )
+    indices[0] = torch.arange(12, dtype=torch.int32)
+    with pytest.raises(ValueError, match="raw reports"):
+        write_windowed_six_slot_cache(
+            tmp_path / "bad-report.zip",
+            images,
+            mask,
+            indices,
+            metadata={"raw_report": "do not cache"},
         )
 
 

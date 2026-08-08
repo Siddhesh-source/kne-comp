@@ -1153,6 +1153,114 @@ def write_grouped_six_slot_cache(
     return fingerprint
 
 
+def write_windowed_six_slot_cache(
+    path: str | Path,
+    images: Tensor | np.ndarray,
+    valid_slot_mask: Tensor | np.ndarray,
+    source_slice_indices: Tensor | np.ndarray,
+    *,
+    metadata: Mapping[str, object],
+    window_size: int = 3,
+) -> str:
+    """Atomically create one ordered-stack Track B cache."""
+    path = Path(path)
+
+    def array(value: Tensor | np.ndarray) -> np.ndarray:
+        return np.asarray(
+            value.detach().cpu().numpy() if isinstance(value, Tensor) else value
+        )
+
+    pixels = array(images)
+    mask = array(valid_slot_mask)
+    indices = array(source_slice_indices)
+    if (
+        pixels.ndim != 4
+        or pixels.shape[0] != len(TB_P0_SLOT_NAMES)
+        or pixels.shape[-1] != pixels.shape[-2]
+        or pixels.dtype != np.uint8
+        or type(window_size) is not int
+        or not 1 <= window_size <= pixels.shape[1]
+    ):
+        raise ValueError("window cache images must be uint8 [6,slices,H,H]")
+    stack_shape = pixels.shape[:2]
+    if (
+        mask.shape != (len(TB_P0_SLOT_NAMES),)
+        or mask.dtype != np.bool_
+        or indices.shape != stack_shape
+        or not np.issubdtype(indices.dtype, np.integer)
+        or not mask.any()
+        or np.any(pixels[~mask] != 0)
+        or np.any(indices[mask] < 0)
+        or np.any(indices[~mask] != -1)
+        or any(np.any(np.diff(row) < 0) for row in indices[mask])
+    ):
+        raise ValueError("window cache mask or source indices are invalid")
+    safe_metadata = dict(metadata)
+    if any(
+        key.lower() in {"report", "raw_report", "report_text"}
+        for key in safe_metadata
+    ):
+        raise ValueError("raw reports must not be stored in Track B cache metadata")
+    safe_metadata.update(
+        {
+            "schema_version": 3,
+            "slot_names": list(TB_P0_SLOT_NAMES),
+            "slice_count": int(stack_shape[1]),
+            "window_size": window_size,
+            "window_count": int(stack_shape[1] - window_size + 1),
+            "image_size": int(pixels.shape[-1]),
+        }
+    )
+    payloads = {
+        "images.npy": _npy_bytes(pixels),
+        "valid_slot_mask.npy": _npy_bytes(mask),
+        "source_slice_indices.npy": _npy_bytes(indices.astype(np.int32)),
+        "metadata.json": json.dumps(
+            safe_metadata, sort_keys=True, allow_nan=False
+        ).encode("utf-8"),
+    }
+    digest = hashlib.sha256()
+    for name in sorted(payloads):
+        digest.update(name.encode("utf-8"))
+        digest.update(payloads[name])
+    fingerprint = digest.hexdigest()
+    safe_metadata["fingerprint"] = fingerprint
+    payloads["metadata.json"] = json.dumps(
+        safe_metadata, sort_keys=True, allow_nan=False
+    ).encode("utf-8")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        raise FileExistsError(f"refusing to overwrite Track B cache: {path}")
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    os.close(descriptor)
+    try:
+        with zipfile.ZipFile(
+            temporary,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=1,
+        ) as archive:
+            for name, payload in payloads.items():
+                archive.writestr(name, payload)
+        try:
+            reservation = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError as exc:
+            raise FileExistsError(
+                f"refusing to overwrite Track B cache: {path}"
+            ) from exc
+        os.close(reservation)
+        os.replace(temporary, path)
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    return fingerprint
+
+
 def read_six_slot_cache(
     path: str | Path,
     *,
@@ -1282,12 +1390,77 @@ def read_grouped_six_slot_cache(
     }
 
 
+def read_windowed_six_slot_cache(
+    path: str | Path,
+    *,
+    normalize: bool = True,
+) -> dict[str, object]:
+    """Read and validate a schema-v3 ordered-stack Track B cache."""
+    path = Path(path)
+    required = {
+        "images.npy",
+        "valid_slot_mask.npy",
+        "source_slice_indices.npy",
+        "metadata.json",
+    }
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = archive.namelist()
+            if len(names) != len(set(names)) or set(names) != required:
+                raise ValueError("invalid windowed Track B cache member set")
+            images = np.load(io.BytesIO(archive.read("images.npy")), allow_pickle=False)
+            mask = np.load(
+                io.BytesIO(archive.read("valid_slot_mask.npy")),
+                allow_pickle=False,
+            )
+            indices = np.load(
+                io.BytesIO(archive.read("source_slice_indices.npy")),
+                allow_pickle=False,
+            )
+            metadata = json.loads(archive.read("metadata.json"))
+    except (OSError, zipfile.BadZipFile, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid windowed Track B cache: {path}") from exc
+    image_size = int(metadata.get("image_size", 0))
+    slice_count = int(metadata.get("slice_count", 0))
+    window_size = int(metadata.get("window_size", 0))
+    if (
+        metadata.get("schema_version") != 3
+        or tuple(metadata.get("slot_names", ())) != TB_P0_SLOT_NAMES
+        or metadata.get("window_count") != slice_count - window_size + 1
+        or not 1 <= window_size <= slice_count
+        or images.shape
+        != (len(TB_P0_SLOT_NAMES), slice_count, image_size, image_size)
+        or images.dtype != np.uint8
+        or mask.shape != (len(TB_P0_SLOT_NAMES),)
+        or mask.dtype != np.bool_
+        or indices.shape != (len(TB_P0_SLOT_NAMES), slice_count)
+        or indices.dtype != np.int32
+        or not mask.any()
+        or np.any(images[~mask] != 0)
+        or np.any(indices[mask] < 0)
+        or np.any(indices[~mask] != -1)
+        or any(np.any(np.diff(row) < 0) for row in indices[mask])
+    ):
+        raise ValueError("invalid windowed Track B cache arrays or metadata")
+    tensor = torch.from_numpy(images.copy()).float()
+    mask_tensor = torch.from_numpy(mask.copy())
+    if normalize:
+        tensor.div_(255)
+    tensor[~mask_tensor] = 0
+    return {
+        "images": tensor,
+        "valid_slot_mask": mask_tensor,
+        "source_slice_indices": torch.from_numpy(indices.copy()),
+        "metadata": metadata,
+    }
+
+
 def read_track_b_cache(
     path: str | Path,
     *,
     normalize: bool = True,
 ) -> dict[str, object]:
-    """Dispatch between immutable C0 schema v1 and grouped schema v2."""
+    """Dispatch among immutable Track B cache schemas."""
     path = Path(path)
     try:
         with zipfile.ZipFile(path) as archive:
@@ -1299,6 +1472,8 @@ def read_track_b_cache(
         return read_six_slot_cache(path, normalize=normalize)
     if version == 2:
         return read_grouped_six_slot_cache(path, normalize=normalize)
+    if version == 3:
+        return read_windowed_six_slot_cache(path, normalize=normalize)
     raise ValueError(f"unsupported Track B cache schema: {version}")
 
 
