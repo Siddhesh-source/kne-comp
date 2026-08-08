@@ -1435,7 +1435,7 @@ def track_b_train_fold(
 
 @app.function(
     image=image,
-    gpu="H100",
+    gpu="A10",
     cpu=16,
     memory=65536,
     ephemeral_disk=524288,
@@ -1557,7 +1557,7 @@ def track_b_train_coverage_arm(
 
 @app.function(
     image=image,
-    gpu="H100",
+    gpu="A10",
     cpu=16,
     memory=65536,
     ephemeral_disk=524288,
@@ -2223,16 +2223,19 @@ def c1_finetune_full(
     crop_mm: int = 130,
     folds: str = "0,1,2,3,4",
     batch_size: int = 8,
+    git_revision: str = "",
 ) -> None:
     """Launch durable, resumable promoted-C1 folds in the active profile."""
     import json
 
     selected_folds = _parse_folds(folds)
-    revision = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"],
-        cwd=PROJECT_ROOT.parent,
-        text=True,
-    ).strip()
+    revision = git_revision.strip()
+    if not revision:
+        revision = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=PROJECT_ROOT.parent,
+            text=True,
+        ).strip()
     print(
         json.dumps(
             track_b_run_c1_finetune.remote(
