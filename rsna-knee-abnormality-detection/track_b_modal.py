@@ -1268,6 +1268,126 @@ def track_b_finalize_coverage_cache(
 
 @app.function(
     image=image,
+    cpu=8,
+    memory=32768,
+    timeout=7200,
+    max_containers=1,
+    volumes={DATA_MOUNT: data_volume, ARTIFACT_MOUNT: artifact_volume},
+)
+def track_b_build_c1_test_cache(
+    crop_mm: int = 130,
+    group_count: int = 4,
+) -> dict[str, object]:
+    """Build and validate the label-free grouped C1 competition test cache."""
+    import json
+
+    import pandas as pd
+
+    from rsna_knee.constants import ID_COLUMN
+    from rsna_knee.track_b_data import read_grouped_six_slot_cache
+
+    cache_name = _coverage_cache_name(crop_mm, group_count)
+    data_volume.reload()
+    artifact_volume.reload()
+    series_path = DATA_MOUNT / "raw" / "test_series.csv"
+    sample_path = DATA_MOUNT / "raw" / "sample_submission.csv"
+    test_root = DATA_MOUNT / "raw" / "test_series"
+    if (
+        not series_path.is_file()
+        or not sample_path.is_file()
+        or not test_root.is_dir()
+    ):
+        raise FileNotFoundError("competition test metadata or DICOM root is missing")
+    series = pd.read_csv(series_path, dtype={"StudyInstanceUID": str})
+    sample = pd.read_csv(sample_path, dtype={ID_COLUMN: str})
+    expected_ids = sample[ID_COLUMN].astype(str).tolist()
+    series_ids = sorted(series["StudyInstanceUID"].astype(str).unique())
+    if len(expected_ids) != len(set(expected_ids)) or set(series_ids) != set(
+        expected_ids
+    ):
+        raise ValueError("test series and sample submission studies do not match")
+    cache_base = TRACK_B_ROOT / "cache" / cache_name / "test"
+    cache_root = cache_base / "studies"
+    manifest_path = cache_base / "manifest.json"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    series_hash = _sha256_file(series_path)
+    sample_hash = _sha256_file(sample_path)
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if (
+            manifest.get("stage") != "TB-C1-test-cache"
+            or manifest.get("crop_mm") != crop_mm
+            or manifest.get("group_count") != group_count
+            or manifest.get("series_source_sha256") != series_hash
+            or manifest.get("sample_submission_sha256") != sample_hash
+            or manifest.get("studies") != len(expected_ids)
+            or {path.stem for path in cache_root.glob("*.zip")}
+            != set(expected_ids)
+        ):
+            raise ValueError("existing C1 test cache manifest is incompatible")
+        return {**manifest, "status": "already_completed"}
+
+    results = []
+    for study_id in expected_ids:
+        destination = cache_root / f"{study_id}.zip"
+        if destination.exists():
+            decoded = read_grouped_six_slot_cache(destination, normalize=False)
+            metadata = decoded["metadata"]
+            if (
+                metadata.get("study_id") != study_id
+                or metadata.get("group_count") != group_count
+                or metadata.get("crop_mm") != crop_mm
+            ):
+                raise ValueError(f"existing C1 test cache mismatch: {destination}")
+            mask = decoded["valid_group_mask"]
+            result = {
+                "study_id": study_id,
+                "valid_groups": int(mask.sum()),
+                "valid_slots": int(mask.any(dim=1).sum()),
+                "fingerprint": metadata["fingerprint"],
+            }
+        else:
+            rows = series.loc[
+                series["StudyInstanceUID"].astype(str).eq(study_id)
+            ]
+            result = _build_one_study_coverage_cache(
+                study_id,
+                rows,
+                train_root=test_root,
+                cache_root=cache_root,
+                crop_mm=crop_mm,
+                group_count=group_count,
+            )
+        result["cache_bytes"] = destination.stat().st_size
+        results.append(result)
+    if {path.stem for path in cache_root.glob("*.zip")} != set(expected_ids):
+        raise ValueError("C1 test cache contains unexpected study identities")
+    digest = hashlib.sha256()
+    for result in sorted(results, key=lambda item: str(item["study_id"])):
+        digest.update(str(result["study_id"]).encode())
+        digest.update(str(result["fingerprint"]).encode())
+    manifest = {
+        "schema_version": 1,
+        "stage": "TB-C1-test-cache",
+        "crop_mm": crop_mm,
+        "group_count": group_count,
+        "studies": len(results),
+        "series_source_sha256": series_hash,
+        "sample_submission_sha256": sample_hash,
+        "test_cache_fingerprint": digest.hexdigest(),
+        "total_cache_bytes": sum(int(item["cache_bytes"]) for item in results),
+        "results": results,
+    }
+    descriptor = os.open(manifest_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2)
+        handle.write("\n")
+    artifact_volume.commit()
+    return {**manifest, "status": "created"}
+
+
+@app.function(
+    image=image,
     gpu="A10",
     cpu=16,
     memory=65536,
@@ -1920,6 +2040,117 @@ def track_b_evaluate_finetune(run_name: str) -> dict[str, object]:
 
 @app.function(
     image=image,
+    gpu="A10",
+    cpu=8,
+    memory=32768,
+    timeout=7200,
+    max_containers=1,
+    volumes={DATA_MOUNT: data_volume, ARTIFACT_MOUNT: artifact_volume},
+)
+def track_b_predict_c1_test(
+    run_name: str,
+    crop_mm: int = 130,
+    batch_size: int = 8,
+) -> dict[str, object]:
+    """Predict and validate one five-fold C1 competition submission."""
+    import json
+
+    import pandas as pd
+    import torch
+
+    from rsna_knee.inference import assemble_ensemble_submission
+    from rsna_knee.track_b_training import predict_tb_p0_fold_cache
+
+    _validate_crop(crop_mm)
+    if type(batch_size) is not int or not 1 <= batch_size <= 16:
+        raise ValueError("batch_size must be an integer from 1 through 16")
+    data_volume.reload()
+    artifact_volume.reload()
+    cache_base = (
+        TRACK_B_ROOT / "cache" / _coverage_cache_name(crop_mm, 4) / "test"
+    )
+    cache_root = cache_base / "studies"
+    cache_manifest_path = cache_base / "manifest.json"
+    sample_path = DATA_MOUNT / "raw" / "sample_submission.csv"
+    run_root = TRACK_B_ROOT / "runs" / run_name
+    for path in (cache_manifest_path, sample_path, run_root / "metadata.json"):
+        if not path.exists():
+            raise FileNotFoundError(path)
+    cache_manifest = json.loads(cache_manifest_path.read_text(encoding="utf-8"))
+    sample = pd.read_csv(sample_path, dtype={"StudyInstanceUID": str})
+    if (
+        cache_manifest.get("stage") != "TB-C1-test-cache"
+        or cache_manifest.get("crop_mm") != crop_mm
+        or cache_manifest.get("group_count") != 4
+        or cache_manifest.get("sample_submission_sha256")
+        != _sha256_file(sample_path)
+        or cache_manifest.get("studies") != len(sample)
+        or len(list(cache_root.glob("*.zip"))) != len(sample)
+    ):
+        raise ValueError("C1 test cache is incompatible")
+    output_root = run_root / "test-predictions"
+    metadata_path = output_root / "metadata.json"
+    if metadata_path.exists():
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        hashes = metadata.get("output_hashes", {})
+        if (
+            metadata.get("stage") != "TB-P0-test-predictions"
+            or metadata.get("run_name") != run_name
+            or metadata.get("test_cache_fingerprint")
+            != cache_manifest.get("test_cache_fingerprint")
+            or any(
+                not (output_root / name).is_file()
+                or _sha256_file(output_root / name) != expected
+                for name, expected in hashes.items()
+            )
+        ):
+            raise ValueError("existing C1 test predictions are incompatible")
+        return {**metadata, "status": "already_completed"}
+    if output_root.exists() and any(output_root.iterdir()):
+        raise FileExistsError("incomplete C1 test prediction artifacts exist")
+    output_root.mkdir(parents=True, exist_ok=True)
+    torch.hub.set_dir(str(ARTIFACT_MOUNT / "models" / "torch-hub"))
+    torch.cuda.reset_peak_memory_stats()
+    fold_predictions = []
+    output_hashes = {}
+    for fold in range(5):
+        prediction = predict_tb_p0_fold_cache(
+            cache_root,
+            run_root,
+            fold,
+            batch_size=batch_size,
+            device="cuda",
+        )
+        prediction_path = output_root / f"fold-{fold}.csv"
+        prediction.to_csv(prediction_path, index=False)
+        fold_predictions.append(prediction)
+        output_hashes[prediction_path.name] = _sha256_file(prediction_path)
+    submission = assemble_ensemble_submission(fold_predictions, sample)
+    submission_path = output_root / "submission.csv"
+    submission.to_csv(submission_path, index=False)
+    output_hashes[submission_path.name] = _sha256_file(submission_path)
+    metadata = {
+        "schema_version": 1,
+        "stage": "TB-P0-test-predictions",
+        "run_name": run_name,
+        "folds": list(range(5)),
+        "studies": len(submission),
+        "batch_size": batch_size,
+        "test_cache_fingerprint": cache_manifest["test_cache_fingerprint"],
+        "sample_submission_sha256": _sha256_file(sample_path),
+        "peak_gpu_memory_bytes": torch.cuda.max_memory_allocated(),
+        "output_hashes": output_hashes,
+    }
+    descriptor = os.open(metadata_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2)
+        handle.write("\n")
+    artifact_volume.commit()
+    return {**metadata, "status": "created"}
+
+
+@app.function(
+    image=image,
     cpu=1,
     memory=2048,
     timeout=43200,
@@ -2296,3 +2527,21 @@ def evaluate_finetune(run_name: str) -> None:
     import json
 
     print(json.dumps(track_b_evaluate_finetune.remote(run_name), indent=2))
+
+
+@app.local_entrypoint()
+def c1_predict_test(
+    run_name: str,
+    crop_mm: int = 130,
+    batch_size: int = 8,
+) -> None:
+    """Build the grouped test cache and write five-fold C1 predictions."""
+    import json
+
+    cache = track_b_build_c1_test_cache.remote(crop_mm, 4)
+    predictions = track_b_predict_c1_test.remote(
+        run_name,
+        crop_mm,
+        batch_size,
+    )
+    print(json.dumps({"cache": cache, "predictions": predictions}, indent=2))
