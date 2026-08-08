@@ -1556,6 +1556,139 @@ def track_b_build_window_cache_canary(
     image=image,
     cpu=8,
     memory=32768,
+    timeout=7200,
+    max_containers=1,
+    volumes={DATA_MOUNT: data_volume, ARTIFACT_MOUNT: artifact_volume},
+)
+def track_b_validate_window_cache_canary(
+    crop_mm: int = 130,
+    slice_count: int = 12,
+    window_size: int = 3,
+) -> dict[str, object]:
+    """Rebuild every canary study and require exact pixels and source indices."""
+    import json
+
+    import pandas as pd
+    import torch
+
+    from rsna_knee.track_b_data import (
+        TBP0DataConfig,
+        preprocessing_fingerprint,
+        read_windowed_six_slot_cache,
+    )
+
+    cache_name = _window_cache_name(crop_mm, slice_count, window_size)
+    data_volume.reload()
+    artifact_volume.reload()
+    series_path = DATA_MOUNT / "metadata" / "train_series.csv"
+    if not series_path.is_file():
+        series_path = DATA_MOUNT / "raw" / "train_series.csv"
+    train_root = DATA_MOUNT / "raw" / "train_series"
+    cache_base = TRACK_B_ROOT / "cache" / cache_name / "canary"
+    cache_root = cache_base / "train"
+    manifest_path = cache_base / "manifest.json"
+    qc_path = cache_base / "validation.json"
+    if qc_path.exists():
+        raise FileExistsError(f"Track B C2 canary validation exists: {qc_path}")
+    if (
+        not series_path.is_file()
+        or not train_root.is_dir()
+        or not manifest_path.is_file()
+    ):
+        raise FileNotFoundError("C2 source data or canary manifest is missing")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if (
+        manifest.get("schema_version") != 3
+        or manifest.get("stage") != "TB-C2-window-cache-canary"
+        or manifest.get("crop_mm") != crop_mm
+        or manifest.get("slice_count") != slice_count
+        or manifest.get("window_size") != window_size
+        or manifest.get("studies") != len(manifest.get("results", ()))
+        or manifest.get("series_source_sha256") != _sha256_file(series_path)
+    ):
+        raise ValueError("incompatible Track B C2 canary manifest")
+    series = pd.read_csv(series_path, dtype={"StudyInstanceUID": str})
+    expected_preprocessing = preprocessing_fingerprint(
+        TBP0DataConfig(crop_mm=float(crop_mm))
+    )
+    checked = []
+    for record in manifest["results"]:
+        study_id = str(record["study_id"])
+        destination = cache_root / f"{study_id}.zip"
+        if (
+            not destination.is_file()
+            or destination.stat().st_size != int(record["cache_bytes"])
+            or _window_cache_payload_fingerprint(destination)
+            != record["fingerprint"]
+        ):
+            raise ValueError(f"C2 canary artifact changed: {study_id}")
+        decoded = read_windowed_six_slot_cache(destination, normalize=False)
+        _validate_window_cache_metadata(
+            decoded["metadata"],
+            study_id=study_id,
+            crop_mm=crop_mm,
+            preprocessing_fingerprint=expected_preprocessing,
+            slice_count=slice_count,
+            window_size=window_size,
+        )
+        rows = series.loc[series["StudyInstanceUID"].astype(str).eq(study_id)]
+        rebuilt = _prepare_one_study_window_cache(
+            study_id,
+            rows,
+            train_root=train_root,
+            crop_mm=crop_mm,
+            slice_count=slice_count,
+            window_size=window_size,
+        )
+        comparisons = {
+            "images": (
+                decoded["images"],
+                rebuilt["images"].to(dtype=torch.float32),
+            ),
+            "valid_slot_mask": (decoded["valid_slot_mask"], rebuilt["mask"]),
+            "source_slice_indices": (
+                decoded["source_slice_indices"],
+                rebuilt["indices"],
+            ),
+        }
+        for name, (cached, fresh) in comparisons.items():
+            if not torch.equal(cached, fresh):
+                raise ValueError(f"C2 canary rebuild mismatch: {study_id} {name}")
+        if any(
+            decoded["metadata"].get(key) != value
+            for key, value in rebuilt["metadata"].items()
+        ):
+            raise ValueError(f"C2 canary metadata mismatch: {study_id}")
+        checked.append(
+            {
+                "study_id": study_id,
+                "valid_slots": int(rebuilt["mask"].sum()),
+                "fingerprint": record["fingerprint"],
+            }
+        )
+    payload = {
+        "schema_version": 3,
+        "stage": "TB-C2-window-cache-canary-validation",
+        "crop_mm": crop_mm,
+        "slice_count": slice_count,
+        "window_size": window_size,
+        "studies": len(checked),
+        "series_source_sha256": manifest["series_source_sha256"],
+        "exact_rebuild_match": True,
+        "results": checked,
+    }
+    descriptor = os.open(qc_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+    artifact_volume.commit()
+    return {**payload, "validation": str(qc_path)}
+
+
+@app.function(
+    image=image,
+    cpu=8,
+    memory=32768,
     timeout=21600,
     retries=1,
     max_containers=40,
@@ -2808,6 +2941,25 @@ def window_cache_canary(
         json.dumps(
             track_b_build_window_cache_canary.remote(
                 crop_mm, limit, slice_count, window_size
+            ),
+            indent=2,
+        )
+    )
+
+
+@app.local_entrypoint()
+def window_cache_validate(
+    crop_mm: int = 130,
+    slice_count: int = 12,
+    window_size: int = 3,
+) -> None:
+    """Require an exact fresh-DICOM rebuild of every C2 canary study."""
+    import json
+
+    print(
+        json.dumps(
+            track_b_validate_window_cache_canary.remote(
+                crop_mm, slice_count, window_size
             ),
             indent=2,
         )
