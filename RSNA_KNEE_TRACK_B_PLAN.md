@@ -6,10 +6,11 @@ This is a standalone implementation and execution plan for a second agent. Track
 
 The downstream design was first revised after auditing Pilkwang Kim's public baseline
 version 14, then revised again after auditing three stronger or complementary public
-systems. Track B still starts from Pilkwang's reproducible six-slot model, but a
-three-slice model is now the **coverage control**, not the presumed final supervised
-architecture. The immediate question is whether 12 spread slices per slot improve strict
-fold-0 validation enough to justify five-fold training and inference cost.
+systems. Track B starts from the same reproducible six-slot family, but the coverage gate
+and first five-fold baseline are now complete. The current question is no longer whether
+12 slices help. It is how much additional score can be recovered through denser
+overlapping-window inference, longer multi-seed training, and metric-aligned rank
+ensembling.
 
 There is no separate strategic "Track C." References to Track C in earlier notes mean the
 `TB-C*` coverage experiments inside Track B. Track A is the dense 46-position supervised
@@ -28,6 +29,116 @@ The aim is not to replace Track A. The aim is to produce a model with a stronger
 
 ---
 
+## August 8 score-maximization update
+
+This section supersedes any older `READY`, `BLOCKED BY PHASE 4`, or "run the five C1
+folds" instructions later in this document.
+
+### Completed Track B result
+
+- The promoted C1 cache contains all 4,407 studies and 12 source slices per available
+  slot, stored as four three-slice groups.
+- All five `TB-P0` folds completed.
+- Strict report-group OOF contains exactly 4,407 studies and 4,257 report groups.
+- Strict macro AUC is `0.8107277038927617`.
+- The five fold AUCs are `0.815414`, `0.811787`, `0.808155`, `0.811184`, and
+  `0.812070`.
+- Five-fold test inference completed for the three visible test studies. The verified
+  local submission SHA-256 is
+  `d06008abe740ed2ff1557bb83ce41e610d376ee1c6a5172d272337f3af5b4133`.
+- Kaggle notebook `ththjyj/rsna-knee-private-hidden-inference` version 3 completed
+  successfully. As of this update, its output has **not** been submitted to the
+  competition. The latest competition submission remains `55308345`, public score
+  `0.758`.
+
+### New public frontier evidence
+
+Pilkwang version 15
+([script `340906482`](https://www.kaggle.com/code/pilkwang/rsna-knee-baseline-v1?scriptVersionId=340906482))
+has a verified public score of **0.891**. Its scored run loads 20 DINOv2-S members:
+four seeds times five folds. All members use the same six slots, 336 px resolution,
+130 mm crop, final six trainable DINO blocks, and CLS-plus-mean-patch slot features as
+our baseline family. The main verified differences are:
+
+| Dimension | Pilkwang V15 | Current Track B C1 |
+|---|---:|---:|
+| Members | 20, four seeds x five folds | 5, one seed x five folds |
+| Epochs completed | 20–60, mean 30.3 | 10 |
+| Slice windows at inference | 10 overlapping windows from 12 slices | 4 fixed groups |
+| Ensemble | Per-label percentile-rank mean | Probability mean |
+| Manifest holdout macro AUC | Mean 0.83985 | Strict OOF 0.81073 |
+
+The architecture is therefore not the primary gap. The strongest evidence points to
+optimization duration, seed diversity, denser slice-window coverage, and rank
+ensembling. Pilkwang's public `report_labels_v2.csv` is also different from our
+consensus labels. Across 4,406 shared studies, per-label Spearman agreement ranges from
+approximately 0.55 to 0.94, so supervision remains a controlled ablation rather than an
+assumed improvement.
+
+The downloaded V15 notebook, execution log, output, weight manifest, and public label
+table are under:
+
+```text
+references/pilkwang-rsna-knee-baseline-v1-v340906482/
+```
+
+The public label and weights datasets report CC0-1.0 through the Kaggle API. Preserve
+their provenance and recheck competition external-data rules before packaging any
+derived artifact.
+
+### Revised course of action
+
+The score-maximization ladder is now:
+
+1. **Submit and record the completed five-fold C1 baseline.** First verify the completed
+   notebook output against the locally backed-up CSV hash. This submission measures the
+   real local-to-public relationship for `TB-P0`; do not infer its score from OOF.
+2. **Add dense-window OOF and inference.** Reconstruct the ordered 12 channels already
+   stored in each C1 cache and evaluate all 10 contiguous three-slice windows. Average
+   member probabilities across windows. Do not submit this change until complete OOF
+   confirms that the train/inference window-distribution change is safe.
+3. **Use metric-aligned ensembling.** Convert every member's predictions to per-label
+   percentile ranks, average ranks with equal initial weights, and rank the final
+   columns. Compare this with probability averaging on complete OOF. A rank transform
+   cannot improve one model's AUC by itself; the gain can only come from combining
+   differently calibrated members.
+4. **Train three additional five-fold seed packs.** Target four seeds and 20 total
+   members. Use the same folds, labels, model, cache, and preprocessing. Raise the
+   training ceiling to 30 epochs initially, retain fold-local best checkpoints, and
+   permit continuation toward 60 only when the validation curve is still improving.
+   Keep portable epoch checkpoints and immutable model hashes.
+5. **Build the 20-member OOF ensemble.** Produce complete OOF predictions for every
+   seed. Measure standalone seed packs, probability mean, equal rank mean, per-label
+   correlations, and fold spread. Do not select members using public leaderboard
+   feedback.
+6. **Run a supervision ablation.** Compare our frozen consensus labels, Pilkwang's
+   public graded labels, and a predeclared blend under the same seed/fold/configuration.
+   Evaluate against the same frozen repository targets and gold protocol. Labels may
+   change training only, never the evaluation target.
+7. **Promote only measured additions.** Focal top-k pooling, weak anatomical priors,
+   learned group reduction, MRI SSL, and report alignment remain candidates after the
+   20-member supervised baseline. Test one change at a time against a matched seed.
+8. **Finish with OOF-gated diversity.** Blend Track B with a completed dense Track A,
+   CNN, or specialist only when full OOF shows complementary per-label errors. Optimize
+   blend weights inside training folds or with a locked protocol, never directly on the
+   public leaderboard.
+
+### Promotion gates
+
+- Dense-window inference must improve complete macro OOF or materially improve weak
+  labels without a broad regression.
+- A new seed pack must add ensemble value, not merely duplicate existing rankings.
+- Longer training must retain the best fold-local epoch and must not select from Kaggle
+  scores.
+- A label-table change must improve frozen evaluation and pass provenance checks.
+- Every promoted ensemble must remain within the Kaggle hidden-test runtime and memory
+  limits. Reduce redundant members or windows using OOF correlation before changing the
+  model family.
+- Preserve the original five-member `TB-P0` checkpoints and submission as an immutable
+  control.
+
+---
+
 ## Track B phase roadmap and current position
 
 ### The route in one page
@@ -43,19 +154,19 @@ Phase 3  Full C1 cache, then matched fold-0 C0 versus C1          COMPLETE
          |
          +-- C1 clearly wins --> optional C2 only if still justified
          |
-Phase 4  Five-fold supervised baseline using promoted coverage   READY
+Phase 4  Five-fold supervised baseline using promoted coverage   COMPLETE
          |
-Phase 5  Supervised notebook ablations, one at a time             BLOCKED BY PHASE 4
+Phase 5  Dense-window, rank-mean, and multi-seed expansion        ACTIVE
          |
-Phase 6  MRI SSL and report-alignment initialization tests        BLOCKED BY PHASE 4
+Phase 6  MRI SSL and report-alignment initialization tests        AFTER SUPERVISED SCALE
          |
-Phase 7  OOF blend with any completed independent model           BLOCKED BY OOF
+Phase 7  OOF-gated blend and Kaggle submission                    BASELINE READY
 ```
 
-Phase 3 is complete. The full C1 cache and matched fold-0 gate both passed on
+Phases 3 and 4 are complete. The full C1 cache and matched fold-0 gate both passed on
 `modal-secondary`. C1 improved macro AUC from `0.79980` to `0.81625`, a gain of
-`0.01645`. All 2,000 paired report-group bootstrap draws were above zero. C1 is the
-promoted input for Phase 4.
+`0.01645`, and all 2,000 paired report-group bootstrap draws were above zero. The
+resulting five-fold baseline reached strict OOF macro AUC `0.8107277038927617`.
 
 ### Status table
 
@@ -65,10 +176,10 @@ promoted input for Phase 4.
 | 1. Coverage implementation | Turn the public multi-group idea into a backward-compatible repository path | Schema-v2 grouped cache, exact C0 group, source indices, short-series masks, train-time group sampling, all-group validation reduction, local tests | **Complete** |
 | 2. C1 cache canary | Prove real DICOM behavior before building another multi-GB cache | Basic 16-study build plus deterministic edge cases, seeded random samples, independent pixel/source-index rebuild checks, slot/group telemetry, size and decode time | **Complete** |
 | 3. Coverage gate | Decide how many slices the supervised baseline should use | Full C1 cache, then matched fold-0 `TB-C0` versus `TB-C1`; C2 only if C1 passes its gate | **Complete, C1 promoted** |
-| 4. Supervised baseline | Establish the number that every pretraining idea must beat | Five-fold `TB-P0`, exactly 4,407 OOF rows, per-label metrics, runtime and memory | Ready |
-| 5. Public-notebook ablations | Test plausible additions without bundling them together | Focal patch pooling, weak anatomical prior, group reducer, crop/resolution and optional slot-taxonomy controls | Blocked by Phase 4 |
-| 6. Representation pretraining | Test whether MRI adaptation or reports improve the same model | Matched `TB-P1`, `TB-P2`, and `TB-P3`; only initialization changes in the first comparison | Blocked by Phase 4 |
-| 7. Ensemble and submission | Keep Track B only if it adds standalone or complementary OOF signal | OOF-gated blend with any completed independent model, inference-cost check and final reproducible package | Blocked by complete OOF |
+| 4. Supervised baseline | Establish the number that every pretraining idea must beat | Five-fold `TB-P0`, exactly 4,407 OOF rows, per-label metrics, runtime and memory | **Complete, 0.81073 OOF** |
+| 5. Supervised scale and inference | Close the verified V15 gap before changing model families | Ten overlapping windows, four seeds x five folds, longer fold-local training, OOF probability/rank comparison | **Active** |
+| 6. Representation pretraining | Test whether MRI adaptation or reports improve the same model | Matched `TB-P1`, `TB-P2`, and `TB-P3`; only initialization changes in the first comparison | After supervised scale |
+| 7. Ensemble and submission | Keep additions only if they add standalone or complementary OOF signal | OOF-gated blend, inference-cost check, reproducible notebook and scored submission | Baseline notebook complete; submission pending |
 
 ### What is already finished
 
@@ -194,14 +305,24 @@ available. Tony and prvsiyan changed the order of experiments:
 
 ### Immediate execution plan
 
-1. Run all five promoted C1 folds on independent H100 workers.
-2. Stage the C1 cache on each worker's local SSD and commit one portable checkpoint pair
-   after every epoch.
-3. If a worker stops, resume only that fold from its highest valid checkpoint.
-4. Finalize exactly 4,407 OOF rows after all five folds complete.
-5. Record macro and per-label OOF AUC, fold spread, runtime and memory.
-6. Freeze the completed result as `TB-P0`, the baseline for later SSL and report
-   alignment experiments.
+The original five-fold execution is complete. The next implementation sequence is:
+
+1. Download the completed Kaggle notebook output and verify it against the backed-up
+   five-fold C1 submission before creating a competition submission.
+2. Add a cache-compatible 10-window evaluator that reconstructs the ordered 12 slices
+   from the four stored triplets without changing source pixels.
+3. Generate complete five-fold dense-window OOF and compare probability averaging with
+   per-label rank averaging.
+4. If the OOF gate passes, run the same inference path on test and package a new
+   create-only notebook artifact.
+5. Train three additional five-fold seed packs with a 30-epoch ceiling and fold-local
+   best-checkpoint selection. Continue an individual fold beyond 30 only when its locked
+   validation trajectory justifies it.
+6. Finalize a 20-member OOF matrix and promote only ensemble variants selected without
+   leaderboard feedback.
+7. Run the frozen-label supervision comparison, then proceed to MRI SSL, report
+   alignment, or independent-model blending only after the scaled supervised baseline is
+   recorded.
 
 ### Coverage promotion gate
 
@@ -257,13 +378,13 @@ Verified shared facts:
 - Dense supervised DINO run E007 is stopped and incomplete.
 - Frozen evaluation targets and folds must never change.
 
-Current project public leaderboard score is 0.758, from the older frozen-representation
-submission. It must not be compared as though it were the result of E007 or Track B. The
-strongest displayed public reference audited is Tony V1 at 0.832; Pilkwang V14 at 0.824
-is the strongest exact score-bearing source available as a clean reproduction baseline.
-Track B is a high-ceiling route, not a guaranteed 0.10 gain. Its broad planning
-contribution is approximately +0.02 to +0.06 over a strong ordinary fine-tuned baseline
-if domain and report pretraining work as intended.
+Current project public leaderboard score is 0.758, from submission `55308345` using the
+older frozen-representation system. It must not be compared as though it were the result
+of E007 or Track B. Our first Track B notebook has completed but has not yet created a
+competition submission. The strongest exact score-bearing public reference now audited
+is Pilkwang V15 at 0.891. Track B is a high-ceiling route, not a guaranteed gain of any
+particular size; the V15 evidence changes the immediate priority from speculative model
+replacement to scaling and ensembling the already-matched supervised architecture.
 
 E007 is Track A dense, not Track B. Its verified fold-0 validation trajectory through
 epoch 6 was `0.6663 -> 0.7156 -> 0.7381 -> 0.7418 -> 0.7451 -> 0.7553`. Epoch-6 training
@@ -278,6 +399,7 @@ The detailed source audit is in `RSNA_KNEE_PUBLIC_NOTEBOOK_RESEARCH.md`.
 
 | Author and source | Displayed public score | What the source supports | Important limitation |
 |---|---:|---|---|
+| Pilkwang V15 (`340906482`) | **0.891** | Twenty members from four seeds and five folds, 12 slices with 10 overlapping inference windows, equal per-label rank mean | Scored run is inference-only; training implementation and full training logs are not published |
 | Tony Li, scored V1 (`340809629`), audited latest V4 | 0.832 | Six slots, nine spread slices/slot, three groups, DINO-S final six blocks, CLS + mean + focal features, weak anatomical prior, rank-averaged fold states | Scored V1 source and training bundle unavailable |
 | prvsiyan, scored V7 (`340691808`), audited latest V9 | 0.829 | Multilingual confidence-weighted report labels, six slots, 12–24 slices/slot, target-wise mean/max reduction and greedy rank ensemble | Scored V7 source unavailable |
 | Pilkwang V14 (`340738955`) | 0.824 | Exact six-slot three-slice baseline, physical crop, geometry laterality and per-label slot attention | One grouped holdout, not five-fold OOF |
@@ -767,7 +889,7 @@ Add Modal entry points only after local units are tested.
 
 ### Implementation status at this revision
 
-Local, currently untracked Track B work already exists in:
+Track B code is committed in:
 
 ```text
 src/rsna_knee/track_b_data.py
@@ -777,8 +899,8 @@ tests/test_track_b_data.py
 tests/test_track_b_training.py
 ```
 
-Preserve and extend it. The code now implements the six-slot C0 foundation and the local
-C1 data/training path:
+Preserve and extend it. The code implements the six-slot C0 foundation and the complete
+C1 data, training, recovery, evaluation, and test-inference path:
 
 - deterministic four-group selection over the central 20%–80% band;
 - schema-v2 `[6,G,3,H,W]` caches with masks, fractions and source indices;
@@ -787,11 +909,16 @@ C1 data/training path:
 - duplicate-group padding masks for short series;
 - independent per-slot group sampling during training;
 - deterministic all-group validation with mask-safe mean-logit reduction;
-- a bounded C1 Modal cache canary.
+- bounded and full sharded C1 Modal cache creation with strict finalization;
+- matched C0/C1 remote fold launch and paired-bootstrap evidence;
+- portable epoch checkpoints with cross-account resume identity;
+- strict five-fold OOF finalization;
+- grouped label-free test-cache creation and five-fold inference.
 
-C2, full C1 sharding/finalization, a matched C0/C1 remote fold launcher and the expanded
-slot experiment are not implemented. There is no `tests/test_track_b_modal.py` yet.
-Do not claim those phases complete until their paths and tests exist.
+C2, dense overlapping-window reconstruction, multi-seed orchestration, and the expanded
+slot experiment are not implemented. The next code change should add dense-window OOF
+and inference as a backward-compatible path over the existing C1 cache, not rebuild the
+19.50 GiB cache unless pixel equivalence cannot be demonstrated.
 
 Every Track B run metadata file must include:
 
