@@ -428,6 +428,30 @@ def _physical_crop_channels(
     return values[..., top : top + crop_height, left : left + crop_width]
 
 
+def _physical_center_crop_channels(
+    values: np.ndarray,
+    spacing: np.ndarray | None,
+    *,
+    crop_mm: float,
+    fallback_fraction: float,
+) -> np.ndarray:
+    """Crop a fixed physical extent around the matrix center for stack parity."""
+    height, width = values.shape[-2:]
+    valid_spacing = (
+        spacing is not None
+        and spacing.shape == (2,)
+        and np.isfinite(spacing).all()
+        and np.all((spacing >= 0.05) & (spacing <= 10.0))
+    )
+    if not valid_spacing:
+        return _center_crop_channels(values, fallback_fraction)
+    crop_height = min(height, max(1, int(round(crop_mm / spacing[0]))))
+    crop_width = min(width, max(1, int(round(crop_mm / spacing[1]))))
+    top = (height - crop_height) // 2
+    left = (width - crop_width) // 2
+    return values[..., top : top + crop_height, left : left + crop_width]
+
+
 def preprocess_slice_triplets(
     triplets: Sequence[tuple[DicomSlice, DicomSlice, DicomSlice]],
     *,
@@ -499,6 +523,57 @@ def preprocess_slice_triplets(
     mean = tensor.new_tensor(IMAGENET_MEAN).view(1, 3, 1, 1)
     std = tensor.new_tensor(IMAGENET_STD).view(1, 3, 1, 1)
     return (tensor - mean) / std
+
+
+def preprocess_slice_stack(
+    slices: Sequence[DicomSlice],
+    *,
+    image_size: int = DEFAULT_DINO_CONFIG.image_size,
+    physical_crop_mm: float | None = None,
+    crop_fraction: float = 0.9,
+    normalize: bool = False,
+) -> Any:
+    """Normalize and resize one ordered grayscale stack with shared controls."""
+    if image_size < 1 or (
+        physical_crop_mm is not None and physical_crop_mm <= 0
+    ):
+        raise ValueError("image size and physical crop must be positive")
+    if normalize:
+        raise ValueError("slice stacks must be normalized after forming RGB windows")
+    try:
+        import torch
+        import torch.nn.functional as functional
+    except ImportError as exc:
+        raise RuntimeError("torch is required for DINO preprocessing") from exc
+    if not slices:
+        return torch.empty((0, image_size, image_size), dtype=torch.float32)
+    shapes = {item.pixels.shape for item in slices}
+    if len(shapes) != 1:
+        raise ValueError("selected DICOM slices must have matching pixel dimensions")
+    values = np.stack([item.pixels for item in slices], axis=0).astype(np.float32)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        normalized = np.zeros_like(values, dtype=np.float32)
+    else:
+        low, high = np.percentile(finite, [1.0, 99.0])
+        normalized = _window_pixels(values, float(low), float(high))
+    normalized = (
+        _physical_center_crop_channels(
+            normalized,
+            slices[len(slices) // 2].pixel_spacing,
+            crop_mm=physical_crop_mm,
+            fallback_fraction=crop_fraction,
+        )
+        if physical_crop_mm is not None
+        else _center_crop_channels(normalized, crop_fraction)
+    )
+    tensor = functional.interpolate(
+        torch.from_numpy(np.ascontiguousarray(normalized)).unsqueeze(0),
+        size=(image_size, image_size),
+        mode="bilinear",
+        align_corners=False,
+    )[0]
+    return tensor
 
 
 def preprocess_slices(

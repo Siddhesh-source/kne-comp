@@ -125,6 +125,20 @@ class TBCoverageConfig:
     slice_band_end: float = 0.80
 
 
+@dataclass(frozen=True)
+class TBWindowConfig:
+    """Controls an ordered slice stack used for overlapping 2.5D windows."""
+
+    slice_count: int = 12
+    window_size: int = 3
+    slice_band_start: float = 0.20
+    slice_band_end: float = 0.80
+
+    @property
+    def window_count(self) -> int:
+        return self.slice_count - self.window_size + 1
+
+
 def _finite_float(value: object) -> float | None:
     try:
         result = float(value)
@@ -534,6 +548,32 @@ def select_coverage_group_indices(
     return tuple(groups), tuple(valid), fractions
 
 
+def select_window_slice_indices(
+    count: int,
+    *,
+    config: TBWindowConfig | None = None,
+) -> tuple[int, ...]:
+    """Select one ordered central-band stack for overlapping inference windows."""
+    config = config or TBWindowConfig()
+    if (
+        count < 1
+        or config.slice_count < 1
+        or config.window_size < 1
+        or config.window_size > config.slice_count
+        or not 0
+        <= config.slice_band_start
+        <= config.slice_band_end
+        <= 1
+    ):
+        raise ValueError("invalid Track B window configuration")
+    start = int(config.slice_band_start * (count - 1))
+    end = int(config.slice_band_end * (count - 1))
+    if end <= start:
+        return (count // 2,) * config.slice_count
+    indices = np.linspace(start, end, config.slice_count).astype(int).tolist()
+    return tuple(int(value) for value in indices)
+
+
 def canonicalize_three_slice_image(
     image: Tensor,
     plane: str,
@@ -550,6 +590,24 @@ def canonicalize_three_slice_image(
     if normalized_plane in {"COR", "AX"}:
         return torch.flip(image, dims=(-1,))
     return torch.flip(image, dims=(0,))
+
+
+def canonicalize_slice_stack(
+    images: Tensor,
+    plane: str,
+    laterality: LateralityDecision,
+) -> Tensor:
+    """Map an ordered grayscale stack to the same left-knee convention."""
+    if images.ndim != 3:
+        raise ValueError("slice stack must have shape [slices, height, width]")
+    normalized_plane = _plane(plane)
+    if normalized_plane is None:
+        raise ValueError("plane is invalid")
+    if laterality.value != "R":
+        return images
+    if normalized_plane in {"COR", "AX"}:
+        return torch.flip(images, dims=(-1,))
+    return torch.flip(images, dims=(0,))
 
 
 def preprocessing_fingerprint(config: TBP0DataConfig) -> str:
@@ -658,6 +716,44 @@ def _selected_dicom_groups(
         torch.tensor(fractions, dtype=torch.float32),
         torch.tensor(groups, dtype=torch.int32),
     )
+
+
+def _selected_dicom_stack(
+    items: Sequence[str | PathLike[str] | Any],
+    *,
+    window: TBWindowConfig,
+) -> tuple[list[Any], Tensor]:
+    """Order once and decode only the slices in one dense central-band stack."""
+    from .dicom_extraction import (
+        _order_dicom_slices,
+        _read_dicom_header,
+        decode_dicom_slice,
+        load_dicom_slices,
+    )
+
+    if not items:
+        raise ValueError("slot series must contain at least one slice")
+    are_paths = all(isinstance(item, (str, PathLike)) for item in items)
+    ordered = (
+        _order_dicom_slices(
+            [
+                _read_dicom_header(item, source_index=index)
+                for index, item in enumerate(items)
+            ]
+        )
+        if are_paths
+        else load_dicom_slices(items)
+    )
+    indices = select_window_slice_indices(len(ordered), config=window)
+    if are_paths:
+        decoded = {
+            index: decode_dicom_slice(ordered[index].source)
+            for index in set(indices)
+        }
+        selected = [decoded[index] for index in indices]
+    else:
+        selected = [ordered[index] for index in indices]
+    return selected, torch.tensor(indices, dtype=torch.int32)
 
 
 def build_six_slot_images(
@@ -779,6 +875,63 @@ def build_grouped_six_slot_images(
         images.mul(255).round().clamp(0, 255).to(torch.uint8),
         valid_mask,
         fractions,
+        source_indices,
+    )
+
+
+def build_windowed_six_slot_images(
+    slot_series: Mapping[str, Sequence[str | PathLike[str] | Any]],
+    laterality: LateralityDecision,
+    *,
+    config: TBP0DataConfig | None = None,
+    window: TBWindowConfig | None = None,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Build six ordered grayscale stacks for overlapping three-slice windows."""
+    from .dicom_extraction import preprocess_slice_stack
+
+    config = config or TBP0DataConfig()
+    window = window or TBWindowConfig()
+    preprocessing_fingerprint(config)
+    select_window_slice_indices(1, config=window)
+    unknown = set(slot_series).difference(TB_P0_SLOT_NAMES)
+    if unknown:
+        raise ValueError(f"unknown TB-P0 slots: {sorted(unknown)}")
+    images = torch.zeros(
+        len(TB_P0_SLOT_NAMES),
+        window.slice_count,
+        config.image_size,
+        config.image_size,
+        dtype=torch.float32,
+    )
+    valid_mask = torch.zeros(len(TB_P0_SLOT_NAMES), dtype=torch.bool)
+    source_indices = torch.full(
+        (len(TB_P0_SLOT_NAMES), window.slice_count),
+        -1,
+        dtype=torch.int32,
+    )
+    for slot_index, slot in enumerate(TB_P0_SLOT_NAMES):
+        items = slot_series.get(slot)
+        if not items:
+            continue
+        selected, indices = _selected_dicom_stack(items, window=window)
+        processed = preprocess_slice_stack(
+            selected,
+            image_size=config.image_size,
+            physical_crop_mm=config.crop_mm,
+            normalize=False,
+        )
+        images[slot_index] = canonicalize_slice_stack(
+            processed,
+            _slot_plane(slot),
+            laterality,
+        )
+        valid_mask[slot_index] = True
+        source_indices[slot_index] = indices
+    if not valid_mask.any():
+        raise ValueError("study has no valid Track B window stacks")
+    return (
+        images.mul(255).round().clamp(0, 255).to(torch.uint8),
+        valid_mask,
         source_indices,
     )
 

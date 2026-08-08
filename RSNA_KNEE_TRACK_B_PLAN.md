@@ -93,10 +93,13 @@ The score-maximization ladder is now:
 1. **Submit and record the completed five-fold C1 baseline.** First verify the completed
    notebook output against the locally backed-up CSV hash. This submission measures the
    real local-to-public relationship for `TB-P0`; do not infer its score from OOF.
-2. **Add dense-window OOF and inference.** Reconstruct the ordered 12 channels already
-   stored in each C1 cache and evaluate all 10 contiguous three-slice windows. Average
-   member probabilities across windows. Do not submit this change until complete OOF
-   confirms that the train/inference window-distribution change is safe.
+2. **Add a dedicated dense-window cache, OOF, and inference path.** The existing C1
+   cache is not sufficient for exact reconstruction: it stores four independently
+   normalized triplets, including the spread C0 control, rather than one jointly
+   normalized ordered 12-slice stack. Build a new fingerprinted stack cache containing
+   12 grayscale slices per slot, then evaluate all 10 contiguous three-slice windows.
+   Train and evaluate matched models on this representation; do not treat it as a
+   test-time-only transformation of the current checkpoints.
 3. **Use metric-aligned ensembling.** Convert every member's predictions to per-label
    percentile ranks, average ranks with equal initial weights, and rank the final
    columns. Compare this with probability averaging on complete OOF. A rank transform
@@ -309,9 +312,11 @@ The original five-fold execution is complete. The next implementation sequence i
 
 1. Download the completed Kaggle notebook output and verify it against the backed-up
    five-fold C1 submission before creating a competition submission.
-2. Add a cache-compatible 10-window evaluator that reconstructs the ordered 12 slices
-   from the four stored triplets without changing source pixels.
-3. Generate complete five-fold dense-window OOF and compare probability averaging with
+2. Build and validate a separate jointly normalized 12-slice stack cache. Do not
+   reconstruct it from the four C1 triplets because their slice selection, crop, and
+   intensity normalization are not equivalent.
+3. Add a 10-window training/evaluation path, generate complete five-fold dense-window
+   OOF, and compare probability averaging with
    per-label rank averaging.
 4. If the OOF gate passes, run the same inference path on test and package a new
    create-only notebook artifact.
@@ -915,10 +920,11 @@ C1 data, training, recovery, evaluation, and test-inference path:
 - strict five-fold OOF finalization;
 - grouped label-free test-cache creation and five-fold inference.
 
-C2, dense overlapping-window reconstruction, multi-seed orchestration, and the expanded
-slot experiment are not implemented. The next code change should add dense-window OOF
-and inference as a backward-compatible path over the existing C1 cache, not rebuild the
-19.50 GiB cache unless pixel equivalence cannot be demonstrated.
+C2, dense overlapping-window training/inference, multi-seed orchestration, and the
+expanded slot experiment are not implemented. Pixel equivalence with the existing C1
+cache cannot be demonstrated because that cache stores independently normalized
+triplets and replaces one dense triplet with the spread C0 control. Dense-window work
+therefore uses a distinct create-only cache namespace and fingerprint.
 
 Every Track B run metadata file must include:
 

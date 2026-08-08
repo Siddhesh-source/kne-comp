@@ -10,8 +10,11 @@ from rsna_knee.track_b_data import (
     SliceGeometry,
     TBCoverageConfig,
     TBP0DataConfig,
+    TBWindowConfig,
     build_grouped_six_slot_images,
     build_six_slot_images,
+    build_windowed_six_slot_images,
+    canonicalize_slice_stack,
     canonicalize_three_slice_image,
     classify_series,
     derive_c0_from_grouped_cache,
@@ -23,6 +26,7 @@ from rsna_knee.track_b_data import (
     select_slot_series,
     select_coverage_group_indices,
     select_three_slice_indices,
+    select_window_slice_indices,
     validate_laterality_agreement,
     write_grouped_six_slot_cache,
     write_six_slot_cache,
@@ -216,6 +220,35 @@ def test_coverage_groups_register_exact_c0_and_mask_padding():
     assert two_mask == (True, True, False, False)
 
 
+def test_window_stack_selects_twelve_ordered_central_band_slices():
+    config = TBWindowConfig()
+    indices = select_window_slice_indices(20, config=config)
+    assert len(indices) == 12
+    assert indices == tuple(sorted(indices))
+    assert indices[0] == 3
+    assert indices[-1] == 15
+    assert config.window_count == 10
+    assert select_window_slice_indices(1, config=config) == (0,) * 12
+    with pytest.raises(ValueError, match="window configuration"):
+        select_window_slice_indices(
+            10,
+            config=TBWindowConfig(slice_count=2, window_size=3),
+        )
+
+
+def test_window_stack_canonicalizes_right_knee_by_plane():
+    stack = torch.arange(4 * 2 * 3).reshape(4, 2, 3)
+    right = LateralityDecision("R", "tag", -30, True)
+    assert torch.equal(
+        canonicalize_slice_stack(stack, "Sagittal", right),
+        torch.flip(stack, dims=(0,)),
+    )
+    assert torch.equal(
+        canonicalize_slice_stack(stack, "Coronal", right),
+        torch.flip(stack, dims=(-1,)),
+    )
+
+
 def test_geometry_recovers_laterality_and_leaves_midline_unresolved():
     left = derive_laterality([geometry_slice("a", z=1, center_x=30)])
     right = derive_laterality([geometry_slice("b", z=1, center_x=-30)])
@@ -329,6 +362,25 @@ def test_grouped_builder_contains_exact_c0_control_and_source_metadata():
     assert indices[0, 0].tolist() == list(select_three_slice_indices(10))
     assert torch.all(indices[~mask] == -1)
     assert torch.all((fractions >= 0) & (fractions <= 1))
+
+
+def test_windowed_builder_uses_shared_stack_normalization_and_source_indices():
+    slices = [
+        dicom(np.arange(64).reshape(8, 8) + index * 10, index)
+        for index in range(20)
+    ]
+    images, mask, indices = build_windowed_six_slot_images(
+        {"SAG_FLUID_FS": slices},
+        LateralityDecision("L", "tag", 30, True),
+        config=TBP0DataConfig(image_size=8, crop_mm=6),
+    )
+    assert images.shape == (6, 12, 8, 8)
+    assert images.dtype == torch.uint8
+    assert mask.tolist() == [True, False, False, False, False, False]
+    assert indices[0].tolist() == list(select_window_slice_indices(20))
+    assert torch.all(indices[~mask] == -1)
+    assert torch.count_nonzero(images[~mask]) == 0
+    assert not torch.equal(images[0, 0], images[0, -1])
 
 
 def test_six_slot_cache_round_trip_is_create_only(tmp_path):
