@@ -28,6 +28,11 @@ checkpoints/
 models/
 submissions/
 
+# Local Modal migration snapshots and runtime logs
+modal-*-transfer/
+kaggle-kernel-inspection/
+*.log
+
 # Private Kaggle packaging and generated notebook assets
 rsna-knee-abnormality-detection/kaggle_hidden_assets/
 rsna-knee-abnormality-detection/kaggle_hidden_inference/heads/

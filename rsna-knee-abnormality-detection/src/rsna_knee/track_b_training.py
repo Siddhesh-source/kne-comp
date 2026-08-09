@@ -1011,7 +1011,7 @@ def _resume_identity(
     competition_cache_fingerprint: str,
     data_fingerprint: str,
     model_structure_fingerprint: str,
-    coverage_arm: Literal["c0", "c1"] | None,
+    coverage_arm: Literal["c0", "c1", "c2"] | None,
     matched_schedule: MatchedCoverageSchedule | None,
 ) -> dict[str, object]:
     return {
@@ -1133,10 +1133,13 @@ def predict_tb_p0_fold_cache(
     batch_size: int | None = None,
     model_factory: Callable[[], nn.Module] | None = None,
     device: str | torch.device = "cuda",
+    coverage_arm: Literal["c1", "c2"] = "c1",
 ) -> pd.DataFrame:
-    """Predict one grouped cache with a validated promoted-C1 fold artifact."""
+    """Predict one grouped cache with a validated C1 or C2 fold artifact."""
     if type(fold) is not int or fold not in range(5):
         raise ValueError("fold must be an integer from 0 through 4")
+    if coverage_arm not in ("c1", "c2"):
+        raise ValueError("prediction coverage arm must be c1 or c2")
     run_dir = Path(run_dir)
     checkpoint_path = run_dir / f"fold-{fold}.pt"
     metadata_path = run_dir / f"fold-{fold}.metadata.json"
@@ -1147,7 +1150,7 @@ def predict_tb_p0_fold_cache(
     if (
         metadata.get("stage") != "TB-P0"
         or metadata.get("fold") != fold
-        or metadata.get("coverage_arm") != "c1"
+        or metadata.get("coverage_arm") != coverage_arm
         or metadata.get("checkpoint") != checkpoint_path.name
         or declared_hash != _sha256_file(checkpoint_path)
     ):
@@ -1162,7 +1165,7 @@ def predict_tb_p0_fold_cache(
         or checkpoint.get("stage") != "TB-P0"
         or checkpoint.get("run_name") != metadata.get("run_name")
         or checkpoint.get("fold") != fold
-        or checkpoint.get("coverage_arm") != "c1"
+        or checkpoint.get("coverage_arm") != coverage_arm
         or checkpoint.get("config") != metadata.get("config")
     ):
         raise ValueError(f"Track B fold {fold} checkpoint is incompatible")
@@ -1213,7 +1216,7 @@ def train_tb_p0_fold(
     git_revision: str,
     source_manifest_sha256: str,
     competition_cache_fingerprint: str,
-    coverage_arm: Literal["c0", "c1"] | None = None,
+    coverage_arm: Literal["c0", "c1", "c2"] | None = None,
     matched_schedule: MatchedCoverageSchedule | None = None,
     resume: bool = True,
     epoch_checkpoint_callback: (
@@ -1228,8 +1231,8 @@ def train_tb_p0_fold(
     if matched_schedule is not None and coverage_arm is None:
         raise ValueError("a matched schedule requires a coverage arm")
     if coverage_arm is not None:
-        if coverage_arm not in ("c0", "c1"):
-            raise ValueError("coverage arm must be c0 or c1")
+        if coverage_arm not in ("c0", "c1", "c2"):
+            raise ValueError("coverage arm must be c0, c1, or c2")
         if coverage_arm == "c0" and matched_schedule is None:
             raise ValueError("the C0 control requires a matched schedule")
     if matched_schedule is not None:
@@ -2063,6 +2066,79 @@ def evaluate_tb_p0_oof(
     }
 
 
+def evaluate_tb_p0_rank_comparison(
+    oof: str | Path | pd.DataFrame,
+    folds: str | Path | pd.DataFrame,
+    targets: str | Path | pd.DataFrame,
+    *,
+    expected_studies: int = 4407,
+) -> dict[str, object]:
+    """Compare raw probabilities with per-label percentile-ranked OOF."""
+    oof_frame = (
+        pd.read_csv(oof, dtype={ID_COLUMN: str})
+        if not isinstance(oof, pd.DataFrame)
+        else oof.copy()
+    )
+    probability = evaluate_tb_p0_oof(
+        oof_frame,
+        folds,
+        targets,
+        expected_studies=expected_studies,
+    )
+    ranked = oof_frame.copy()
+    for label in LABELS:
+        ranked[label] = ranked[label].rank(method="average", pct=True)
+    percentile_rank = evaluate_tb_p0_oof(
+        ranked,
+        folds,
+        targets,
+        expected_studies=expected_studies,
+    )
+    return {
+        "schema_version": 1,
+        "stage": "TB-C2-OOF-rank-comparison",
+        "studies": expected_studies,
+        "rank_method": "per_label_average_percentile_before_report_group_mean",
+        "probability": probability,
+        "percentile_rank": percentile_rank,
+        "rank_minus_probability_macro_auc": (
+            float(percentile_rank["macro_auc"])
+            - float(probability["macro_auc"])
+        ),
+    }
+
+
+def write_tb_p0_rank_comparison(
+    output_dir: str | Path,
+    folds: str | Path | pd.DataFrame,
+    targets: str | Path | pd.DataFrame,
+    *,
+    expected_studies: int = 4407,
+) -> dict[str, object]:
+    """Write a create-only probability-versus-rank OOF comparison."""
+    output_dir = Path(output_dir)
+    oof_path = output_dir / "oof.csv"
+    comparison_path = output_dir / "rank-comparison.json"
+    if not oof_path.is_file():
+        raise FileNotFoundError(oof_path)
+    if comparison_path.exists():
+        raise FileExistsError("Track B rank comparison is already finalized")
+    comparison = evaluate_tb_p0_rank_comparison(
+        oof_path,
+        folds,
+        targets,
+        expected_studies=expected_studies,
+    )
+    comparison["outputs"] = {"oof.csv": _sha256_file(oof_path)}
+    _atomic_bytes(
+        comparison_path,
+        (
+            json.dumps(comparison, indent=2, allow_nan=False) + "\n"
+        ).encode("utf-8"),
+    )
+    return comparison
+
+
 def write_tb_p0_oof_metrics(
     output_dir: str | Path,
     folds: str | Path | pd.DataFrame,
@@ -2099,11 +2175,12 @@ def finalize_tb_p0_run(
     run_name: str,
     expected_studies: int = 4407,
     targets: str | Path | pd.DataFrame | None = None,
+    coverage_arm: Literal["c1", "c2"] = "c1",
 ) -> dict[str, object]:
     """Create exactly one strict five-fold TB-P0 OOF without overwriting."""
     output_dir = Path(output_dir)
-    if expected_studies < 1:
-        raise ValueError("expected_studies must be positive")
+    if expected_studies < 1 or coverage_arm not in ("c1", "c2"):
+        raise ValueError("expected_studies or coverage_arm is invalid")
     fold_frame = (
         pd.read_csv(folds, dtype={ID_COLUMN: str})
         if not isinstance(folds, pd.DataFrame)
@@ -2143,7 +2220,7 @@ def finalize_tb_p0_run(
             metadata.get("fold") != fold
             or metadata.get("run_name") != run_name
             or metadata.get("stage") != "TB-P0"
-            or metadata.get("coverage_arm") != "c1"
+            or metadata.get("coverage_arm") != coverage_arm
             or metadata.get("checkpoint") != checkpoint_path.name
             or metadata.get("oof") != oof_path.name
         ):
@@ -2216,6 +2293,7 @@ def finalize_tb_p0_run(
         "schema_version": 1,
         "run_name": run_name,
         "stage": "TB-P0",
+        "coverage_arm": coverage_arm,
         "folds": list(range(5)),
         "studies": expected_studies,
         "config": reference_config,

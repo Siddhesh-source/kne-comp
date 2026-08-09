@@ -2,6 +2,37 @@
 
 Date: August 7, 2026
 
+## August 8 score-bearing update
+
+This section supersedes the older statement below that Tony Li's `0.832` was the
+strongest displayed score in the audit.
+
+- Our five-fold Track B C1 submission `55351338` scored **`0.849`** using dynamic
+  hidden-DICOM inference.
+- Pilkwang V15, script version `340906482`, has a verified public score of **`0.891`**.
+- V15 loads 20 DINOv2-S members, four seeds across five folds, uses the same six-slot
+  family and 336 px input, evaluates all 10 overlapping three-slice windows from 12
+  ordered slices, and averages per-label percentile ranks.
+- Our current baseline uses five members, 10 training epochs, four fixed groups, and
+  probability averaging. Its strict five-fold OOF macro AUC is `0.8107277038927617`.
+
+The comparison does not prove that any one V15 difference causes the `0.042` public
+score gap. It does provide a much stronger experiment order than another architecture
+search:
+
+1. finish and validate the ordered 12-slice, 10-window cache;
+2. compare probability mean with per-label rank mean on complete OOF;
+3. raise the training ceiling to 30 epochs while retaining fold-local best checkpoints;
+4. train additional seed packs toward four seeds and 20 total members;
+5. test Pilkwang's public graded labels only as a controlled, provenance-checked
+   supervision ablation;
+6. delay DINOv2-B, MRI SSL, report alignment, and specialist models until this supervised
+   scaling baseline is measured.
+
+The local V15 notebook, execution log, output, weight manifest, and public label table
+are archived under `references/pilkwang-rsna-knee-baseline-v1-v340906482/`. Keep its
+`0.891` score and design evidence clearly separated from our own `0.849` result.
+
 ## Bottom line
 
 The public leaders studied here do not reveal a completely separate alternative to

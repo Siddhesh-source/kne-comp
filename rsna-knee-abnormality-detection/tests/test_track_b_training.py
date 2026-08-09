@@ -30,6 +30,7 @@ from rsna_knee.track_b_training import (
     build_tb_p0_optimizer,
     build_tb_p0_scheduler,
     evaluate_tb_p0_oof,
+    evaluate_tb_p0_rank_comparison,
     finalize_tb_p0_run,
     optimizer_updates_per_epoch,
     paired_report_group_bootstrap,
@@ -39,6 +40,7 @@ from rsna_knee.track_b_training import (
     validate_matched_coverage_results,
     verify_registered_c0_sample,
     write_tb_p0_oof_metrics,
+    write_tb_p0_rank_comparison,
     write_matched_coverage_evidence,
 )
 
@@ -1030,6 +1032,32 @@ def test_tb_p0_finalizer_requires_exact_five_fold_oof(tmp_path):
     )
     assert metrics["studies"] == 10
     assert (output / "metrics.json").is_file()
+    rank_comparison = write_tb_p0_rank_comparison(
+        output,
+        folds,
+        targets,
+        expected_studies=10,
+    )
+    expected_rank_comparison = evaluate_tb_p0_rank_comparison(
+        oof,
+        folds,
+        targets,
+        expected_studies=10,
+    )
+    assert rank_comparison["probability"]["macro_auc"] == pytest.approx(
+        expected_rank_comparison["probability"]["macro_auc"]
+    )
+    assert rank_comparison["percentile_rank"]["macro_auc"] == pytest.approx(
+        expected_rank_comparison["percentile_rank"]["macro_auc"]
+    )
+    assert (output / "rank-comparison.json").is_file()
+    with pytest.raises(FileExistsError, match="already finalized"):
+        write_tb_p0_rank_comparison(
+            output,
+            folds,
+            targets,
+            expected_studies=10,
+        )
     with pytest.raises(FileExistsError, match="already finalized"):
         write_tb_p0_oof_metrics(
             output,

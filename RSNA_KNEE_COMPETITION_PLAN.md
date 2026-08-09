@@ -1,6 +1,24 @@
 # RSNA knee abnormality detection: execution plan
 
-Last updated: August 7, 2026 (Phase A closed same day). Every fact below was verified against the repository and the Kaggle API on that date. If the repo disagrees, trust the repo and update this file.
+Last updated: August 8, 2026 (revised after the Track B C1 score and Pilkwang V15 audit). If the repo disagrees, trust the repo and update this file.
+
+## Revision note: track names and current direction
+
+Earlier versions of this document called dense end-to-end training "Phase B." That phase is
+now named **Track A dense** to avoid confusion with the separate **Track B** plan.
+
+- **Track A dense:** E007, up to 46 sampled 2.5D positions at 336 px, a slice transformer,
+  and per-label gated pooling.
+- **Track B coverage-aware sparse:** six acquisition-aware slots, several spread slice
+  groups per slot, a small diagnosis-specific head, then optional MRI SSL and image-report
+  alignment.
+- **CNN route:** an independent 2.5D representation retained for ensemble diversity.
+
+The notebook audit in `RSNA_KNEE_PUBLIC_NOTEBOOK_RESEARCH.md` changed the priority, not the
+historical record. E007 remains a valid dense experiment, but it is now a one-fold gate.
+Do not launch its remaining folds unless its final fold-0 result or per-label
+complementarity justifies the cost. The primary next supervised route is the
+coverage-aware sparse model described in `RSNA_KNEE_TRACK_B_PLAN.md`.
 
 ---
 
@@ -8,27 +26,35 @@ Last updated: August 7, 2026 (Phase A closed same day). Every fact below was ver
 
 | | |
 |---|---|
-| Public LB | 0.758 (submission 55308345) |
-| Rank | 122 / 312 |
+| Public LB | **0.849** (submission `55351338`, Track B C1) |
+| Previous dynamic LB | 0.758 (submission `55308345`) |
 | Leader / 10th | 0.932 / 0.866 |
 | Deadline | 2026-10-22 (11 weeks) |
-| Best pseudo OOF | 0.793 (E005) |
-| Best gold OOF | 0.736 (E005) |
+| Best strict Track B OOF | **0.8107277** (`TB-P0`, 4,407 studies, five folds) |
+| Previous pseudo / gold OOF | 0.793 / 0.736 (E005) |
 | Label system gold AUC | 0.896 (E003) |
 
 Gap decomposition:
 
 ```
 0.932  leader
-0.896  our label supervision ceiling     <- supervision loss, >= 0.036
-0.793  our pseudo OOF
-0.758  our public LB
-0.736  our gold OOF                      <- representation loss, ~0.160
+0.891  audited Pilkwang V15 public reference
+0.849  our Track B C1 public LB
+0.811  our strict Track B C1 OOF
+0.758  previous dynamic public LB
 ```
 
-Representation is the dominant term, supervision is a hard cap below the leader, head tuning is worth ~0.01. Effort follows that order.
+The `0.091` public gain confirms that end-to-end acquisition-aware imaging was the
+dominant missing component. The next measured gap is within the same model family:
+Pilkwang V15 adds overlapping ordered windows, longer training, four seeds and rank
+ensembling. Test those changes before a new backbone or expensive pretraining.
 
-**Phase A closed 2026-08-07** (Section 6). The D1 fix is real (+0.013 gold AUC, single seed) and is now merged into `main`. The silence-prior calibration (D2) added nothing measurable on top of it. The numbers above are still E005's registered values; they have not been re-ensembled or resubmitted with the fix (that is the deferred A5 decision). Effort now moves to Phase B.
+**Phase A closed 2026-08-07** (Section 6). The D1 fix is real (+0.013 gold AUC, single seed) and is now merged into `main`. The silence-prior calibration (D2) added nothing measurable on top of it. The numbers above are still E005's registered values; they have not been re-ensembled or resubmitted with the fix (that is the deferred A5 decision). Imaging work moved first to the Track A dense E007 gate and now prioritizes coverage-aware Track B.
+
+**Latest verified E007 fold-0 trajectory:** validation macro AUC
+`0.6663 -> 0.7156 -> 0.7381 -> 0.7418 -> 0.7451` over epochs 1 through 5. Epoch-5
+training loss was `0.2806`, but its AUC gain was only `+0.0033`. This is preliminary single-fold
+evidence, not a complete OOF result and not directly comparable to a Kaggle public score.
 
 E005 config, for reproduction:
 
@@ -92,8 +118,8 @@ E004 → E005 moved gold OOF 0.698 → 0.736 through head changes alone. Further
 
 Two points:
 
-- **LoRA is not a strategy here.** ViT-S/14 is 21M params; unfreezing the last six blocks at low LR is simpler, has no adapter-placement risk, and is what the public 0.770 notebook does. LoRA matters when memory binds; at 336 px on an A10 it does not.
-- **The 2.5D CNN is a genuine second route**, not a fallback. Cheaper, faster, decorrelated errors. Worth as much in the ensemble as a second ViT. That is why Phase B runs both.
+- **LoRA is not a strategy here.** ViT-S/14 is 21M params; unfreezing the last six blocks at low LR is simpler, has no adapter-placement risk, and is shared by the strongest audited sparse systems. LoRA matters when memory binds; at 336 px on an A10 it does not.
+- **The 2.5D CNN is a genuine second route**, not a fallback. It is cheaper, faster and likely to make different errors. Train it when OOF evidence supports paying for another representation.
 
 Levers by value per unit effort: (1) fix D1/D2, +0.01–0.03, no GPU. (2) train the encoder, +0.04–0.08, unavoidable. (3) report distillation, +0.01–0.03. (4) ensemble + TTA, +0.01–0.03. (5) SSL adaptation, +0.02–0.04. Stacked with overlap: 0.87–0.92.
 
@@ -177,25 +203,33 @@ Uploaded the three files to `metadata/` on `modal-secondary`, ran four `train_he
 | p10 | 0.7116 | 0.7598 | 0.7366 | +0.0003 / −0.0005 / +0.0049 |
 | p05 | 0.7109 | 0.7597 | 0.7371 | −0.0004 / −0.0006 / +0.0054 |
 
-Recorded as rows `A4-p50-control`, `A4-p25`, `A4-p10`, `A4-p05` in `experiments.csv`, decision `hold`. None of the three priors clears the gate (beat control on restricted pseudo AUC without losing gold) by a margin distinguishable from noise (bootstrap CI width ~±0.05). The D1 fix alone accounts for essentially all of the measured gain; D2 does not matter at this scale. **Phase A gate for moving to Phase B is met by the fix alone** — no further label-only work is expected to move the needle before Phase B lands.
+Recorded as rows `A4-p50-control`, `A4-p25`, `A4-p10`, `A4-p05` in `experiments.csv`, decision `hold`. None of the three priors clears the gate (beat control on restricted pseudo AUC without losing gold) by a margin distinguishable from noise (bootstrap CI width ~±0.05). The D1 fix alone accounts for essentially all of the measured gain; D2 does not matter at this scale. **The Phase A gate for image training was met by the fix alone.** No further label-only work is expected to move the needle before Track B.
 
 ### A5 (deferred): promote the fix into a submitted ensemble
 
-Not yet done, and not blocking Phase B. Retrain a 3-seed ensemble on `consensus-labels-v1.csv` with the fix (matching E005's seeds), evaluate, record as `E006`, and decide whether to submit. Cheap (~15 A10-minutes) and low-risk since it changes no architecture, only the already-verified label semantics — but it competes for time against Phase B, which has a much larger ceiling. Revisit once Phase B has a first working checkpoint, or sooner if a low-risk submission is wanted to confirm the local-to-LB relationship still holds.
+Not yet done, and not blocking Track B. Retrain a 3-seed ensemble on `consensus-labels-v1.csv` with the fix (matching E005's seeds), evaluate, record as `E006`, and decide whether to submit. It is cheap (~15 A10-minutes) and changes no architecture, but Track B has a much larger ceiling. Revisit once Track B has a first working checkpoint, or sooner if a low-risk submission is wanted to confirm the local-to-LB relationship still holds.
 
 ### A6 (deferred, likely low value given A4): forced-decision silence resolution
 
-Replaces the constant prior with a per-study LLM estimate instead of a flat number. Given that A4 showed the flat prior itself does not matter, a per-study prior is unlikely to matter either — the head already handles ambiguity well once it is not forced toward 1. Keep on the list only as a fallback if Phase B stalls and D2 needs re-examination with better evidence.
+Replaces the constant prior with a per-study LLM estimate instead of a flat number. Given that A4 showed the flat prior itself does not matter, a per-study prior is unlikely to matter either. The head already handles ambiguity once it is not forced toward 1. Keep this only as a fallback if Track B stalls and D2 needs better evidence.
 
 ### A7 (deferred, low value): bootstrap-gated blend weights
 
-`specialist_labeler.py` ~line 190 already sweeps specialist weight over `(0, 0.25, 0.5, 0.75, 1.0)` and `consensus.py` takes one global value. Make it per label and only move off 0.5 when a 1,000-sample bootstrap over the gold set favours the alternative in ≥80% of resamples. Expected ≤0.005 — not worth doing before Phase B.
+`specialist_labeler.py` ~line 190 already sweeps specialist weight over `(0, 0.25, 0.5, 0.75, 1.0)` and `consensus.py` takes one global value. Make it per label and only move off 0.5 when a 1,000-sample bootstrap over the gold set favours the alternative in ≥80% of resamples. Expected ≤0.005, so it is not worth doing before Track B.
 
 ---
 
-## 7. Phase B: end-to-end image training
+## 7. Track A dense: end-to-end image training
 
-This phase decides whether we finish near 0.80 or near 0.90. 2–3 weeks, ~30 A10h, ~$40. Expected LB **0.84–0.87**.
+This section preserves the dense route that was previously named Phase B. Its engineering
+work, cache and E007 checkpoint remain useful. The public audit does not support treating
+it as the default architecture for all remaining folds.
+
+Track A processes up to 46 positions per study and must infer which positions explain one
+study-level target vector. That gives broad coverage but weak credit assignment and high
+compute on only 4,407 labelled studies. Track B reduces the training burden by sampling
+one group from each of six clinically meaningful acquisition slots while accumulating
+broader coverage across epochs.
 
 ### B0: switch the physical crop to 150 mm — done, committed `87301cc`
 
@@ -243,11 +277,24 @@ Both use the Phase A winning label file and `folds-v1.csv`.
 
 The first attempt exposed a bfloat16-to-float32 scatter mismatch under CUDA autocast. Commit `42e9e62` fixed the boundary and added a CPU autocast regression test. A functional retry then completed and wrote its checkpoint/OOF/metadata. Commit `f088dc5` added explicit first/last-step telemetry, and the final approved smoke on `modal-secondary` passed: fold 0, one epoch, 64-study cap, 19 validation rows, loss **0.7501 → 0.5108**, checkpoint written, and peak allocated CUDA memory **1.82 GB**, far below the 22 GiB gate. The 0.426 validation AUC is not decision-quality at this sample size. Full suite: **133 passed**.
 
-### B4: full runs
+### B4: E007 fold-0 gate, remaining dense folds on hold
 
-B1 five folds on `modal-secondary`, B2 five folds on `modal-tertiary`, in parallel. 2–4 h wall clock each. Concatenate fold OOFs into single 4,407-row files and evaluate.
+The original plan was to launch five DINO folds and five CNN folds in parallel. Do not do
+that automatically.
 
-**Gate for the whole phase:** at least one run reaches gold macro AUC > 0.82 **and** restricted pseudo macro AUC > 0.85.
+E007 fold 0 has reached 0.7451 validation macro AUC at epoch 5, after 0.7418 at epoch 4.
+Let the bounded run finish or early-stop, then inspect its final and per-label results.
+
+Dense promotion rules:
+
+- `>= 0.80`: train the remaining E007 folds after checking the frozen metrics;
+- `0.77-0.80`: retain only if per-label or ensemble evidence shows complementarity;
+- `0.74-0.77`: treat as a tuning result; do not fund four more identical folds;
+- `< 0.74`: reject the configuration.
+
+The stronger original full-phase gate still applies before calling Track A a primary
+model: gold macro AUC above 0.82 and mention-restricted pseudo macro AUC above 0.85 on a
+complete five-fold OOF.
 
 If neither clears it, diagnose in this order:
 
@@ -256,19 +303,67 @@ If neither clears it, diagnose in this order:
 3. Data-loading bug (AUC ≈ 0.5) → dump 10 cached studies to PNG and look at them. Worth doing once regardless.
 4. Label or fold misalignment (high train AUC, random val AUC) → assert study IDs at every join.
 
-Do not enter Phase C until the gate passes. Record as E007/E008 and submit the better run.
+Record E007 honestly as a one-fold dense gate unless all five folds are later completed.
+Do not concatenate or present a partial fold as full OOF.
 
 ---
 
-## 8. Phases C–F
+## 8. Primary next phase: coverage-aware Track B
 
-**C, report distillation (weeks 4–6, may overlap B).** Embed every report with a multilingual model (e.g. `intfloat/multilingual-e5-base`), PCA to 384 dims, store aligned to `report_group`, add a cosine auxiliary loss at weight 0.3, rerun the better of B1/B2 changing nothing else. Gate: gold AUC improves over the same seed and folds without the auxiliary loss. Expected +0.01–0.03, zero inference cost.
+The four audited public notebooks cluster around one model family:
 
-**D, anatomy and resolution (weeks 5–8, only after B passes).** Fixed geometry crops at higher resolution for the meniscal horns, ACL, MCL, patellofemoral compartment, and popliteal fossa; per-label plane gating (fracture and contusion lean fluid-sensitive, OA labels lean structural); a 448 px experiment restricted to the smallest structures. Gate: the labels a crop targets must improve — macro drift is not acceptance.
+| Public notebook | Displayed score | Transferable evidence |
+|---|---:|---|
+| Tony Li, scored V1 / audited latest V4 | 0.832 | Six slots, nine spread slices, focal patch pooling, weak anatomical prior and fold rank averaging |
+| prvsiyan, scored V7 / audited latest V9 | 0.829 | Up to 24 slices per slot; controlled 3/6/12-slice curve of 0.7536/0.7726/0.7866 |
+| Pilkwang V14 | 0.824 | Efficient six-slot, three-slice, partially fine-tuned DINO baseline |
+| wguesdon V5 | 0.815 | Dense frozen plus sparse fine-tuned complementarity |
 
-**E, ensemble and packaging (weeks 8–11).** Rank-average B, C, D models plus the frozen v3 head model if it exists; per-label weights from OOF with bootstrap gating, never from the LB; h-flip and slice-offset TTA; a full offline dry run of the Kaggle notebook with measured runtime. Gate: beats every component on both frozen metrics and finishes under 4 h on the T4 pair, leaving margin under the 9 h limit. Expected 0.88–0.92.
+Tony's score-bearing V1 source and prvsiyan's V7 source were not retrievable through the
+Kaggle CLI. Their latest sources were audited, so visible features must not be claimed as
+proven causes of the historical score.
 
-**F, optional SSL adaptation.** DINO or MIM on the 730k unlabeled slices for 20–40 A10h, then repeat Phase B from the adapted weights. Highest ceiling on the list, but the gain overlaps Phase C. Only with real time to spare.
+The primary experiment ladder is:
+
+1. `TB-C0`: six slots, one three-slice group, fold 0 control.
+2. `TB-C1`: four groups, 12 slices per slot, same fold and training configuration.
+3. `TB-C2`: eight groups, 24 slices per slot, only if the 12-slice curve is still rising
+   enough to justify the extra inference encodes.
+4. Promote the winning coverage to `TB-P0` and produce strict five-fold OOF.
+5. Ablate focal top-k patch pooling, weak anatomical priors and learned slot-group
+   attention one at a time.
+6. Profile candidate acquisition types, then compare six versus 10/12 slots under the
+   same total image-encode budget. None of the audited leaders proves that more than six
+   hard slots helps.
+7. Test DINOv2-B only after coverage and aggregation have plateaued.
+8. Compare ordinary DINO initialization with MRI SSL and fold-specific report alignment.
+
+Why coverage comes first: prvsiyan reported `+0.033` from 3 to 12 slices, while modest
+resolution changes were around `0.001` in two runs. These are one-holdout pseudo-label
+results, not guaranteed OOF gains, but they are stronger evidence than a backbone swap.
+
+Track B implementation, leakage controls, cache requirements and promotion gates live in
+`RSNA_KNEE_TRACK_B_PLAN.md`.
+
+### Later routes
+
+**Report alignment and distillation.** Keep full-report supervision. The preferred
+representation experiment is fold-specific image-report alignment before supervised
+fine-tuning. Auxiliary report-embedding distillation remains a cheaper separate ablation.
+Do not fit a global learned report projection across validation folds.
+
+**Anatomy and resolution.** Add targeted views only after per-label Track B OOF identifies
+a need. Test 130 versus 150 mm and 224 versus 336 px after the slice-coverage decision.
+Do not jump to 448 px before proving that input resolution, rather than missed slices, is
+the bottleneck.
+
+**MRI SSL.** Adapt DINO on the approximately 730,000 competition slices and permitted
+external knee MRI. Competition-domain SSL used for OOF must exclude each validation fold.
+Compare initialization only against matched `TB-P0`.
+
+**CNN and ensemble.** Train the CNN after the sparse baseline is credible or when a
+measured dense/sparse model needs a decorrelated partner. Blend only complete OOF
+predictions. Dense E007 may remain valuable even when its standalone score is weaker.
 
 ---
 
@@ -279,19 +374,21 @@ Do not enter Phase C until the gate passes. Record as E007/E008 and submit the b
 | Phase A retrains (4) | 1 | 30 min | $2 |
 | B0 canary | 0.1 | 5 min | $0.20 |
 | B1 image cache (CPU preferred) | 2 | 40 min | $3 |
-| B1 fine-tune, 5 folds | 15 | 3 h | $20 |
-| B2 CNN, 5 folds | 12 | 2.5 h | $16 |
-| Phase C | 15 | 3 h | $20 |
-| Phase D | 20 | 4 h | $27 |
-| Phase E | 5 | 2 h | $7 |
-| **Total without F** | **70** | | **$95** |
-| Phase F | 40 | 12 h | $54 |
+| E007 fold-0 dense gate | measured per epoch; let current run stop naturally | active | measured after finalization |
+| Remaining E007 dense folds | on hold | — | — |
+| TB-C0/C1 fold-0 coverage gate | measure with bounded smoke | TBD | approval required |
+| TB-C2 24-slice gate | conditional | TBD | approval required |
+| Five-fold TB-P0 | project from winning coverage smoke | TBD | approval required |
+| MRI SSL | 20–40 | TBD | approval required |
+| Fold-specific report alignment | 10–20 | TBD | approval required |
+| CNN, five folds | 12 provisional | 2.5 h provisional | $16 provisional |
+| Ensemble and packaging | 5 provisional | 2 h provisional | $7 provisional |
 
 Compute is not the constraint; deciding what to run is.
 
 One row per run in `experiments.csv` (existing columns: `experiment_id, parent_id, change, label_version, fold_version, gold_oof_auc, pseudo_oof_auc, public_lb_auc, runtime_minutes, git_revision, decision, notes`). Put the gold bootstrap interval and the restricted pseudo AUC in `notes`.
 
-Actual/planned IDs: `A0`–`A4-p05` Phase A (closed, see Section 6), `E006` optional 3-seed fix-only ensemble (A5, deferred), `E007` DINOv2 partial unfreeze, `E008` EfficientNetV2-S, `E009` report distillation, `E010` anatomy crops, `E011` final ensemble.
+Actual/planned IDs: `A0`–`A4-p05` Phase A (closed, see Section 6), `E006` optional 3-seed fix-only ensemble (A5, deferred), `E007` Track A dense DINOv2 partial unfreeze, `TB-C0/C1/C2` coverage gates, `TB-P0` five-fold supervised Track B baseline, `TB-P1/P2/P3` pretraining initializations, `E008` EfficientNetV2-S, and a later OOF-gated final ensemble.
 
 **Promotion criteria** — all five: restricted pseudo AUC improves; gold does not fall more than 0.01 and shows no broad per-label regression; the gain is not one label improving while several decline; projected inference stays under 4 h on the T4 pair; the pipeline writes a valid submission even when a component fails.
 
@@ -310,7 +407,7 @@ Actual/planned IDs: `A0`–`A4-p05` Phase A (closed, see Section 6), `E006` opti
 | Tertiary inodes | 169.7% of limit | write to `rsna-knee-artifacts` or use secondary |
 | LB overfitting | >6 submissions without a prior hypothesis | stop submitting, return to local evidence |
 
-**Hard stops — report, do not improvise:** a Phase A variant improves locally but drops the LB below 0.758; Phase B fails its gate after both the overfit and underfit remedies; any single launch would exceed 10 A10 hours; anything asks to delete or overwrite existing artifacts.
+**Hard stops — report, do not improvise:** a Phase A variant improves locally but drops the LB below 0.758; Track B fails its supervised gate after documented coverage and optimization checks; any single launch would exceed 10 A10 hours; anything asks to delete or overwrite existing artifacts.
 
 ---
 
@@ -322,7 +419,7 @@ Actual/planned IDs: `A0`–`A4-p05` Phase A (closed, see Section 6), `E006` opti
 4. Do not evaluate a label variant against its own targets.
 5. Do not pass `--overwrite` to Modal training jobs.
 6. Do not add file trees to `rsna-knee-data` on `modal-tertiary`.
-7. Do not chase backbone swaps (DINOv3, C-RADIO) before Phase B. Frozen-feature swaps are worth 0.01–0.03; Phase B is worth 0.04–0.08. OrthoFoundation is unusable: CC BY-NC-ND, no public weights.
+7. Do not chase backbone swaps (DINOv3, C-RADIO or DINOv2-B) before the Track B coverage gate. The public audit found stronger measured evidence for slice coverage than capacity. OrthoFoundation is unusable: CC BY-NC-ND, no public weights.
 
 ---
 
@@ -334,9 +431,8 @@ Actual/planned IDs: `A0`–`A4-p05` Phase A (closed, see Section 6), `E006` opti
 
 **Policy.** The 265 GB archive stays off the local machine — local is CSVs, labeling, code, tracking; Modal does preprocessing, caching, extraction, training; Kaggle does final inference. Confirm competition rules and license before sending reports to any third-party LLM API.
 
-**Reference notebooks** (Kaggle-displayed scores, Aug 6): DINOv2 at meniscus resolution 0.802; Pilkwang baseline v1 0.770; DINOv2 fork 0.668; EDA to 2.5D 0.630; DINOsaur V2 0.621. A sweep of the cached sources in `references/notebooks/` on Aug 7 found only one score stated in notebook text (0.621, superseded by its own author). Treat the cached copies as sources of technique, not verified score. Unadopted techniques worth taking: the 150 mm crop (task B0), bootstrap-gated blend weights (A7), two-position-set slot assignment for unusual protocols. **Every public result above 0.77 puts gradients into the encoder** — independent confirmation of Phase B.
+**Reference notebooks** (Kaggle-displayed scores, audited Aug 7): Tony V1 0.832, prvsiyan V7 0.829, Pilkwang V14 0.824, and wguesdon V5 0.815. Tony's score-bearing V1 and prvsiyan's V7 sources were unavailable; their latest downloadable V4 and V9 sources were audited instead. Pilkwang V14 and wguesdon V5 are exact score-bearing sources. See `RSNA_KNEE_PUBLIC_NOTEBOOK_RESEARCH.md` and the local, gitignored `references/top-scoring/README.md`. Treat public results as design evidence, never as repository OOF.
 
-**v3 preprocessing.** Committed at `79d3f97`, physical crop corrected 130mm → 150mm at `87301cc` (B0). First canary (130mm, superseded) on `modal-tertiary`, Aug 7: 18 studies, 0 failures, 2,304 dim, 46 slices, 53.1 s, 2.95 s/study, fingerprint `29cc3fbb...`. Current canary (150mm) same day: 18 studies, 0 failures, 2,304 dim, 46 slices, 21.05 s, 1.17 s/study, fingerprint `c7d19329...`, sha256 `997a74ab...`. Contents: 2.5D adjacent-slice triplets, DINO blocks 9 and 12, per-series windowing p1–p99.5, PixelSpacing-aware 150mm physical crop with 90% center-crop fallback, laterality normalization (right-knee sagittal reversal, coronal/axial flip), persisted fractional positions and slot IDs. Reused verbatim by Phase B through `build_study_images`.
+**v3 preprocessing.** Committed at `79d3f97`, physical crop corrected 130mm → 150mm at `87301cc` (B0). First canary (130mm, superseded) on `modal-tertiary`, Aug 7: 18 studies, 0 failures, 2,304 dim, 46 slices, 53.1 s, 2.95 s/study, fingerprint `29cc3fbb...`. Current canary (150mm) same day: 18 studies, 0 failures, 2,304 dim, 46 slices, 21.05 s, 1.17 s/study, fingerprint `c7d19329...`, sha256 `997a74ab...`. Contents: 2.5D adjacent-slice triplets, DINO blocks 9 and 12, per-series windowing p1–p99.5, PixelSpacing-aware 150mm physical crop with 90% center-crop fallback, laterality normalization (right-knee sagittal reversal, coronal/axial flip), persisted fractional positions and slot IDs. Reused by Track A dense. Track B may reuse source images and geometry code, but coverage-aware six-slot caches require separate fingerprints.
 
 **Links:** [competition](https://www.kaggle.com/competitions/rsna-knee-abnormality-detection) · [notebooks](https://www.kaggle.com/competitions/rsna-knee-abnormality-detection/code) · [meniscus resolution](https://www.kaggle.com/code/wguesdon/rsna-knee-dinov2-at-meniscus-resolution) · [pilkwang baseline](https://www.kaggle.com/code/pilkwang/rsna-knee-baseline-v1)
-</content>

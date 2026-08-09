@@ -46,10 +46,13 @@ folds" instructions later in this document.
 - Five-fold test inference completed for the three visible test studies. The verified
   local submission SHA-256 is
   `d06008abe740ed2ff1557bb83ce41e610d376ee1c6a5172d272337f3af5b4133`.
-- Kaggle notebook `ththjyj/rsna-knee-private-hidden-inference` version 3 completed
-  successfully. As of this update, its output has **not** been submitted to the
-  competition. The latest competition submission remains `55308345`, public score
-  `0.758`.
+- Kaggle notebook `ththjyj/rsna-knee-private-hidden-inference` version 1 completed
+  successfully with dynamic hidden-DICOM inference. Its visible output matched the
+  Modal reference IDs and ordering; the maximum probability difference was
+  `0.000153017`, consistent with GPU numerical variation.
+- Submission `55351338`, `Dynamic Track B C1 five-fold DINOv2 ensemble`, completed with
+  public score **`0.849`**. This is the current project public leaderboard score and a
+  gain of `0.091` over submission `55308345` at `0.758`.
 
 ### New public frontier evidence
 
@@ -90,9 +93,9 @@ derived artifact.
 
 The score-maximization ladder is now:
 
-1. **Submit and record the completed five-fold C1 baseline.** First verify the completed
-   notebook output against the locally backed-up CSV hash. This submission measures the
-   real local-to-public relationship for `TB-P0`; do not infer its score from OOF.
+1. **Completed: submit and record the five-fold C1 baseline.** Submission `55351338`
+   scored `0.849`, confirming that the six-slot C1 architecture transfers strongly from
+   strict OOF to the hidden competition test.
 2. **Add a dedicated dense-window cache, OOF, and inference path.** The existing C1
    cache is not sufficient for exact reconstruction: it stores four independently
    normalized triplets, including the spread C0 control, rather than one jointly
@@ -163,7 +166,7 @@ Phase 5  Dense-window, rank-mean, and multi-seed expansion        ACTIVE
          |
 Phase 6  MRI SSL and report-alignment initialization tests        AFTER SUPERVISED SCALE
          |
-Phase 7  OOF-gated blend and Kaggle submission                    BASELINE READY
+Phase 7  OOF-gated blend and Kaggle submission                    BASELINE SCORED 0.849
 ```
 
 Phases 3 and 4 are complete. The full C1 cache and matched fold-0 gate both passed on
@@ -182,7 +185,7 @@ resulting five-fold baseline reached strict OOF macro AUC `0.8107277038927617`.
 | 4. Supervised baseline | Establish the number that every pretraining idea must beat | Five-fold `TB-P0`, exactly 4,407 OOF rows, per-label metrics, runtime and memory | **Complete, 0.81073 OOF** |
 | 5. Supervised scale and inference | Close the verified V15 gap before changing model families | Ten overlapping windows, four seeds x five folds, longer fold-local training, OOF probability/rank comparison | **Active** |
 | 6. Representation pretraining | Test whether MRI adaptation or reports improve the same model | Matched `TB-P1`, `TB-P2`, and `TB-P3`; only initialization changes in the first comparison | After supervised scale |
-| 7. Ensemble and submission | Keep additions only if they add standalone or complementary OOF signal | OOF-gated blend, inference-cost check, reproducible notebook and scored submission | Baseline notebook complete; submission pending |
+| 7. Ensemble and submission | Keep additions only if they add standalone or complementary OOF signal | OOF-gated blend, inference-cost check, reproducible notebook and scored submission | **Baseline scored 0.849; expansion pending** |
 
 ### What is already finished
 
@@ -339,8 +342,13 @@ The original five-fold execution is complete. The next implementation sequence i
 | C1 improves by at least 0.01 and the curve appears unsaturated | Consider C2 as a separate fold-0 test |
 | C1 fails with suspicious masks, ordering or missingness | Fix data validity first; do not interpret it as a model result |
 
-The C2 cache is not approved or implemented. C2 reaches up to 48 group encodes per study
-at inference, close to dense Track A, so it must earn that cost.
+The original `TB-C2` proposal remains the conditional 24-slice, eight-group coverage
+test. Separately, Phase 5 now has an implemented schema-v3 **ordered 12-slice window
+cache** that evaluates the 10 contiguous three-slice windows used by Pilkwang V15. The
+code calls this a C2 window cache, but it must not be confused with the older 24-slice
+`TB-C2` experiment. The ordered-window cache is currently being migrated from the
+disabled `modal-tertiary` workspace to `modal-quaternary`: 37 of 40 shard manifests are
+complete, and missing shards are exactly `21`, `23`, and `31`.
 
 For the paired bootstrap, resample validation report groups rather than individual rows
 and recompute the C1-minus-C0 macro AUC difference. Use it as stability evidence, not as
@@ -383,13 +391,14 @@ Verified shared facts:
 - Dense supervised DINO run E007 is stopped and incomplete.
 - Frozen evaluation targets and folds must never change.
 
-Current project public leaderboard score is 0.758, from submission `55308345` using the
-older frozen-representation system. It must not be compared as though it were the result
-of E007 or Track B. Our first Track B notebook has completed but has not yet created a
-competition submission. The strongest exact score-bearing public reference now audited
-is Pilkwang V15 at 0.891. Track B is a high-ceiling route, not a guaranteed gain of any
-particular size; the V15 evidence changes the immediate priority from speculative model
-replacement to scaling and ensembling the already-matched supervised architecture.
+Current project public leaderboard score is **0.849**, from submission `55351338` using
+the five-fold Track B C1 ensemble. The previous dynamic hidden-test submission
+`55308345` scored `0.758`. The strongest exact score-bearing public reference now
+audited is Pilkwang V15 at **0.891**. The remaining `0.042` public-score gap, together
+with the close architectural match, changes the immediate priority from speculative
+model replacement to scaling and ensembling the validated supervised architecture:
+ordered overlapping windows, longer fold-local training, multiple seed packs, and
+per-label rank averaging.
 
 E007 is Track A dense, not Track B. Its verified fold-0 validation trajectory through
 epoch 6 was `0.6663 -> 0.7156 -> 0.7381 -> 0.7418 -> 0.7451 -> 0.7553`. Epoch-6 training
