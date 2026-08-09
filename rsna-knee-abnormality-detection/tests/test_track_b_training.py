@@ -1,4 +1,5 @@
 import json
+import hashlib
 
 import shutil
 
@@ -18,6 +19,7 @@ from rsna_knee.track_b_data import (
     write_windowed_six_slot_cache,
 )
 from rsna_knee.track_b_training import (
+    C2MatrixSpec,
     MaskedPerLabelSlotAttention,
     SixSlotStudyEncoder,
     SparseDinoCLSMeanBackbone,
@@ -27,10 +29,13 @@ from rsna_knee.track_b_training import (
     TBP0RigidAugmentation,
     align_tb_p0_cached_data,
     build_matched_coverage_schedule,
+    build_c2_experiment_matrix,
     build_tb_p0_optimizer,
     build_tb_p0_scheduler,
     evaluate_tb_p0_oof,
     evaluate_tb_p0_rank_comparison,
+    c2_experiment_matrix_manifest,
+    finalize_tb_c2_oof_ensemble,
     finalize_tb_p0_run,
     optimizer_updates_per_epoch,
     paired_report_group_bootstrap,
@@ -1070,5 +1075,182 @@ def test_tb_p0_finalizer_requires_exact_five_fold_oof(tmp_path):
             output,
             folds,
             run_name="tb-p0-five-fold",
+            expected_studies=10,
+        )
+
+
+def _c2_matrix_spec(**overrides):
+    values = {
+        "matrix_id": "c2-scale-v1",
+        "base_run_name": "tb-c2",
+        "crops_mm": (150, 130),
+        "seeds": (20260829, 20260828),
+        "git_revision": "revision",
+        "folds_sha256": "a" * 64,
+        "targets_sha256": "b" * 64,
+        "cache_fingerprints": ((150, "d" * 64), (130, "c" * 64)),
+        "run_name_overrides": (
+            (130, 20260828, "tb-c2-active"),
+        ),
+    }
+    values.update(overrides)
+    return C2MatrixSpec(**values)
+
+
+def test_c2_matrix_is_canonical_and_hashes_full_identity():
+    first = _c2_matrix_spec()
+    second = _c2_matrix_spec(
+        crops_mm=(130, 150),
+        seeds=(20260828, 20260829),
+        cache_fingerprints=((130, "c" * 64), (150, "d" * 64)),
+    )
+    members = build_c2_experiment_matrix(first)
+    assert [member.member_id for member in members] == [
+        "c130-s20260828",
+        "c130-s20260829",
+        "c150-s20260828",
+        "c150-s20260829",
+    ]
+    assert members[0].run_name == "tb-c2-active"
+    assert (
+        c2_experiment_matrix_manifest(first)["matrix_fingerprint"]
+        == c2_experiment_matrix_manifest(second)["matrix_fingerprint"]
+    )
+    changed = _c2_matrix_spec(epochs=29)
+    assert (
+        c2_experiment_matrix_manifest(first)["matrix_fingerprint"]
+        != c2_experiment_matrix_manifest(changed)["matrix_fingerprint"]
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"crops_mm": (130, 130)},
+        {"crops_mm": (True,)},
+        {"seeds": (1, 1)},
+        {"seeds": (False,)},
+        {"folds": (0, 1, 2, 3)},
+        {"folds_sha256": "short"},
+        {"cache_fingerprints": ((130, "c" * 64),)},
+        {
+            "run_name_overrides": (
+                (130, 20260828, "duplicate"),
+                (150, 20260829, "duplicate"),
+            )
+        },
+    ],
+)
+def test_c2_matrix_rejects_ambiguous_identity(overrides):
+    with pytest.raises(ValueError):
+        build_c2_experiment_matrix(_c2_matrix_spec(**overrides))
+
+
+def _write_finalized_c2_member(path, run_name, frame):
+    path.mkdir()
+    oof_path = path / "oof.csv"
+    frame.to_csv(oof_path, index=False)
+    digest = hashlib.sha256(oof_path.read_bytes()).hexdigest()
+    metadata = {
+        "schema_version": 1,
+        "stage": "TB-P0",
+        "coverage_arm": "c2",
+        "run_name": run_name,
+        "studies": len(frame),
+        "oof": "oof.csv",
+        "output_hashes": {"oof.csv": digest},
+        "config": {"seed": run_name},
+        "provenance": {"competition_cache_fingerprint": run_name},
+    }
+    (path / "metadata.json").write_text(json.dumps(metadata))
+
+
+def test_c2_oof_ensemble_uses_equal_probability_and_member_ranks(tmp_path):
+    study_ids = [f"study-{index}" for index in range(10)]
+    folds = pd.DataFrame(
+        {
+            ID_COLUMN: study_ids,
+            "report_group": study_ids,
+            "fold": np.arange(10) % 5,
+        }
+    )
+    targets = pd.DataFrame({ID_COLUMN: study_ids})
+    member_one = pd.DataFrame({ID_COLUMN: study_ids})
+    member_two = pd.DataFrame({ID_COLUMN: study_ids})
+    for label_index, label in enumerate(LABELS):
+        target = ((np.arange(10) + label_index) % 2).astype(float)
+        targets[label] = target
+        member_one[label] = 0.15 + 0.7 * target
+        member_two[label] = 0.25 + 0.5 * target + np.arange(10) * 0.001
+    _write_finalized_c2_member(tmp_path / "member-one", "run-one", member_one)
+    _write_finalized_c2_member(tmp_path / "member-two", "run-two", member_two)
+
+    metadata = finalize_tb_c2_oof_ensemble(
+        tmp_path / "ensemble",
+        {
+            "member-one": tmp_path / "member-one",
+            "member-two": tmp_path / "member-two",
+        },
+        folds,
+        targets,
+        ensemble_name="c2-equal-v1",
+        expected_studies=10,
+    )
+
+    probability = pd.read_csv(tmp_path / "ensemble" / "probability-oof.csv")
+    rank = pd.read_csv(tmp_path / "ensemble" / "rank-oof.csv")
+    expected_probability = (
+        member_one.loc[:, LABELS].to_numpy()
+        + member_two.loc[:, LABELS].to_numpy()
+    ) / 2
+    expected_rank = (
+        member_one.loc[:, LABELS].rank(method="average", pct=True)
+        + member_two.loc[:, LABELS].rank(method="average", pct=True)
+    ) / 2
+    expected_rank = expected_rank.rank(method="average", pct=True)
+    assert np.allclose(probability.loc[:, LABELS], expected_probability)
+    assert np.allclose(rank.loc[:, LABELS], expected_rank)
+    assert metadata["probability_metrics"]["macro_auc"] == pytest.approx(1.0)
+    assert metadata["rank_metrics"]["macro_auc"] == pytest.approx(1.0)
+    assert set(metadata["members"]) == {"member-one", "member-two"}
+    with pytest.raises(FileExistsError):
+        finalize_tb_c2_oof_ensemble(
+            tmp_path / "ensemble",
+            {
+                "member-one": tmp_path / "member-one",
+                "member-two": tmp_path / "member-two",
+            },
+            folds,
+            targets,
+            ensemble_name="c2-equal-v1",
+            expected_studies=10,
+        )
+
+
+def test_c2_oof_ensemble_rejects_tampered_or_incomplete_members(tmp_path):
+    study_ids = [f"study-{index}" for index in range(10)]
+    folds = pd.DataFrame(
+        {
+            ID_COLUMN: study_ids,
+            "report_group": study_ids,
+            "fold": np.arange(10) % 5,
+        }
+    )
+    targets = pd.DataFrame({ID_COLUMN: study_ids})
+    member = pd.DataFrame({ID_COLUMN: study_ids})
+    for label_index, label in enumerate(LABELS):
+        targets[label] = ((np.arange(10) + label_index) % 2).astype(float)
+        member[label] = 0.1 + targets[label] * 0.8
+    _write_finalized_c2_member(tmp_path / "one", "run-one", member)
+    _write_finalized_c2_member(tmp_path / "two", "run-two", member)
+    with (tmp_path / "two" / "oof.csv").open("a") as handle:
+        handle.write("\n")
+    with pytest.raises(ValueError, match="metadata"):
+        finalize_tb_c2_oof_ensemble(
+            tmp_path / "ensemble",
+            {"member-one": tmp_path / "one", "member-two": tmp_path / "two"},
+            folds,
+            targets,
+            ensemble_name="c2-equal-v1",
             expected_studies=10,
         )

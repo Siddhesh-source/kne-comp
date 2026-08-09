@@ -11,7 +11,7 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Callable, Literal, Mapping
 
 import numpy as np
 import pandas as pd
@@ -55,6 +55,140 @@ class TBP0Config:
     gradient_checkpointing: bool = False
     seed: int = 20260828
     num_workers: int = 0
+
+
+@dataclass(frozen=True)
+class C2MatrixSpec:
+    matrix_id: str
+    base_run_name: str
+    crops_mm: tuple[int, ...]
+    seeds: tuple[int, ...]
+    git_revision: str
+    folds_sha256: str
+    targets_sha256: str
+    cache_fingerprints: tuple[tuple[int, str], ...]
+    run_name_overrides: tuple[tuple[int, int, str], ...] = ()
+    folds: tuple[int, ...] = (0, 1, 2, 3, 4)
+    epochs: int = 30
+    batch_size: int = 8
+
+
+@dataclass(frozen=True)
+class C2MatrixMember:
+    member_id: str
+    run_name: str
+    crop_mm: int
+    seed: int
+    folds: tuple[int, ...]
+    epochs: int
+    batch_size: int
+    cache_fingerprint: str
+
+
+def build_c2_experiment_matrix(
+    spec: C2MatrixSpec,
+) -> tuple[C2MatrixMember, ...]:
+    """Expand one immutable C2 matrix in canonical crop/seed order."""
+    identifier = re.compile(r"[a-z0-9][a-z0-9-]{2,63}")
+    sha256 = re.compile(r"[0-9a-f]{64}")
+    if (
+        not identifier.fullmatch(spec.matrix_id)
+        or not identifier.fullmatch(spec.base_run_name)
+        or not spec.git_revision.strip()
+        or not sha256.fullmatch(spec.folds_sha256)
+        or not sha256.fullmatch(spec.targets_sha256)
+        or type(spec.epochs) is not int
+        or not 1 <= spec.epochs <= 30
+        or type(spec.batch_size) is not int
+        or not 1 <= spec.batch_size <= 16
+        or spec.folds != (0, 1, 2, 3, 4)
+    ):
+        raise ValueError("C2 matrix identity or training controls are invalid")
+    crops = tuple(sorted(spec.crops_mm))
+    seeds = tuple(sorted(spec.seeds))
+    if (
+        not crops
+        or len(set(crops)) != len(crops)
+        or any(type(crop) is not int or crop not in (130, 150) for crop in crops)
+        or not seeds
+        or len(set(seeds)) != len(seeds)
+        or any(type(seed) is not int or seed < 0 for seed in seeds)
+    ):
+        raise ValueError("C2 matrix crops and seeds must be unique and valid")
+    cache_fingerprints = dict(spec.cache_fingerprints)
+    if (
+        len(cache_fingerprints) != len(spec.cache_fingerprints)
+        or set(cache_fingerprints) != set(crops)
+        or any(
+            not sha256.fullmatch(fingerprint)
+            for fingerprint in cache_fingerprints.values()
+        )
+    ):
+        raise ValueError("C2 matrix cache fingerprints are incomplete")
+    overrides: dict[tuple[int, int], str] = {}
+    for crop, seed, run_name in spec.run_name_overrides:
+        key = (crop, seed)
+        if (
+            key in overrides
+            or crop not in crops
+            or seed not in seeds
+            or not identifier.fullmatch(run_name)
+        ):
+            raise ValueError("C2 matrix run-name override is invalid")
+        overrides[key] = run_name
+    members: list[C2MatrixMember] = []
+    run_names: set[str] = set()
+    for crop in crops:
+        for seed in seeds:
+            member_id = f"c{crop}-s{seed}"
+            run_name = overrides.get(
+                (crop, seed),
+                f"{spec.base_run_name}-{member_id}",
+            )
+            if len(run_name) > 64 or run_name in run_names:
+                raise ValueError("C2 matrix generated duplicate or long run names")
+            run_names.add(run_name)
+            members.append(
+                C2MatrixMember(
+                    member_id=member_id,
+                    run_name=run_name,
+                    crop_mm=crop,
+                    seed=seed,
+                    folds=spec.folds,
+                    epochs=spec.epochs,
+                    batch_size=spec.batch_size,
+                    cache_fingerprint=cache_fingerprints[crop],
+                )
+            )
+    return tuple(members)
+
+
+def c2_experiment_matrix_manifest(
+    spec: C2MatrixSpec,
+) -> dict[str, object]:
+    """Return canonical create-only matrix content and its fingerprint."""
+    import hashlib
+
+    members = build_c2_experiment_matrix(spec)
+    payload = {
+        "schema_version": 1,
+        "stage": "TB-C2-experiment-matrix",
+        "matrix_id": spec.matrix_id,
+        "git_revision": spec.git_revision,
+        "folds_sha256": spec.folds_sha256,
+        "targets_sha256": spec.targets_sha256,
+        "members": [asdict(member) for member in members],
+    }
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return {
+        **payload,
+        "matrix_fingerprint": hashlib.sha256(canonical).hexdigest(),
+    }
 
 
 def validate_tb_p0_config(config: TBP0Config) -> None:
@@ -2106,6 +2240,226 @@ def evaluate_tb_p0_rank_comparison(
             - float(probability["macro_auc"])
         ),
     }
+
+
+def _tb_c2_member_oof(
+    member_id: str,
+    run_dir: str | Path,
+    folds: str | Path | pd.DataFrame,
+    targets: str | Path | pd.DataFrame,
+    *,
+    expected_studies: int,
+) -> tuple[pd.DataFrame, dict[str, object], dict[str, object]]:
+    run_dir = Path(run_dir)
+    oof_path = run_dir / "oof.csv"
+    metadata_path = run_dir / "metadata.json"
+    if not oof_path.is_file() or not metadata_path.is_file():
+        raise ValueError(f"C2 ensemble member {member_id} is not finalized")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    actual_hash = _sha256_file(oof_path)
+    if (
+        metadata.get("schema_version") != 1
+        or metadata.get("stage") != "TB-P0"
+        or metadata.get("coverage_arm") != "c2"
+        or metadata.get("studies") != expected_studies
+        or metadata.get("oof") != "oof.csv"
+        or metadata.get("output_hashes", {}).get("oof.csv") != actual_hash
+    ):
+        raise ValueError(f"C2 ensemble member {member_id} metadata is invalid")
+    frame = pd.read_csv(oof_path, dtype={ID_COLUMN: str})
+    metrics = evaluate_tb_p0_oof(
+        frame,
+        folds,
+        targets,
+        expected_studies=expected_studies,
+    )
+    return frame, metadata, metrics
+
+
+def _tb_c2_member_correlations(
+    members: Mapping[str, pd.DataFrame],
+    fold_frame: pd.DataFrame,
+) -> dict[str, object]:
+    ordered_ids = fold_frame[ID_COLUMN].astype(str).tolist()
+    groups = (
+        fold_frame.set_index(ID_COLUMN)
+        .loc[ordered_ids, "report_group"]
+        .astype(str)
+        .to_numpy()
+    )
+    names = sorted(members)
+    by_label: dict[str, object] = {}
+    for label in LABELS:
+        grouped: list[np.ndarray] = []
+        for name in names:
+            values = (
+                members[name]
+                .set_index(ID_COLUMN)
+                .loc[ordered_ids, label]
+                .to_numpy(dtype=np.float64)
+            )
+            grouped.append(
+                pd.DataFrame({"group": groups, "value": values})
+                .groupby("group", sort=True)["value"]
+                .mean()
+                .to_numpy()
+            )
+        matrix: list[list[float | None]] = []
+        for left in grouped:
+            row: list[float | None] = []
+            for right in grouped:
+                if np.ptp(left) == 0 or np.ptp(right) == 0:
+                    row.append(None)
+                else:
+                    value = pd.Series(left).corr(
+                        pd.Series(right),
+                        method="spearman",
+                    )
+                    row.append(float(value) if np.isfinite(value) else None)
+            matrix.append(row)
+        by_label[label] = {
+            "members": names,
+            "matrix": matrix,
+            "null_reason": "constant report-group predictions",
+        }
+    return by_label
+
+
+def finalize_tb_c2_oof_ensemble(
+    output_dir: str | Path,
+    member_run_dirs: Mapping[str, str | Path],
+    folds: str | Path | pd.DataFrame,
+    targets: str | Path | pd.DataFrame,
+    *,
+    ensemble_name: str,
+    expected_studies: int = 4407,
+) -> dict[str, object]:
+    """Finalize equal-probability and equal-rank complete-OOF C2 blends."""
+    if (
+        not re.fullmatch(r"[a-z0-9][a-z0-9-]{2,63}", ensemble_name)
+        or len(member_run_dirs) < 2
+        or len(set(member_run_dirs)) != len(member_run_dirs)
+    ):
+        raise ValueError("C2 ensemble identity or member count is invalid")
+    output_dir = Path(output_dir)
+    output_paths = {
+        "probability": output_dir / "probability-oof.csv",
+        "rank": output_dir / "rank-oof.csv",
+        "metadata": output_dir / "ensemble-metadata.json",
+    }
+    if any(path.exists() for path in output_paths.values()):
+        raise FileExistsError("C2 OOF ensemble is already finalized")
+    fold_frame = (
+        pd.read_csv(folds, dtype={ID_COLUMN: str})
+        if not isinstance(folds, pd.DataFrame)
+        else folds.copy()
+    )
+    validate_fold_assignments(fold_frame, 5)
+    fold_frame[ID_COLUMN] = fold_frame[ID_COLUMN].astype(str)
+    if len(fold_frame) != expected_studies:
+        raise ValueError("C2 ensemble fold assignments are incomplete")
+    ordered_ids = fold_frame[ID_COLUMN].tolist()
+    member_frames: dict[str, pd.DataFrame] = {}
+    member_metadata: dict[str, object] = {}
+    member_metrics: dict[str, object] = {}
+    for member_id in sorted(member_run_dirs):
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{2,63}", member_id):
+            raise ValueError("C2 ensemble member ID is invalid")
+        frame, metadata, metrics = _tb_c2_member_oof(
+            member_id,
+            member_run_dirs[member_id],
+            fold_frame,
+            targets,
+            expected_studies=expected_studies,
+        )
+        member_frames[member_id] = (
+            frame.set_index(ID_COLUMN).loc[ordered_ids].reset_index()
+        )
+        member_metadata[member_id] = {
+            "run_name": metadata["run_name"],
+            "oof_sha256": metadata["output_hashes"]["oof.csv"],
+            "metadata_sha256": _sha256_file(
+                Path(member_run_dirs[member_id]) / "metadata.json"
+            ),
+            "provenance": metadata.get("provenance"),
+            "config": metadata.get("config"),
+        }
+        member_metrics[member_id] = metrics
+    probability = pd.DataFrame({ID_COLUMN: ordered_ids})
+    ranked_members: list[pd.DataFrame] = []
+    for frame in member_frames.values():
+        values = frame.loc[:, LABELS].astype(np.float64)
+        ranked_members.append(values.rank(method="average", pct=True))
+    for label in LABELS:
+        probability[label] = np.mean(
+            [frame[label].to_numpy() for frame in member_frames.values()],
+            axis=0,
+        )
+    rank = pd.DataFrame({ID_COLUMN: ordered_ids})
+    for label in LABELS:
+        averaged = np.mean(
+            [frame[label].to_numpy() for frame in ranked_members],
+            axis=0,
+        )
+        rank[label] = pd.Series(averaged).rank(method="average", pct=True)
+    probability_metrics = evaluate_tb_p0_oof(
+        probability,
+        fold_frame,
+        targets,
+        expected_studies=expected_studies,
+    )
+    rank_metrics = evaluate_tb_p0_oof(
+        rank,
+        fold_frame,
+        targets,
+        expected_studies=expected_studies,
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _atomic_bytes(
+        output_paths["probability"],
+        probability.to_csv(index=False).encode("utf-8"),
+    )
+    _atomic_bytes(
+        output_paths["rank"],
+        rank.to_csv(index=False).encode("utf-8"),
+    )
+    metadata = {
+        "schema_version": 1,
+        "stage": "TB-C2-OOF-ensemble",
+        "ensemble_name": ensemble_name,
+        "studies": expected_studies,
+        "members": member_metadata,
+        "member_metrics": member_metrics,
+        "blend": {
+            "probability": "equal arithmetic mean",
+            "rank": (
+                "per-member per-label average percentile, equal arithmetic "
+                "mean, final per-label average percentile"
+            ),
+            "weights": "exactly 1/member_count",
+        },
+        "probability_metrics": probability_metrics,
+        "rank_metrics": rank_metrics,
+        "rank_minus_probability_macro_auc": (
+            float(rank_metrics["macro_auc"])
+            - float(probability_metrics["macro_auc"])
+        ),
+        "report_group_spearman": _tb_c2_member_correlations(
+            member_frames,
+            fold_frame,
+        ),
+        "outputs": {
+            output_paths["probability"].name: _sha256_file(
+                output_paths["probability"]
+            ),
+            output_paths["rank"].name: _sha256_file(output_paths["rank"]),
+        },
+    }
+    _atomic_bytes(
+        output_paths["metadata"],
+        (json.dumps(metadata, indent=2, allow_nan=False) + "\n").encode(),
+    )
+    return metadata
 
 
 def write_tb_p0_rank_comparison(
