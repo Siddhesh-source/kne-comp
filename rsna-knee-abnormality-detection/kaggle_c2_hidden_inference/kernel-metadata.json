@@ -1,0 +1,20 @@
+{
+  "id": "ththjyj/rsna-knee-private-c2-hidden-inference",
+  "title": "RSNA Knee Private C2 Hidden Inference",
+  "code_file": "inference.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": false,
+  "competition_sources": [
+    "rsna-knee-abnormality-detection"
+  ],
+  "dataset_sources": [
+    "ththjyj/rsna-knee-private-c2-hidden-assets"
+  ],
+  "kernel_sources": [],
+  "model_sources": [],
+  "machine_shape": "NvidiaTeslaT4"
+}
