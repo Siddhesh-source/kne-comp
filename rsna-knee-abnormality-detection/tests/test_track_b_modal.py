@@ -1,4 +1,6 @@
 import importlib.util
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -148,4 +150,104 @@ def test_stage_cache_locally_rejects_incomplete_or_existing_destination(tmp_path
             source,
             destination,
             expected_studies=1,
+        )
+
+
+def c2_matrix_payload(module):
+    payload = {
+        "schema_version": 1,
+        "stage": "TB-C2-experiment-matrix",
+        "matrix_id": "c2-scale-v1",
+        "git_revision": "revision",
+        "folds_sha256": "a" * 64,
+        "targets_sha256": "b" * 64,
+        "members": [
+            {
+                "member_id": "c130-s1",
+                "run_name": "tb-c2-c130-s1",
+                "crop_mm": 130,
+                "seed": 1,
+                "folds": [0, 1, 2, 3, 4],
+                "epochs": 30,
+                "batch_size": 8,
+                "cache_fingerprint": "c" * 64,
+            },
+            {
+                "member_id": "c150-s2",
+                "run_name": "tb-c2-c150-s2",
+                "crop_mm": 150,
+                "seed": 2,
+                "folds": [0, 1, 2, 3, 4],
+                "epochs": 30,
+                "batch_size": 8,
+                "cache_fingerprint": "d" * 64,
+            },
+        ],
+    }
+    payload["matrix_fingerprint"] = module._c2_matrix_payload_fingerprint(
+        payload
+    )
+    return payload
+
+
+def test_c2_matrix_manifest_validation_and_selection_are_strict():
+    module = load_track_b_modal()
+    payload = c2_matrix_payload(module)
+    members = module._validate_c2_matrix_manifest(
+        payload,
+        matrix_id="c2-scale-v1",
+        matrix_fingerprint=payload["matrix_fingerprint"],
+    )
+    assert [member["member_id"] for member in members] == [
+        "c130-s1",
+        "c150-s2",
+    ]
+    assert [
+        member["member_id"]
+        for member in module._select_c2_matrix_members(members, "c150-s2")
+    ] == ["c150-s2"]
+    with pytest.raises(ValueError, match="unique registered"):
+        module._select_c2_matrix_members(members, "c130-s1,c130-s1")
+    payload["members"][0]["epochs"] = 29
+    with pytest.raises(ValueError, match="fingerprint"):
+        module._validate_c2_matrix_manifest(
+            payload,
+            matrix_id="c2-scale-v1",
+            matrix_fingerprint=payload["matrix_fingerprint"],
+        )
+
+
+def test_finalized_c2_run_validation_checks_all_declared_hashes(tmp_path):
+    module = load_track_b_modal()
+    oof = tmp_path / "oof.csv"
+    oof.write_text("StudyInstanceUID\nstudy\n")
+    digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+    fold_hashes = {}
+    for fold in range(5):
+        for suffix in ("pt", "oof.csv"):
+            path = tmp_path / f"fold-{fold}.{suffix}"
+            path.write_bytes(f"{fold}-{suffix}".encode())
+            fold_hashes[path.name] = digest(path)
+    metadata = {
+        "schema_version": 1,
+        "stage": "TB-P0",
+        "coverage_arm": "c2",
+        "run_name": "tb-c2-run",
+        "studies": 4407,
+        "folds": [0, 1, 2, 3, 4],
+        "output_hashes": {"oof.csv": digest(oof)},
+        "fold_artifact_hashes": fold_hashes,
+    }
+    (tmp_path / "metadata.json").write_text(json.dumps(metadata))
+    result = module._validate_finalized_c2_run(
+        tmp_path,
+        run_name="tb-c2-run",
+    )
+    assert result["run_name"] == "tb-c2-run"
+    checkpoint = tmp_path / "fold-0.pt"
+    checkpoint.write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="artifact hash"):
+        module._validate_finalized_c2_run(
+            tmp_path,
+            run_name="tb-c2-run",
         )

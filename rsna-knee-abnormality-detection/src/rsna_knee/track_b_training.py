@@ -170,6 +170,11 @@ def c2_experiment_matrix_manifest(
     import hashlib
 
     members = build_c2_experiment_matrix(spec)
+    serialized_members = []
+    for member in members:
+        serialized = asdict(member)
+        serialized["folds"] = list(member.folds)
+        serialized_members.append(serialized)
     payload = {
         "schema_version": 1,
         "stage": "TB-C2-experiment-matrix",
@@ -177,7 +182,7 @@ def c2_experiment_matrix_manifest(
         "git_revision": spec.git_revision,
         "folds_sha256": spec.folds_sha256,
         "targets_sha256": spec.targets_sha256,
-        "members": [asdict(member) for member in members],
+        "members": serialized_members,
     }
     canonical = json.dumps(
         payload,
@@ -189,6 +194,22 @@ def c2_experiment_matrix_manifest(
         **payload,
         "matrix_fingerprint": hashlib.sha256(canonical).hexdigest(),
     }
+
+
+def write_c2_experiment_matrix_manifest(
+    destination: str | Path,
+    spec: C2MatrixSpec,
+) -> dict[str, object]:
+    """Write one create-only canonical C2 matrix manifest."""
+    destination = Path(destination)
+    if destination.exists():
+        raise FileExistsError("C2 experiment matrix manifest already exists")
+    manifest = c2_experiment_matrix_manifest(spec)
+    _atomic_bytes(
+        destination,
+        (json.dumps(manifest, indent=2, allow_nan=False) + "\n").encode(),
+    )
+    return manifest
 
 
 def validate_tb_p0_config(config: TBP0Config) -> None:
@@ -2333,6 +2354,7 @@ def finalize_tb_c2_oof_ensemble(
     *,
     ensemble_name: str,
     expected_studies: int = 4407,
+    provenance: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
     """Finalize equal-probability and equal-rank complete-OOF C2 blends."""
     if (
@@ -2428,6 +2450,7 @@ def finalize_tb_c2_oof_ensemble(
         "stage": "TB-C2-OOF-ensemble",
         "ensemble_name": ensemble_name,
         "studies": expected_studies,
+        "provenance": dict(provenance or {}),
         "members": member_metadata,
         "member_metrics": member_metrics,
         "blend": {

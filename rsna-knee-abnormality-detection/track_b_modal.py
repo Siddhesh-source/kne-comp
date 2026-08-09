@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -175,6 +176,160 @@ def _parse_folds(value: str) -> list[int]:
     ):
         raise ValueError("folds must contain unique fold indices from 0 through 4")
     return folds
+
+
+def _c2_matrix_payload_fingerprint(payload: dict[str, object]) -> str:
+    """Hash the canonical immutable matrix payload, excluding its own hash."""
+    import json
+
+    canonical_payload = {
+        key: value
+        for key, value in payload.items()
+        if key != "matrix_fingerprint"
+    }
+    canonical = json.dumps(
+        canonical_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _validate_c2_matrix_manifest(
+    payload: object,
+    *,
+    matrix_id: str,
+    matrix_fingerprint: str,
+) -> list[dict[str, object]]:
+    """Validate one registered matrix before deriving any worker arguments."""
+    identifier = re.compile(r"[a-z0-9][a-z0-9-]{2,63}")
+    sha256 = re.compile(r"[0-9a-f]{64}")
+    if (
+        not isinstance(payload, dict)
+        or not identifier.fullmatch(matrix_id)
+        or not sha256.fullmatch(matrix_fingerprint)
+        or payload.get("schema_version") != 1
+        or payload.get("stage") != "TB-C2-experiment-matrix"
+        or payload.get("matrix_id") != matrix_id
+        or payload.get("matrix_fingerprint") != matrix_fingerprint
+        or _c2_matrix_payload_fingerprint(payload) != matrix_fingerprint
+    ):
+        raise ValueError("C2 matrix manifest identity or fingerprint is invalid")
+    members = payload.get("members")
+    if not isinstance(members, list) or not members:
+        raise ValueError("C2 matrix manifest has no members")
+    member_ids: set[str] = set()
+    run_names: set[str] = set()
+    for member in members:
+        if (
+            not isinstance(member, dict)
+            or not isinstance(member.get("member_id"), str)
+            or not identifier.fullmatch(str(member["member_id"]))
+            or not isinstance(member.get("run_name"), str)
+            or not identifier.fullmatch(str(member["run_name"]))
+            or type(member.get("crop_mm")) is not int
+            or member.get("crop_mm") not in (130, 150)
+            or type(member.get("seed")) is not int
+            or int(member["seed"]) < 0
+            or member.get("folds") != [0, 1, 2, 3, 4]
+            or type(member.get("epochs")) is not int
+            or not 1 <= int(member["epochs"]) <= 30
+            or type(member.get("batch_size")) is not int
+            or not 1 <= int(member["batch_size"]) <= 16
+            or not isinstance(member.get("cache_fingerprint"), str)
+            or not sha256.fullmatch(str(member["cache_fingerprint"]))
+        ):
+            raise ValueError("C2 matrix member configuration is invalid")
+        member_id = str(member["member_id"])
+        run_name = str(member["run_name"])
+        if member_id in member_ids or run_name in run_names:
+            raise ValueError("C2 matrix member or run name is duplicated")
+        member_ids.add(member_id)
+        run_names.add(run_name)
+    return sorted(members, key=lambda item: str(item["member_id"]))
+
+
+def _load_c2_matrix_manifest(
+    matrix_id: str,
+    matrix_fingerprint: str,
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    import json
+
+    if (
+        not re.fullmatch(r"[a-z0-9][a-z0-9-]{2,63}", matrix_id)
+        or not re.fullmatch(r"[0-9a-f]{64}", matrix_fingerprint)
+    ):
+        raise ValueError("C2 matrix lookup identity is invalid")
+    path = TRACK_B_ROOT / "matrices" / matrix_id / "matrix.json"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return payload, _validate_c2_matrix_manifest(
+        payload,
+        matrix_id=matrix_id,
+        matrix_fingerprint=matrix_fingerprint,
+    )
+
+
+def _select_c2_matrix_members(
+    members: list[dict[str, object]],
+    member_ids: str,
+) -> list[dict[str, object]]:
+    available = {str(member["member_id"]): member for member in members}
+    if not member_ids.strip():
+        return [available[name] for name in sorted(available)]
+    selected = [item.strip() for item in member_ids.split(",")]
+    if (
+        not selected
+        or any(not item for item in selected)
+        or len(selected) != len(set(selected))
+        or any(item not in available for item in selected)
+    ):
+        raise ValueError("member_ids must be unique registered C2 members")
+    return [available[name] for name in selected]
+
+
+def _validate_finalized_c2_run(
+    run_root: Path,
+    *,
+    run_name: str,
+    expected_studies: int = 4407,
+) -> dict[str, object]:
+    import json
+
+    metadata_path = run_root / "metadata.json"
+    if not metadata_path.is_file():
+        raise FileNotFoundError(metadata_path)
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    hashes = metadata.get("output_hashes")
+    fold_hashes = metadata.get("fold_artifact_hashes")
+    if (
+        metadata.get("schema_version") != 1
+        or metadata.get("stage") != "TB-P0"
+        or metadata.get("coverage_arm") != "c2"
+        or metadata.get("run_name") != run_name
+        or metadata.get("studies") != expected_studies
+        or metadata.get("folds") != [0, 1, 2, 3, 4]
+        or not isinstance(hashes, dict)
+        or not isinstance(fold_hashes, dict)
+        or set(hashes) != {"oof.csv"}
+        or set(fold_hashes)
+        != {
+            name
+            for fold in range(5)
+            for name in (f"fold-{fold}.pt", f"fold-{fold}.oof.csv")
+        }
+    ):
+        raise ValueError("finalized C2 run metadata is incompatible")
+    declared = {**fold_hashes, **hashes}
+    if any(
+        not (run_root / name).is_file()
+        or _sha256_file(run_root / name) != expected
+        for name, expected in declared.items()
+    ):
+        raise ValueError("finalized C2 run artifact hash is invalid")
+    return metadata
 
 
 def _stage_cache_locally(
@@ -2941,6 +3096,239 @@ def track_b_evaluate_finetune(run_name: str) -> dict[str, object]:
 
 @app.function(
     image=image,
+    cpu=2,
+    memory=4096,
+    timeout=1800,
+    max_containers=1,
+    volumes={DATA_MOUNT: data_volume, ARTIFACT_MOUNT: artifact_volume},
+)
+def track_b_register_c2_matrix(matrix_json: str) -> dict[str, object]:
+    """Register one immutable matrix after validating all local identities."""
+    import json
+
+    if not isinstance(matrix_json, str) or not matrix_json.strip():
+        raise ValueError("matrix_json must contain a C2 matrix manifest")
+    payload = json.loads(matrix_json)
+    matrix_id = payload.get("matrix_id") if isinstance(payload, dict) else None
+    fingerprint = (
+        payload.get("matrix_fingerprint") if isinstance(payload, dict) else None
+    )
+    if not isinstance(matrix_id, str) or not isinstance(fingerprint, str):
+        raise ValueError("C2 matrix manifest identifiers are missing")
+    members = _validate_c2_matrix_manifest(
+        payload,
+        matrix_id=matrix_id,
+        matrix_fingerprint=fingerprint,
+    )
+    data_volume.reload()
+    artifact_volume.reload()
+    folds_path = DATA_MOUNT / "metadata" / "folds-v1.csv"
+    targets_path = DATA_MOUNT / "metadata" / "consensus-labels-v1.csv"
+    if (
+        not folds_path.is_file()
+        or not targets_path.is_file()
+        or _sha256_file(folds_path) != payload.get("folds_sha256")
+        or _sha256_file(targets_path) != payload.get("targets_sha256")
+    ):
+        raise ValueError("C2 matrix fold or target hashes do not match")
+    for member in members:
+        cache_manifest_path = (
+            TRACK_B_ROOT
+            / "cache"
+            / _window_cache_name(int(member["crop_mm"]), 12, 3)
+            / "full"
+            / "manifest.json"
+        )
+        if not cache_manifest_path.is_file():
+            raise FileNotFoundError(cache_manifest_path)
+        cache_manifest = json.loads(
+            cache_manifest_path.read_text(encoding="utf-8")
+        )
+        if (
+            cache_manifest.get("schema_version") != 3
+            or cache_manifest.get("stage") != "TB-C2-window-cache"
+            or cache_manifest.get("crop_mm") != member["crop_mm"]
+            or cache_manifest.get("studies") != 4407
+            or cache_manifest.get("competition_cache_fingerprint")
+            != member["cache_fingerprint"]
+        ):
+            raise ValueError("C2 matrix cache fingerprint does not match")
+    matrix_root = TRACK_B_ROOT / "matrices" / matrix_id
+    matrix_path = matrix_root / "matrix.json"
+    if matrix_path.exists():
+        existing = json.loads(matrix_path.read_text(encoding="utf-8"))
+        if existing != payload:
+            raise FileExistsError("a different C2 matrix is already registered")
+        return {
+            "matrix_id": matrix_id,
+            "matrix_fingerprint": fingerprint,
+            "members": len(members),
+            "status": "already_registered",
+        }
+    matrix_root.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(matrix_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, allow_nan=False)
+        handle.write("\n")
+    artifact_volume.commit()
+    return {
+        "matrix_id": matrix_id,
+        "matrix_fingerprint": fingerprint,
+        "members": len(members),
+        "status": "registered",
+    }
+
+
+@app.function(
+    image=image,
+    cpu=1,
+    memory=2048,
+    timeout=86400,
+    max_containers=40,
+    volumes={ARTIFACT_MOUNT: artifact_volume},
+)
+def track_b_train_c2_matrix_fold(
+    matrix_id: str,
+    matrix_fingerprint: str,
+    member_id: str,
+    fold: int,
+) -> dict[str, object]:
+    """Derive a C2 fold invocation only from its registered matrix."""
+    if type(fold) is not int or fold not in range(5):
+        raise ValueError("fold must be an integer from 0 through 4")
+    artifact_volume.reload()
+    payload, members = _load_c2_matrix_manifest(
+        matrix_id,
+        matrix_fingerprint,
+    )
+    selected = [
+        member for member in members if member["member_id"] == member_id
+    ]
+    if len(selected) != 1 or fold not in selected[0]["folds"]:
+        raise ValueError("requested C2 matrix member or fold is not registered")
+    member = selected[0]
+    result = track_b_train_c2_fold.remote(
+        str(member["run_name"]),
+        str(payload["git_revision"]),
+        int(member["crop_mm"]),
+        fold,
+        int(member["batch_size"]),
+        int(member["epochs"]),
+        int(member["seed"]),
+    )
+    return {
+        **result,
+        "matrix_id": matrix_id,
+        "matrix_fingerprint": matrix_fingerprint,
+        "member_id": member_id,
+    }
+
+
+@app.function(
+    image=image,
+    cpu=2,
+    memory=8192,
+    timeout=3600,
+    max_containers=1,
+    volumes={DATA_MOUNT: data_volume, ARTIFACT_MOUNT: artifact_volume},
+)
+def track_b_finalize_c2_matrix_member(
+    matrix_id: str,
+    matrix_fingerprint: str,
+    member_id: str,
+) -> dict[str, object]:
+    """Idempotently finalize one complete registered five-fold member."""
+    artifact_volume.reload()
+    _, members = _load_c2_matrix_manifest(matrix_id, matrix_fingerprint)
+    selected = [
+        member for member in members if member["member_id"] == member_id
+    ]
+    if len(selected) != 1:
+        raise ValueError("requested C2 matrix member is not registered")
+    run_name = str(selected[0]["run_name"])
+    run_root = TRACK_B_ROOT / "runs" / run_name
+    if (run_root / "metadata.json").is_file():
+        metadata = _validate_finalized_c2_run(
+            run_root,
+            run_name=run_name,
+        )
+        return {
+            **metadata,
+            "member_id": member_id,
+            "status": "already_finalized",
+        }
+    metadata = track_b_finalize_finetune.remote(run_name, "c2")
+    artifact_volume.reload()
+    _validate_finalized_c2_run(run_root, run_name=run_name)
+    return {**metadata, "member_id": member_id, "status": "finalized"}
+
+
+@app.function(
+    image=image,
+    cpu=2,
+    memory=8192,
+    timeout=3600,
+    max_containers=1,
+    volumes={DATA_MOUNT: data_volume, ARTIFACT_MOUNT: artifact_volume},
+)
+def track_b_finalize_c2_matrix_ensemble(
+    matrix_id: str,
+    matrix_fingerprint: str,
+) -> dict[str, object]:
+    """Finalize the equal-weight OOF ensemble for every declared member."""
+    import json
+
+    from rsna_knee.track_b_training import finalize_tb_c2_oof_ensemble
+
+    data_volume.reload()
+    artifact_volume.reload()
+    _, members = _load_c2_matrix_manifest(matrix_id, matrix_fingerprint)
+    run_dirs = {
+        str(member["member_id"]): (
+            TRACK_B_ROOT / "runs" / str(member["run_name"])
+        )
+        for member in members
+    }
+    for member in members:
+        _validate_finalized_c2_run(
+            run_dirs[str(member["member_id"])],
+            run_name=str(member["run_name"]),
+        )
+    output = TRACK_B_ROOT / "matrices" / matrix_id / "ensemble"
+    metadata_path = output / "ensemble-metadata.json"
+    if metadata_path.is_file():
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if (
+            metadata.get("stage") != "TB-C2-OOF-ensemble"
+            or set(metadata.get("members", {})) != set(run_dirs)
+            or any(
+                not (output / name).is_file()
+                or _sha256_file(output / name) != expected
+                for name, expected in metadata.get("outputs", {}).items()
+            )
+        ):
+            raise ValueError("existing C2 matrix ensemble is incompatible")
+        return {**metadata, "status": "already_finalized"}
+    folds_path = DATA_MOUNT / "metadata" / "folds-v1.csv"
+    targets_path = DATA_MOUNT / "metadata" / "consensus-labels-v1.csv"
+    metadata = finalize_tb_c2_oof_ensemble(
+        output,
+        run_dirs,
+        folds_path,
+        targets_path,
+        ensemble_name=matrix_id,
+        expected_studies=4407,
+        provenance={
+            "matrix_id": matrix_id,
+            "matrix_fingerprint": matrix_fingerprint,
+        },
+    )
+    artifact_volume.commit()
+    return {**metadata, "status": "finalized"}
+
+
+@app.function(
+    image=image,
     gpu="A10",
     cpu=8,
     memory=32768,
@@ -3178,6 +3566,84 @@ def track_b_run_c2_finetune(
     max_containers=1,
     volumes={ARTIFACT_MOUNT: artifact_volume},
 )
+def track_b_run_c2_matrix(
+    matrix_id: str,
+    matrix_fingerprint: str,
+    member_ids: str = "",
+    folds: str = "0,1,2,3,4",
+) -> dict[str, object]:
+    """Run selected registered members, then finalize only complete evidence."""
+    artifact_volume.reload()
+    _, members = _load_c2_matrix_manifest(matrix_id, matrix_fingerprint)
+    selected_members = _select_c2_matrix_members(members, member_ids)
+    selected_folds = _parse_folds(folds)
+    results = list(
+        track_b_train_c2_matrix_fold.starmap(
+            (
+                (
+                    matrix_id,
+                    matrix_fingerprint,
+                    str(member["member_id"]),
+                    fold,
+                )
+                for member in selected_members
+                for fold in selected_folds
+            ),
+            order_outputs=False,
+        )
+    )
+    full_fold_set = (
+        len(selected_folds) == 5
+        and set(selected_folds) == set(range(5))
+    )
+    finalized_members = (
+        [
+            track_b_finalize_c2_matrix_member.remote(
+                matrix_id,
+                matrix_fingerprint,
+                str(member["member_id"]),
+            )
+            for member in selected_members
+        ]
+        if full_fold_set
+        else []
+    )
+    selected_all_members = {
+        str(member["member_id"]) for member in selected_members
+    } == {
+        str(member["member_id"]) for member in members
+    }
+    ensemble = (
+        track_b_finalize_c2_matrix_ensemble.remote(
+            matrix_id,
+            matrix_fingerprint,
+        )
+        if full_fold_set and selected_all_members
+        else None
+    )
+    return {
+        "matrix_id": matrix_id,
+        "matrix_fingerprint": matrix_fingerprint,
+        "folds": sorted(
+            results,
+            key=lambda item: (item["member_id"], item["fold"]),
+        ),
+        "finalized_members": sorted(
+            finalized_members,
+            key=lambda item: item["member_id"],
+        ),
+        "ensemble": ensemble,
+    }
+
+
+@app.function(
+    image=image,
+    cpu=1,
+    memory=2048,
+    timeout=86400,
+    max_containers=1,
+    volumes={ARTIFACT_MOUNT: artifact_volume},
+)
 def track_b_finalize_c2_and_run_finetune(
     run_name: str,
     git_revision: str,
@@ -3364,6 +3830,49 @@ def c2_pipeline(
                 batch_size,
                 epochs,
                 seed,
+                ",".join(str(fold) for fold in selected_folds),
+            ),
+            indent=2,
+        )
+    )
+
+
+@app.local_entrypoint()
+def c2_matrix_register(manifest_path: str) -> None:
+    """Register a locally generated immutable matrix in the active workspace."""
+    import json
+
+    path = Path(manifest_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    print(
+        json.dumps(
+            track_b_register_c2_matrix.remote(
+                json.dumps(payload, allow_nan=False)
+            ),
+            indent=2,
+        )
+    )
+
+
+@app.local_entrypoint()
+def c2_matrix_run(
+    matrix_id: str,
+    matrix_fingerprint: str,
+    member_ids: str = "",
+    folds: str = "0,1,2,3,4",
+) -> None:
+    """Launch a registered matrix from its persistent remote coordinator."""
+    import json
+
+    selected_folds = _parse_folds(folds)
+    print(
+        json.dumps(
+            track_b_run_c2_matrix.remote(
+                matrix_id,
+                matrix_fingerprint,
+                member_ids,
                 ",".join(str(fold) for fold in selected_folds),
             ),
             indent=2,

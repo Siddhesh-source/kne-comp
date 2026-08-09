@@ -46,6 +46,7 @@ from rsna_knee.track_b_training import (
     verify_registered_c0_sample,
     write_tb_p0_oof_metrics,
     write_tb_p0_rank_comparison,
+    write_c2_experiment_matrix_manifest,
     write_matched_coverage_evidence,
 )
 
@@ -1121,6 +1122,20 @@ def test_c2_matrix_is_canonical_and_hashes_full_identity():
         c2_experiment_matrix_manifest(first)["matrix_fingerprint"]
         != c2_experiment_matrix_manifest(changed)["matrix_fingerprint"]
     )
+
+
+def test_c2_matrix_manifest_writer_is_create_only(tmp_path):
+    destination = tmp_path / "matrix.json"
+    manifest = write_c2_experiment_matrix_manifest(
+        destination,
+        _c2_matrix_spec(),
+    )
+    assert json.loads(destination.read_text()) == manifest
+    with pytest.raises(FileExistsError):
+        write_c2_experiment_matrix_manifest(
+            destination,
+            _c2_matrix_spec(),
+        )
 
 
 @pytest.mark.parametrize(
