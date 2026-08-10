@@ -20,6 +20,8 @@ from rsna_knee.track_b_data import (
 )
 from rsna_knee.track_b_training import (
     C2MatrixSpec,
+    EnhancedC2Config,
+    EnhancedC2StudyEncoder,
     MaskedPerLabelSlotAttention,
     SixSlotStudyEncoder,
     SparseDinoCLSMeanBackbone,
@@ -44,6 +46,7 @@ from rsna_knee.track_b_training import (
     train_tb_p0_fold,
     validate_matched_coverage_results,
     verify_registered_c0_sample,
+    weighted_soft_focal_bce,
     write_tb_p0_oof_metrics,
     write_tb_p0_rank_comparison,
     write_c2_experiment_matrix_manifest,
@@ -203,6 +206,66 @@ def test_autocast_scatter_preserves_finite_outputs():
         logits = model(images, mask)
     assert logits.shape == (2, len(LABELS))
     assert torch.isfinite(logits).all()
+
+
+def make_enhanced_encoder():
+    return EnhancedC2StudyEncoder(
+        make_encoder(),
+        hidden_dim=6,
+        dropout=0,
+        recipe=EnhancedC2Config(
+            ema_decay=0.9,
+            auxiliary_loss_weight=0.1,
+        ),
+    )
+
+
+def test_enhanced_c2_emits_removable_streams_and_plane_fallbacks():
+    torch.manual_seed(18)
+    model = make_enhanced_encoder().eval()
+    images, mask = encoder_inputs()
+    mask[:, 2] = False
+    streams = model.prediction_streams(images, mask)
+    assert set(streams) == set(model.STREAMS)
+    assert all(value.shape == (2, len(LABELS)) for value in streams.values())
+    assert all(torch.isfinite(value).all() for value in streams.values())
+    torch.testing.assert_close(streams["axial"], streams["ema-global"])
+
+
+def test_enhanced_auxiliary_head_gradients_are_detached_from_backbone():
+    torch.manual_seed(19)
+    model = make_enhanced_encoder()
+    images, mask = encoder_inputs()
+    features, valid = model.online.encode_slots(images, mask)
+    logits = model.auxiliary_heads["focal-global"](
+        features.detach(),
+        valid,
+    )
+    loss = weighted_soft_focal_bce(
+        logits,
+        torch.full_like(logits, 0.5),
+        torch.ones_like(logits),
+    )
+    loss.backward()
+    assert all(
+        parameter.grad is None
+        for parameter in model.online.parameters()
+    )
+    assert any(
+        parameter.grad is not None
+        for parameter in model.auxiliary_heads["focal-global"].parameters()
+    )
+
+
+@pytest.mark.parametrize("target", [0.0, 0.5, 1.0])
+def test_weighted_soft_focal_bce_is_finite_for_soft_targets(target):
+    logits = torch.tensor([[-100.0, 0.0, 100.0]], requires_grad=True)
+    targets = torch.full_like(logits, target)
+    weights = torch.tensor([[1.0, 0.0, 2.0]])
+    loss = weighted_soft_focal_bce(logits, targets, weights, gamma=2)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert torch.isfinite(logits.grad).all()
 
 
 def test_final_six_dino_blocks_and_norm_are_trainable():
@@ -631,6 +694,102 @@ class TinyTBP0Model(nn.Module):
         del valid_mask
         values = images.mean(dim=tuple(range(1, images.ndim))).unsqueeze(1)
         return self.head(torch.tanh(self.slice_backbone(values)))
+
+
+def tiny_enhanced_model():
+    return EnhancedC2StudyEncoder(
+        make_encoder(),
+        hidden_dim=6,
+        dropout=0,
+        recipe=EnhancedC2Config(
+            ema_decay=0.9,
+            auxiliary_loss_weight=0.1,
+        ),
+    )
+
+
+def test_enhanced_fold_writes_all_hashed_oof_streams(tmp_path):
+    data = aligned_cache_fixture(tmp_path)
+    output = tmp_path / "enhanced"
+    metadata = train_tb_p0_fold(
+        data,
+        output,
+        0,
+        run_name="enhanced-c2-test",
+        config=TBP0Config(
+            feature_dim=8,
+            hidden_dim=6,
+            epochs=1,
+            batch_size=2,
+            seed=81,
+        ),
+        model_factory=tiny_enhanced_model,
+        device="cpu",
+        git_revision="enhanced-revision",
+        source_manifest_sha256="enhanced-manifest",
+        competition_cache_fingerprint="enhanced-cache",
+        coverage_arm="c2",
+    )
+    assert metadata["primary_stream"] == "ema-global"
+    assert set(metadata["prediction_streams"]) == set(
+        EnhancedC2StudyEncoder.STREAMS
+    )
+    for path_name in metadata["prediction_streams"].values():
+        path = output / path_name
+        assert path.is_file()
+        assert metadata["output_hashes"][path_name] == hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+
+
+def test_enhanced_run_finalizes_every_prediction_stream(tmp_path):
+    data = aligned_cache_fixture(tmp_path)
+    output = tmp_path / "enhanced-final"
+    config = TBP0Config(
+        feature_dim=8,
+        hidden_dim=6,
+        epochs=1,
+        batch_size=2,
+        seed=82,
+    )
+    for fold in range(5):
+        train_tb_p0_fold(
+            data,
+            output,
+            fold,
+            run_name="enhanced-c2-final",
+            config=config,
+            model_factory=tiny_enhanced_model,
+            device="cpu",
+            git_revision="enhanced-revision",
+            source_manifest_sha256="enhanced-manifest",
+            competition_cache_fingerprint="enhanced-cache",
+            coverage_arm="c2",
+        )
+    folds = pd.DataFrame(
+        {
+            ID_COLUMN: data.study_ids,
+            "report_group": data.report_groups,
+            "fold": data.folds,
+        }
+    )
+    metadata = finalize_tb_p0_run(
+        output,
+        folds,
+        run_name="enhanced-c2-final",
+        expected_studies=len(data.study_ids),
+        coverage_arm="c2",
+    )
+    assert metadata["primary_stream"] == "ema-global"
+    assert set(metadata["prediction_streams"]) == set(
+        EnhancedC2StudyEncoder.STREAMS
+    )
+    for name in metadata["prediction_streams"].values():
+        path = output / name
+        assert path.is_file()
+        assert metadata["output_hashes"][name] == hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
 
 
 def test_cpu_fold_training_writes_create_only_tb_p0_artifacts(tmp_path, capsys):

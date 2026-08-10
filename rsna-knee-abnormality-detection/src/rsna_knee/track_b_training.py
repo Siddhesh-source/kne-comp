@@ -9,6 +9,7 @@ import random
 import re
 import tempfile
 import time
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Literal, Mapping
@@ -55,6 +56,17 @@ class TBP0Config:
     gradient_checkpointing: bool = False
     seed: int = 20260828
     num_workers: int = 0
+
+
+@dataclass(frozen=True)
+class EnhancedC2Config:
+    """Frozen controls for the independently removable enhanced C2 pack."""
+
+    recipe_id: str = "enhanced-c2-v1"
+    ema_decay: float = 0.999
+    auxiliary_loss_weight: float = 0.15
+    focal_gamma: float = 2.0
+    precision: Literal["auto", "bf16", "fp16"] = "auto"
 
 
 @dataclass(frozen=True)
@@ -363,6 +375,37 @@ class SixSlotStudyEncoder(nn.Module):
             dropout=dropout,
         )
 
+    def encode_slots(
+        self,
+        images: Tensor,
+        valid_mask: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """Encode one sampled view while never evaluating absent slots."""
+        if (
+            images.ndim != 5
+            or images.shape[1] != len(TB_P0_SLOT_NAMES)
+            or images.shape[2] != 3
+        ):
+            raise ValueError("images must have shape [batch, 6, 3, H, W]")
+        if valid_mask.shape != images.shape[:2]:
+            raise ValueError("valid_mask shape must match batch and slots")
+        mask = valid_mask.bool()
+        if not mask.any(dim=1).all():
+            raise ValueError("every study must contain at least one valid slot")
+        flattened = images.reshape(-1, *images.shape[2:])
+        flat_mask = mask.reshape(-1)
+        valid_features = self.slice_backbone(flattened[flat_mask])
+        expected = (int(flat_mask.sum()), self.feature_dim)
+        if not isinstance(valid_features, Tensor) or valid_features.shape != expected:
+            raise ValueError(
+                f"slice backbone must return valid-slot features shaped {expected}"
+            )
+        features = valid_features.new_zeros(
+            images.shape[0] * images.shape[1], self.feature_dim
+        )
+        features[flat_mask] = valid_features
+        return features.view(images.shape[0], images.shape[1], -1), mask
+
     def forward(
         self,
         images: Tensor,
@@ -405,36 +448,270 @@ class SixSlotStudyEncoder(nn.Module):
             logits = logits.view(images.shape[0], images.shape[2], -1)
             weights = view_mask.unsqueeze(-1).to(logits.dtype)
             return (logits * weights).sum(dim=1) / weights.sum(dim=1)
-        if (
-            images.ndim != 5
-            or images.shape[1] != len(TB_P0_SLOT_NAMES)
-            or images.shape[2] != 3
-        ):
-            raise ValueError("images must have shape [batch, 6, 3, H, W]")
-        if valid_mask.shape != images.shape[:2]:
-            raise ValueError("valid_mask shape must match batch and slots")
-        mask = valid_mask.bool()
-        if not mask.any(dim=1).all():
-            raise ValueError("every study must contain at least one valid slot")
-
-        flattened = images.reshape(-1, *images.shape[2:])
-        flat_mask = mask.reshape(-1)
-        valid_features = self.slice_backbone(flattened[flat_mask])
-        expected = (int(flat_mask.sum()), self.feature_dim)
-        if not isinstance(valid_features, Tensor) or valid_features.shape != expected:
-            raise ValueError(
-                f"slice backbone must return valid-slot features shaped {expected}"
-            )
-        features = valid_features.new_zeros(
-            images.shape[0] * images.shape[1], self.feature_dim
-        )
-        features[flat_mask] = valid_features
-        features = features.view(images.shape[0], images.shape[1], -1)
+        features, mask = self.encode_slots(images, valid_mask)
         return self.head(
             features,
             mask,
             return_attention=return_attention,
         )
+
+
+def weighted_soft_focal_bce(
+    logits: Tensor,
+    targets: Tensor,
+    weights: Tensor,
+    *,
+    gamma: float = 2.0,
+) -> Tensor:
+    """Weighted focal BCE that preserves soft consensus targets."""
+    if (
+        logits.shape != targets.shape
+        or logits.shape != weights.shape
+        or gamma < 0
+    ):
+        raise ValueError("focal BCE tensors or gamma are invalid")
+    probabilities = torch.sigmoid(logits)
+    target_probability = (
+        targets * probabilities + (1 - targets) * (1 - probabilities)
+    )
+    losses = F.binary_cross_entropy_with_logits(
+        logits,
+        targets,
+        reduction="none",
+    ) * (1 - target_probability).pow(gamma)
+    denominator = weights.sum().clamp_min(1e-8)
+    return (losses * weights).sum() / denominator
+
+
+class EnhancedC2StudyEncoder(nn.Module):
+    """C2 primary model plus detached removable heads and EMA evaluation."""
+
+    STREAMS = (
+        "ema-global",
+        "online-global",
+        "focal-global",
+        "sagittal",
+        "coronal",
+        "axial",
+    )
+    PLANE_SLOTS = {
+        "sagittal": (0, 3, 5),
+        "coronal": (1, 4),
+        "axial": (2,),
+    }
+
+    def __init__(
+        self,
+        online: SixSlotStudyEncoder,
+        *,
+        hidden_dim: int = 256,
+        dropout: float = 0.2,
+        recipe: EnhancedC2Config | None = None,
+    ) -> None:
+        super().__init__()
+        self.recipe = recipe or EnhancedC2Config()
+        if (
+            not re.fullmatch(r"[a-z0-9][a-z0-9-]{2,63}", self.recipe.recipe_id)
+            or not 0 < self.recipe.ema_decay < 1
+            or self.recipe.auxiliary_loss_weight < 0
+            or self.recipe.focal_gamma < 0
+            or self.recipe.precision not in ("auto", "bf16", "fp16")
+        ):
+            raise ValueError("enhanced C2 recipe is invalid")
+        self.online = online
+        self.ema = deepcopy(online)
+        self.ema.requires_grad_(False)
+        self.ema.eval()
+        self.auxiliary_heads = nn.ModuleDict(
+            {
+                stream: MaskedPerLabelSlotAttention(
+                    feature_dim=online.feature_dim,
+                    hidden_dim=hidden_dim,
+                    dropout=dropout,
+                )
+                for stream in ("focal-global", *self.PLANE_SLOTS)
+            }
+        )
+        self.register_buffer(
+            "ema_updates",
+            torch.zeros((), dtype=torch.int64),
+        )
+
+    @property
+    def slice_backbone(self) -> nn.Module:
+        return self.online.slice_backbone
+
+    def train(self, mode: bool = True) -> EnhancedC2StudyEncoder:
+        super().train(mode)
+        self.ema.eval()
+        return self
+
+    def training_recipe_manifest(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "model_family": "enhanced-dino-c2",
+            **asdict(self.recipe),
+            "primary_stream": "ema-global",
+            "prediction_streams": list(self.STREAMS),
+            "plane_slots": {
+                key: list(value) for key, value in self.PLANE_SLOTS.items()
+            },
+            "auxiliary_gradient": "detached-slot-features",
+        }
+
+    @torch.no_grad()
+    def after_optimizer_step(self) -> None:
+        decay = self.recipe.ema_decay
+        online_state = self.online.state_dict()
+        for name, value in self.ema.state_dict().items():
+            source = online_state[name].detach()
+            if value.is_floating_point():
+                value.mul_(decay).add_(source, alpha=1 - decay)
+            else:
+                value.copy_(source)
+        self.ema_updates.add_(1)
+
+    def _online_streams(
+        self,
+        images: Tensor,
+        valid_mask: Tensor,
+    ) -> tuple[Tensor, dict[str, Tensor], dict[str, Tensor]]:
+        features, mask = self.online.encode_slots(images, valid_mask)
+        online = self.online.head(features, mask)
+        assert isinstance(online, Tensor)
+        streams = {"online-global": online}
+        availability: dict[str, Tensor] = {
+            "focal-global": torch.ones(
+                images.shape[0], dtype=torch.bool, device=images.device
+            )
+        }
+        focal = self.auxiliary_heads["focal-global"](features.detach(), mask)
+        assert isinstance(focal, Tensor)
+        streams["focal-global"] = focal
+        for stream, slots in self.PLANE_SLOTS.items():
+            plane_mask = torch.zeros_like(mask)
+            plane_mask[:, list(slots)] = mask[:, list(slots)]
+            present = plane_mask.any(dim=1)
+            availability[stream] = present
+            safe_mask = plane_mask.clone()
+            safe_mask[~present] = mask[~present]
+            logits = self.auxiliary_heads[stream](
+                features.detach(),
+                safe_mask,
+            )
+            assert isinstance(logits, Tensor)
+            streams[stream] = logits
+        return features, streams, availability
+
+    def training_objective(
+        self,
+        images: Tensor,
+        valid_mask: Tensor,
+        targets: Tensor,
+        weights: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        _, streams, availability = self._online_streams(images, valid_mask)
+        primary = streams["online-global"]
+        loss = weighted_soft_bce(primary, targets, weights)
+        auxiliary_losses = [
+            weighted_soft_focal_bce(
+                streams["focal-global"],
+                targets,
+                weights,
+                gamma=self.recipe.focal_gamma,
+            )
+        ]
+        for stream in self.PLANE_SLOTS:
+            stream_weights = weights * availability[stream].unsqueeze(1)
+            if stream_weights.sum() > 0:
+                auxiliary_losses.append(
+                    weighted_soft_bce(
+                        streams[stream],
+                        targets,
+                        stream_weights,
+                    )
+                )
+        if auxiliary_losses:
+            loss = loss + self.recipe.auxiliary_loss_weight * torch.stack(
+                auxiliary_losses
+            ).mean()
+        return primary, loss
+
+    def _single_view_streams(
+        self,
+        images: Tensor,
+        valid_mask: Tensor,
+    ) -> dict[str, Tensor]:
+        with torch.no_grad():
+            ema = self.ema(images, valid_mask)
+        assert isinstance(ema, Tensor)
+        _, streams, availability = self._online_streams(images, valid_mask)
+        result = {"ema-global": ema, **streams}
+        for stream in self.PLANE_SLOTS:
+            result[stream] = torch.where(
+                availability[stream].unsqueeze(1),
+                result[stream],
+                ema,
+            )
+        return result
+
+    def prediction_streams(
+        self,
+        images: Tensor,
+        valid_mask: Tensor,
+    ) -> dict[str, Tensor]:
+        if images.ndim == 5:
+            return self._single_view_streams(images, valid_mask)
+        if (
+            images.ndim != 6
+            or images.shape[1] != len(TB_P0_SLOT_NAMES)
+            or valid_mask.shape != images.shape[:3]
+        ):
+            raise ValueError("enhanced grouped inputs are incompatible")
+        group_images = images.transpose(1, 2)
+        group_mask = valid_mask.transpose(1, 2).bool()
+        view_mask = group_mask.any(dim=2)
+        flat_images = group_images.reshape(
+            -1, len(TB_P0_SLOT_NAMES), *images.shape[3:]
+        )
+        flat_mask = group_mask.reshape(-1, len(TB_P0_SLOT_NAMES))
+        selected = view_mask.reshape(-1)
+        valid_streams = self._single_view_streams(
+            flat_images[selected],
+            flat_mask[selected],
+        )
+        result: dict[str, Tensor] = {}
+        weights = view_mask.unsqueeze(-1)
+        for stream, values in valid_streams.items():
+            full = values.new_zeros(
+                images.shape[0] * images.shape[2],
+                values.shape[-1],
+            )
+            full[selected] = values
+            full = full.view(images.shape[0], images.shape[2], -1)
+            result[stream] = (
+                full * weights.to(full.dtype)
+            ).sum(dim=1) / weights.sum(dim=1)
+        return result
+
+    def forward(self, images: Tensor, valid_mask: Tensor) -> Tensor:
+        return self.prediction_streams(images, valid_mask)["ema-global"]
+
+
+def create_enhanced_c2_model(
+    config: TBP0Config | None = None,
+    *,
+    recipe: EnhancedC2Config | None = None,
+    pretrained: bool = True,
+) -> EnhancedC2StudyEncoder:
+    """Construct Pack B from the pinned verified C2 backbone."""
+    config = config or TBP0Config()
+    return EnhancedC2StudyEncoder(
+        create_tb_p0_model(config, pretrained=pretrained),
+        hidden_dim=config.hidden_dim,
+        dropout=config.dropout,
+        recipe=recipe,
+    )
 
 
 def create_tb_p0_model(
@@ -1156,6 +1433,34 @@ def _optimizer_to_device(
                 state[key] = value.to(device)
 
 
+def _training_precision(
+    device: torch.device,
+    training_recipe: dict[str, object] | None,
+) -> tuple[bool, torch.dtype, bool, str]:
+    """Resolve CUDA precision, selecting FP16 for T4-class hardware."""
+    if device.type != "cuda":
+        return False, torch.bfloat16, False, "fp32"
+    requested = (
+        str(training_recipe.get("precision", "auto"))
+        if training_recipe is not None
+        else "bf16"
+    )
+    if requested == "auto":
+        requested = (
+            "bf16"
+            if bool(getattr(torch.cuda, "is_bf16_supported", lambda: False)())
+            else "fp16"
+        )
+    if requested not in ("bf16", "fp16"):
+        raise ValueError("CUDA training precision is invalid")
+    return (
+        True,
+        torch.bfloat16 if requested == "bf16" else torch.float16,
+        requested == "fp16",
+        requested,
+    )
+
+
 def _resume_identity(
     *,
     run_name: str,
@@ -1168,8 +1473,9 @@ def _resume_identity(
     model_structure_fingerprint: str,
     coverage_arm: Literal["c0", "c1", "c2"] | None,
     matched_schedule: MatchedCoverageSchedule | None,
+    training_recipe: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    return {
+    identity = {
         "run_name": run_name,
         "fold": fold,
         "labels": list(LABELS),
@@ -1184,6 +1490,9 @@ def _resume_identity(
             matched_schedule.fingerprint if matched_schedule is not None else None
         ),
     }
+    if training_recipe is not None:
+        identity["training_recipe"] = training_recipe
+    return identity
 
 
 def _validate_tb_p0_resume_state(
@@ -1280,6 +1589,46 @@ def _predict_tb_p0(
 
 
 @torch.no_grad()
+def _predict_tb_p0_streams(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+) -> tuple[dict[str, np.ndarray], np.ndarray, list[str]]:
+    """Predict every declared stream, preserving the primary compatibility path."""
+    model.eval()
+    predictions: dict[str, list[np.ndarray]] = {}
+    targets: list[np.ndarray] = []
+    study_ids: list[str] = []
+    for batch in loader:
+        images = batch["images"].to(device)
+        mask = batch["valid_mask"].to(device)
+        if hasattr(model, "prediction_streams"):
+            streams = model.prediction_streams(images, mask)
+        else:
+            streams = {"primary": model(images, mask)}
+        if not isinstance(streams, dict) or not streams:
+            raise ValueError("prediction streams must be a non-empty mapping")
+        for name, logits in streams.items():
+            if (
+                not isinstance(name, str)
+                or not isinstance(logits, Tensor)
+                or logits.ndim != 2
+                or logits.shape[1] != len(LABELS)
+            ):
+                raise ValueError("prediction stream output is invalid")
+            predictions.setdefault(name, []).append(
+                torch.sigmoid(logits).float().cpu().numpy()
+            )
+        targets.append(batch["targets"].numpy())
+        study_ids.extend(str(value) for value in batch["study_id"])
+    return (
+        {name: np.concatenate(values) for name, values in predictions.items()},
+        np.concatenate(targets),
+        study_ids,
+    )
+
+
+@torch.no_grad()
 def predict_tb_p0_fold_cache(
     cache_root: str | Path,
     run_dir: str | Path,
@@ -1338,9 +1687,24 @@ def predict_tb_p0_fold_cache(
         num_workers=config.num_workers,
     )
     torch_device = torch.device(device)
-    model = (
-        model_factory() if model_factory is not None else create_tb_p0_model(config)
-    ).to(torch_device)
+    if model_factory is not None:
+        model = model_factory()
+    elif checkpoint.get("training_recipe", {}).get("model_family") == (
+        "enhanced-dino-c2"
+    ):
+        recipe_payload = checkpoint["training_recipe"]
+        model = create_enhanced_c2_model(
+            config,
+            recipe=EnhancedC2Config(
+                **{
+                    key: recipe_payload[key]
+                    for key in asdict(EnhancedC2Config())
+                }
+            ),
+        )
+    else:
+        model = create_tb_p0_model(config)
+    model = model.to(torch_device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
     predictions: list[np.ndarray] = []
@@ -1472,6 +1836,12 @@ def train_tb_p0_fold(
     model = (
         model_factory() if model_factory is not None else create_tb_p0_model(config)
     ).to(torch_device)
+    recipe_factory = getattr(model, "training_recipe_manifest", None)
+    training_recipe = recipe_factory() if callable(recipe_factory) else None
+    autocast_enabled, autocast_dtype, scaler_enabled, resolved_precision = (
+        _training_precision(torch_device, training_recipe)
+    )
+    scaler = torch.amp.GradScaler("cuda", enabled=scaler_enabled)
     optimizer = build_tb_p0_optimizer(model, config)
     scheduler, total_updates = build_tb_p0_scheduler(
         optimizer,
@@ -1510,6 +1880,7 @@ def train_tb_p0_fold(
         model_structure_fingerprint=_model_structure_fingerprint(model),
         coverage_arm=coverage_arm,
         matched_schedule=matched_schedule,
+        training_recipe=training_recipe,
     )
     start_epoch = 0
     resumed_from_epoch = 0
@@ -1525,6 +1896,17 @@ def train_tb_p0_fold(
             optimizer.load_state_dict(resume_state["optimizer_state"])
             _optimizer_to_device(optimizer, torch_device)
             scheduler.load_state_dict(resume_state["scheduler_state"])
+            saved_scaler = resume_state.get("scaler_state")
+            if scaler_enabled:
+                if not isinstance(saved_scaler, dict):
+                    raise ValueError(
+                        "Track B FP16 resume checkpoint is missing scaler state"
+                    )
+                scaler.load_state_dict(saved_scaler)
+            elif saved_scaler is not None:
+                raise ValueError(
+                    "Track B resume checkpoint has unexpected scaler state"
+                )
             start_epoch = int(resume_state["next_epoch"])
             resumed_from_epoch = start_epoch
             best_auc = float(resume_state["best_auc"])
@@ -1602,13 +1984,22 @@ def train_tb_p0_fold(
             weights = batch["weights"].to(torch_device)
             with torch.autocast(
                 device_type=torch_device.type,
-                dtype=torch.bfloat16,
-                enabled=torch_device.type == "cuda",
+                dtype=autocast_dtype,
+                enabled=autocast_enabled,
             ):
-                logits = model(images, mask)
-                loss = weighted_soft_bce(logits, targets, weights)
+                objective = getattr(model, "training_objective", None)
+                if callable(objective):
+                    logits, loss = objective(
+                        images,
+                        mask,
+                        targets,
+                        weights,
+                    )
+                else:
+                    logits = model(images, mask)
+                    loss = weighted_soft_bce(logits, targets, weights)
                 scaled_loss = loss / config.gradient_accumulation_steps
-            scaled_loss.backward()
+            scaler.scale(scaled_loss).backward()
             value = float(loss.detach().cpu())
             first_step_loss = value if not np.isfinite(first_step_loss) else first_step_loss
             last_step_loss = value
@@ -1619,10 +2010,19 @@ def train_tb_p0_fold(
                 or batch_index + 1 == len(train_loader)
             )
             if update:
-                optimizer.step()
+                scale_before = scaler.get_scale()
+                scaler.step(optimizer)
+                scaler.update()
                 optimizer.zero_grad(set_to_none=True)
-                scheduler.step()
-                optimizer_updates += 1
+                step_succeeded = (
+                    not scaler_enabled or scaler.get_scale() >= scale_before
+                )
+                if step_succeeded:
+                    after_step = getattr(model, "after_optimizer_step", None)
+                    if callable(after_step):
+                        after_step()
+                    scheduler.step()
+                    optimizer_updates += 1
         predictions, validation_targets, study_ids = _predict_tb_p0(
             model, valid_loader, torch_device
         )
@@ -1678,7 +2078,7 @@ def train_tb_p0_fold(
             "model_state": _cpu_tree(model.state_dict()),
             "optimizer_state": _cpu_tree(optimizer.state_dict()),
             "scheduler_state": scheduler.state_dict(),
-            "scaler_state": None,
+            "scaler_state": scaler.state_dict() if scaler_enabled else None,
             "best_auc": best_auc,
             "best_epoch": best_epoch,
             "best_model_state": best_state,
@@ -1714,10 +2114,25 @@ def train_tb_p0_fold(
     if best_state is None:
         raise RuntimeError("TB-P0 training did not produce a checkpoint")
     model.load_state_dict(best_state)
-    predictions, _, study_ids = _predict_tb_p0(model, valid_loader, torch_device)
-    oof = pd.DataFrame({ID_COLUMN: study_ids})
-    for label_index, label in enumerate(LABELS):
-        oof[label] = predictions[:, label_index]
+    stream_predictions, _, study_ids = _predict_tb_p0_streams(
+        model,
+        valid_loader,
+        torch_device,
+    )
+    primary_stream = (
+        str(training_recipe["primary_stream"])
+        if training_recipe is not None
+        else "primary"
+    )
+    if primary_stream not in stream_predictions:
+        raise RuntimeError("primary prediction stream is missing")
+    oof_frames: dict[str, pd.DataFrame] = {}
+    for stream, predictions in stream_predictions.items():
+        frame = pd.DataFrame({ID_COLUMN: study_ids})
+        for label_index, label in enumerate(LABELS):
+            frame[label] = predictions[:, label_index]
+        oof_frames[stream] = frame
+    oof = oof_frames[primary_stream]
     checkpoint = {
         "schema_version": 1,
         "stage": "TB-P0",
@@ -1735,12 +2150,22 @@ def train_tb_p0_fold(
         ),
         "resume_epochs": len(history),
         "coverage_arm": coverage_arm,
+        "training_recipe": training_recipe,
+        "primary_stream": primary_stream,
+        "resolved_precision": resolved_precision,
         "matched_schedule_fingerprint": (
             matched_schedule.fingerprint if matched_schedule is not None else None
         ),
     }
     _atomic_torch_save(paths["checkpoint"], checkpoint)
     _atomic_bytes(paths["oof"], oof.to_csv(index=False).encode("utf-8"))
+    stream_paths: dict[str, Path] = {}
+    for stream, frame in oof_frames.items():
+        if stream == primary_stream:
+            continue
+        path = output_dir / f"fold-{fold}.{stream}.oof.csv"
+        _atomic_bytes(path, frame.to_csv(index=False).encode("utf-8"))
+        stream_paths[stream] = path
     exposure_metadata: dict[str, object] | None = None
     if matched_schedule is not None:
         assert exposure_counts is not None
@@ -1880,11 +2305,20 @@ def train_tb_p0_fold(
         "history": history,
         "checkpoint": paths["checkpoint"].name,
         "oof": paths["oof"].name,
+        "training_recipe": training_recipe,
+        "primary_stream": primary_stream,
+        "resolved_precision": resolved_precision,
+        "prediction_streams": {
+            primary_stream: paths["oof"].name,
+            **{stream: path.name for stream, path in stream_paths.items()},
+        },
     }
     for key in ("checkpoint", "oof", "exposure"):
         if key not in paths:
             continue
         metadata["output_hashes"][paths[key].name] = _sha256_file(paths[key])
+    for path in stream_paths.values():
+        metadata["output_hashes"][path.name] = _sha256_file(path)
     _atomic_bytes(
         paths["metadata"],
         (json.dumps(metadata, indent=2, allow_nan=False) + "\n").encode("utf-8"),
@@ -2580,6 +3014,10 @@ def finalize_tb_p0_run(
     fold_metadata: list[dict[str, object]] = []
     reference_config: object | None = None
     reference_provenance: dict[str, object] | None = None
+    reference_recipe: object | None = None
+    reference_primary_stream: str | None = None
+    reference_stream_names: tuple[str, ...] | None = None
+    stream_frames: dict[str, list[pd.DataFrame]] = {}
     artifact_hashes: dict[str, str] = {}
     for fold in range(5):
         checkpoint_path = output_dir / f"fold-{fold}.pt"
@@ -2608,6 +3046,34 @@ def finalize_tb_p0_run(
             if declared != actual:
                 raise ValueError(f"fold {fold} artifact hash is invalid")
             artifact_hashes[path.name] = actual
+        primary_stream = str(metadata.get("primary_stream", "primary"))
+        prediction_streams = metadata.get(
+            "prediction_streams",
+            {primary_stream: oof_path.name},
+        )
+        if (
+            not isinstance(prediction_streams, dict)
+            or not prediction_streams
+            or prediction_streams.get(primary_stream) != oof_path.name
+            or any(
+                not isinstance(stream, str)
+                or not re.fullmatch(r"[a-z][a-z0-9-]{2,31}", stream)
+                or not isinstance(name, str)
+                for stream, name in prediction_streams.items()
+            )
+        ):
+            raise ValueError(f"fold {fold} prediction streams are invalid")
+        stream_names = tuple(sorted(prediction_streams))
+        if reference_stream_names is None:
+            reference_stream_names = stream_names
+            reference_primary_stream = primary_stream
+            reference_recipe = metadata.get("training_recipe")
+        elif (
+            stream_names != reference_stream_names
+            or primary_stream != reference_primary_stream
+            or metadata.get("training_recipe") != reference_recipe
+        ):
+            raise ValueError("TB-P0 fold prediction recipes do not match")
         if reference_config is None:
             reference_config = metadata.get("config")
         elif metadata.get("config") != reference_config:
@@ -2637,6 +3103,33 @@ def finalize_tb_p0_run(
         if not np.isfinite(frame.loc[:, LABELS].to_numpy()).all():
             raise ValueError(f"fold {fold} OOF predictions are non-finite")
         frames.append(frame)
+        for stream, name in prediction_streams.items():
+            path = output_dir / name
+            if stream == primary_stream:
+                stream_frame = frame
+            else:
+                if (
+                    not path.is_file()
+                    or metadata.get("output_hashes", {}).get(name)
+                    != _sha256_file(path)
+                ):
+                    raise ValueError(
+                        f"fold {fold} prediction stream hash is invalid"
+                    )
+                artifact_hashes[name] = _sha256_file(path)
+                stream_frame = pd.read_csv(path, dtype={ID_COLUMN: str})
+                if (
+                    set(stream_frame.columns) != required
+                    or stream_frame[ID_COLUMN].duplicated().any()
+                    or set(stream_frame[ID_COLUMN]) != expected_ids
+                    or not np.isfinite(
+                        stream_frame.loc[:, LABELS].to_numpy()
+                    ).all()
+                ):
+                    raise ValueError(
+                        f"fold {fold} prediction stream schema is invalid"
+                    )
+            stream_frames.setdefault(stream, []).append(stream_frame)
         fold_metadata.append(metadata)
 
     combined = pd.concat(frames, ignore_index=True)
@@ -2666,6 +3159,24 @@ def finalize_tb_p0_run(
         final_paths["oof"],
         combined.to_csv(index=False).encode("utf-8"),
     )
+    stream_outputs = {
+        str(reference_primary_stream): final_paths["oof"].name,
+    }
+    stream_hashes = {
+        final_paths["oof"].name: _sha256_file(final_paths["oof"]),
+    }
+    for stream, fold_frames in sorted(stream_frames.items()):
+        if stream == reference_primary_stream:
+            continue
+        stream_combined = pd.concat(fold_frames, ignore_index=True)
+        stream_combined["_order"] = stream_combined[ID_COLUMN].map(order)
+        stream_combined = stream_combined.sort_values("_order").drop(
+            columns="_order"
+        )
+        path = output_dir / f"{stream}-oof.csv"
+        _atomic_bytes(path, stream_combined.to_csv(index=False).encode("utf-8"))
+        stream_outputs[stream] = path.name
+        stream_hashes[path.name] = _sha256_file(path)
     metadata = {
         "schema_version": 1,
         "run_name": run_name,
@@ -2674,6 +3185,9 @@ def finalize_tb_p0_run(
         "folds": list(range(5)),
         "studies": expected_studies,
         "config": reference_config,
+        "training_recipe": reference_recipe,
+        "primary_stream": reference_primary_stream,
+        "prediction_streams": stream_outputs,
         "provenance": reference_provenance,
         "fold_metadata": [
             path.name
@@ -2685,9 +3199,7 @@ def finalize_tb_p0_run(
         "oof_metrics": oof_metrics,
         "oof": final_paths["oof"].name,
         "fold_artifact_hashes": artifact_hashes,
-        "output_hashes": {
-            final_paths["oof"].name: _sha256_file(final_paths["oof"])
-        },
+        "output_hashes": stream_hashes,
     }
     _atomic_bytes(
         final_paths["metadata"],
