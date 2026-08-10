@@ -31,12 +31,14 @@ from rsna_knee.track_b_training import (
     TBP0CachedDataset,
     TBP0InferenceDataset,
     TBP0RigidAugmentation,
+    TrackBCampaignSpec,
     TorchvisionConvNeXtBackbone,
     align_tb_p0_cached_data,
     build_matched_coverage_schedule,
     build_c2_experiment_matrix,
     build_tb_p0_optimizer,
     build_tb_p0_scheduler,
+    build_track_b_campaign_manifest,
     evaluate_tb_p0_oof,
     evaluate_tb_p0_rank_comparison,
     c2_experiment_matrix_manifest,
@@ -54,6 +56,7 @@ from rsna_knee.track_b_training import (
     write_tb_p0_rank_comparison,
     write_c2_experiment_matrix_manifest,
     write_matched_coverage_evidence,
+    write_track_b_campaign_manifest,
 )
 
 
@@ -1359,6 +1362,47 @@ def _c2_matrix_spec(**overrides):
     }
     values.update(overrides)
     return C2MatrixSpec(**values)
+
+
+def _campaign_spec(**overrides):
+    values = {
+        "campaign_id": "tb-095-v1",
+        "git_revision": "revision",
+        "folds_sha256": "a" * 64,
+        "targets_sha256": "b" * 64,
+        "cache_fingerprint": "c" * 64,
+    }
+    values.update(overrides)
+    return TrackBCampaignSpec(**values)
+
+
+def test_modal_campaign_freezes_three_packs_and_fifteen_jobs():
+    manifest = build_track_b_campaign_manifest(_campaign_spec())
+    assert manifest["stage"] == "TB-Modal-campaign"
+    assert manifest["existing_run_name"] == "tb-c2-window-s20260828-e30-v1"
+    assert [pack["model_family"] for pack in manifest["packs"]] == [
+        "dino-vits-c2",
+        "enhanced-dino-c2",
+        "convnext-2p5d-c2",
+    ]
+    assert len(manifest["jobs"]) == 15
+    assert len({job["job_id"] for job in manifest["jobs"]}) == 15
+    assert {job["fold"] for job in manifest["jobs"]} == set(range(5))
+    changed = build_track_b_campaign_manifest(
+        _campaign_spec(cache_fingerprint="d" * 64)
+    )
+    assert changed["campaign_fingerprint"] != manifest["campaign_fingerprint"]
+
+
+def test_modal_campaign_manifest_writer_is_create_only(tmp_path):
+    destination = tmp_path / "campaign.json"
+    manifest = write_track_b_campaign_manifest(
+        destination,
+        _campaign_spec(),
+    )
+    assert json.loads(destination.read_text()) == manifest
+    with pytest.raises(FileExistsError):
+        write_track_b_campaign_manifest(destination, _campaign_spec())
 
 
 def test_c2_matrix_is_canonical_and_hashes_full_identity():

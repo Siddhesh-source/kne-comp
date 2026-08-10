@@ -217,6 +217,42 @@ def test_c2_matrix_manifest_validation_and_selection_are_strict():
         )
 
 
+def test_modal_campaign_validation_accepts_only_frozen_fifteen_jobs():
+    module = load_track_b_modal()
+    from rsna_knee.track_b_training import (
+        TrackBCampaignSpec,
+        build_track_b_campaign_manifest,
+    )
+
+    payload = build_track_b_campaign_manifest(
+        TrackBCampaignSpec(
+            campaign_id="tb-095-v1",
+            git_revision="revision",
+            folds_sha256="a" * 64,
+            targets_sha256="b" * 64,
+            cache_fingerprint="c" * 64,
+        )
+    )
+    jobs = module._validate_track_b_campaign_manifest(
+        payload,
+        campaign_id="tb-095-v1",
+        campaign_fingerprint=payload["campaign_fingerprint"],
+    )
+    assert len(jobs) == 15
+    assert {job["pack_id"] for job in jobs} == {
+        "pack-a-c2-seed",
+        "pack-b-enhanced-c2",
+        "pack-c-convnext",
+    }
+    payload["packs"][0]["config"]["epochs"] = 29
+    with pytest.raises(ValueError, match="fingerprint"):
+        module._validate_track_b_campaign_manifest(
+            payload,
+            campaign_id="tb-095-v1",
+            campaign_fingerprint=payload["campaign_fingerprint"],
+        )
+
+
 def test_finalized_c2_run_validation_checks_all_declared_hashes(tmp_path):
     module = load_track_b_modal()
     oof = tmp_path / "oof.csv"
@@ -251,3 +287,45 @@ def test_finalized_c2_run_validation_checks_all_declared_hashes(tmp_path):
             tmp_path,
             run_name="tb-c2-run",
         )
+
+
+def test_finalized_enhanced_run_validates_all_prediction_streams(tmp_path):
+    module = load_track_b_modal()
+    digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+    streams = {
+        "ema-global": "oof.csv",
+        "online-global": "online-global-oof.csv",
+    }
+    output_hashes = {}
+    for name in streams.values():
+        path = tmp_path / name
+        path.write_bytes(name.encode())
+        output_hashes[name] = digest(path)
+    fold_hashes = {}
+    for fold in range(5):
+        for name in (
+            f"fold-{fold}.pt",
+            f"fold-{fold}.oof.csv",
+            f"fold-{fold}.online-global.oof.csv",
+        ):
+            path = tmp_path / name
+            path.write_bytes(name.encode())
+            fold_hashes[name] = digest(path)
+    metadata = {
+        "schema_version": 1,
+        "stage": "TB-P0",
+        "coverage_arm": "c2",
+        "run_name": "enhanced-run",
+        "studies": 4407,
+        "folds": [0, 1, 2, 3, 4],
+        "primary_stream": "ema-global",
+        "prediction_streams": streams,
+        "output_hashes": output_hashes,
+        "fold_artifact_hashes": fold_hashes,
+    }
+    (tmp_path / "metadata.json").write_text(json.dumps(metadata))
+    result = module._validate_finalized_c2_run(
+        tmp_path,
+        run_name="enhanced-run",
+    )
+    assert result["primary_stream"] == "ema-global"

@@ -109,6 +109,137 @@ class C2MatrixMember:
     cache_fingerprint: str
 
 
+@dataclass(frozen=True)
+class TrackBCampaignSpec:
+    campaign_id: str
+    git_revision: str
+    folds_sha256: str
+    targets_sha256: str
+    cache_fingerprint: str
+    crop_mm: int = 130
+    existing_run_name: str = "tb-c2-window-s20260828-e30-v1"
+
+
+def build_track_b_campaign_manifest(
+    spec: TrackBCampaignSpec,
+) -> dict[str, object]:
+    """Freeze the Modal-only Pack A/B/C campaign and its fifteen fold jobs."""
+    identifier = re.compile(r"[a-z0-9][a-z0-9-]{2,63}")
+    sha256 = re.compile(r"[0-9a-f]{64}")
+    if (
+        not identifier.fullmatch(spec.campaign_id)
+        or not spec.git_revision.strip()
+        or spec.crop_mm not in (130, 150)
+        or not identifier.fullmatch(spec.existing_run_name)
+        or any(
+            not sha256.fullmatch(value)
+            for value in (
+                spec.folds_sha256,
+                spec.targets_sha256,
+                spec.cache_fingerprint,
+            )
+        )
+    ):
+        raise ValueError("Track B campaign identity or fingerprints are invalid")
+    packs = (
+        {
+            "pack_id": "pack-a-c2-seed",
+            "model_family": "dino-vits-c2",
+            "seed": 20260829,
+            "config": asdict(
+                TBP0Config(
+                    epochs=30,
+                    batch_size=8,
+                    seed=20260829,
+                )
+            ),
+            "recipe": None,
+        },
+        {
+            "pack_id": "pack-b-enhanced-c2",
+            "model_family": "enhanced-dino-c2",
+            "seed": 20260830,
+            "config": asdict(
+                TBP0Config(
+                    epochs=30,
+                    batch_size=8,
+                    seed=20260830,
+                )
+            ),
+            "recipe": asdict(EnhancedC2Config()),
+        },
+        {
+            "pack_id": "pack-c-convnext",
+            "model_family": "convnext-2p5d-c2",
+            "seed": 20260831,
+            "config": asdict(
+                TBP0Config(
+                    feature_dim=768,
+                    hidden_dim=256,
+                    trainable_blocks=0,
+                    backbone_learning_rate=3e-4,
+                    head_learning_rate=3e-4,
+                    epochs=16,
+                    batch_size=2,
+                    gradient_accumulation_steps=4,
+                    gradient_checkpointing=False,
+                    seed=20260831,
+                )
+            ),
+            "recipe": asdict(CNN2p5DConfig()),
+        },
+    )
+    jobs = [
+        {
+            "job_id": f"{pack['pack_id']}-f{fold}",
+            "pack_id": pack["pack_id"],
+            "run_name": f"{spec.campaign_id}-{pack['pack_id']}",
+            "fold": fold,
+        }
+        for pack in packs
+        for fold in range(5)
+    ]
+    payload = {
+        "schema_version": 1,
+        "stage": "TB-Modal-campaign",
+        "campaign_id": spec.campaign_id,
+        "git_revision": spec.git_revision,
+        "folds_sha256": spec.folds_sha256,
+        "targets_sha256": spec.targets_sha256,
+        "crop_mm": spec.crop_mm,
+        "cache_fingerprint": spec.cache_fingerprint,
+        "existing_run_name": spec.existing_run_name,
+        "packs": list(packs),
+        "jobs": jobs,
+    }
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return {
+        **payload,
+        "campaign_fingerprint": _sha256_bytes(canonical),
+    }
+
+
+def write_track_b_campaign_manifest(
+    destination: str | Path,
+    spec: TrackBCampaignSpec,
+) -> dict[str, object]:
+    """Create one immutable Modal campaign manifest."""
+    destination = Path(destination)
+    if destination.exists():
+        raise FileExistsError("Track B campaign manifest already exists")
+    manifest = build_track_b_campaign_manifest(spec)
+    _atomic_bytes(
+        destination,
+        (json.dumps(manifest, indent=2, allow_nan=False) + "\n").encode(),
+    )
+    return manifest
+
+
 def build_c2_experiment_matrix(
     spec: C2MatrixSpec,
 ) -> tuple[C2MatrixMember, ...]:

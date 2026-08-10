@@ -197,6 +197,98 @@ def _c2_matrix_payload_fingerprint(payload: dict[str, object]) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
+def _track_b_campaign_payload_fingerprint(
+    payload: dict[str, object],
+) -> str:
+    import json
+
+    canonical_payload = {
+        key: value
+        for key, value in payload.items()
+        if key != "campaign_fingerprint"
+    }
+    canonical = json.dumps(
+        canonical_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _validate_track_b_campaign_manifest(
+    payload: object,
+    *,
+    campaign_id: str,
+    campaign_fingerprint: str,
+) -> list[dict[str, object]]:
+    """Accept only the canonical three-pack, fifteen-job Modal campaign."""
+    import json
+
+    from rsna_knee.track_b_training import (
+        TrackBCampaignSpec,
+        build_track_b_campaign_manifest,
+    )
+
+    if not isinstance(payload, dict):
+        raise ValueError("Track B campaign manifest must be an object")
+    try:
+        expected = build_track_b_campaign_manifest(
+            TrackBCampaignSpec(
+                campaign_id=campaign_id,
+                git_revision=str(payload["git_revision"]),
+                folds_sha256=str(payload["folds_sha256"]),
+                targets_sha256=str(payload["targets_sha256"]),
+                cache_fingerprint=str(payload["cache_fingerprint"]),
+                crop_mm=int(payload["crop_mm"]),
+                existing_run_name=str(payload["existing_run_name"]),
+            )
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Track B campaign manifest is invalid") from exc
+    if (
+        payload.get("schema_version") != 1
+        or payload.get("stage") != "TB-Modal-campaign"
+        or payload.get("campaign_id") != campaign_id
+        or payload.get("campaign_fingerprint") != campaign_fingerprint
+        or _track_b_campaign_payload_fingerprint(payload)
+        != campaign_fingerprint
+        or payload != expected
+    ):
+        raise ValueError("Track B campaign identity or fingerprint is invalid")
+    jobs = payload.get("jobs")
+    if (
+        not isinstance(jobs, list)
+        or len(jobs) != 15
+        or len({job["job_id"] for job in jobs}) != 15
+    ):
+        raise ValueError("Track B campaign must contain fifteen unique jobs")
+    return jobs
+
+
+def _load_track_b_campaign_manifest(
+    campaign_id: str,
+    campaign_fingerprint: str,
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    import json
+
+    if (
+        not re.fullmatch(r"[a-z0-9][a-z0-9-]{2,63}", campaign_id)
+        or not re.fullmatch(r"[0-9a-f]{64}", campaign_fingerprint)
+    ):
+        raise ValueError("Track B campaign identifiers are invalid")
+    path = TRACK_B_ROOT / "campaigns" / campaign_id / "campaign.json"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    jobs = _validate_track_b_campaign_manifest(
+        payload,
+        campaign_id=campaign_id,
+        campaign_fingerprint=campaign_fingerprint,
+    )
+    return payload, jobs
+
+
 def _validate_c2_matrix_manifest(
     payload: object,
     *,
@@ -305,6 +397,23 @@ def _validate_finalized_c2_run(
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     hashes = metadata.get("output_hashes")
     fold_hashes = metadata.get("fold_artifact_hashes")
+    primary_stream = str(metadata.get("primary_stream", "primary"))
+    prediction_streams = metadata.get(
+        "prediction_streams",
+        {primary_stream: "oof.csv"},
+    )
+    expected_fold_hashes = {
+        f"fold-{fold}.pt"
+        for fold in range(5)
+    }
+    if isinstance(prediction_streams, dict):
+        for fold in range(5):
+            for stream in prediction_streams:
+                expected_fold_hashes.add(
+                    f"fold-{fold}.oof.csv"
+                    if stream == primary_stream
+                    else f"fold-{fold}.{stream}.oof.csv"
+                )
     if (
         metadata.get("schema_version") != 1
         or metadata.get("stage") != "TB-P0"
@@ -314,13 +423,10 @@ def _validate_finalized_c2_run(
         or metadata.get("folds") != [0, 1, 2, 3, 4]
         or not isinstance(hashes, dict)
         or not isinstance(fold_hashes, dict)
-        or set(hashes) != {"oof.csv"}
-        or set(fold_hashes)
-        != {
-            name
-            for fold in range(5)
-            for name in (f"fold-{fold}.pt", f"fold-{fold}.oof.csv")
-        }
+        or not isinstance(prediction_streams, dict)
+        or prediction_streams.get(primary_stream) != "oof.csv"
+        or set(hashes) != set(prediction_streams.values())
+        or set(fold_hashes) != expected_fold_hashes
     ):
         raise ValueError("finalized C2 run metadata is incompatible")
     declared = {**fold_hashes, **hashes}
@@ -2714,8 +2820,10 @@ def track_b_train_c2_fold(
     batch_size: int,
     epochs: int = 30,
     seed: int = 20260828,
+    model_family: str = "dino-vits-c2",
+    recipe_json: str = "",
 ) -> dict[str, object]:
-    """Train or resume one ordered-window C2 fold."""
+    """Train or resume one ordered-window C2 fold from an approved model family."""
     import json
     from dataclasses import asdict
 
@@ -2723,8 +2831,12 @@ def track_b_train_c2_fold(
     import torch
 
     from rsna_knee.track_b_training import (
+        CNN2p5DConfig,
+        EnhancedC2Config,
         TBP0Config,
         align_tb_p0_cached_data,
+        create_cnn_2p5d_model,
+        create_enhanced_c2_model,
         train_tb_p0_fold,
     )
 
@@ -2737,6 +2849,59 @@ def track_b_train_c2_fold(
         raise ValueError("epochs must be an integer from 1 through 30")
     if type(seed) is not int or seed < 0:
         raise ValueError("seed must be a non-negative integer")
+    if model_family not in (
+        "dino-vits-c2",
+        "enhanced-dino-c2",
+        "convnext-2p5d-c2",
+    ):
+        raise ValueError("C2 model family is not approved")
+    recipe_payload = json.loads(recipe_json) if recipe_json else None
+    model_factory = None
+    if model_family == "dino-vits-c2":
+        if recipe_payload is not None:
+            raise ValueError("baseline C2 must not declare a model recipe")
+        config = TBP0Config(
+            batch_size=batch_size,
+            epochs=epochs,
+            seed=seed,
+        )
+    elif model_family == "enhanced-dino-c2":
+        if not isinstance(recipe_payload, dict):
+            raise ValueError("enhanced C2 requires its frozen recipe")
+        recipe = EnhancedC2Config(**recipe_payload)
+        if asdict(recipe) != recipe_payload:
+            raise ValueError("enhanced C2 recipe is not canonical")
+        config = TBP0Config(
+            batch_size=batch_size,
+            epochs=epochs,
+            seed=seed,
+        )
+        model_factory = lambda: create_enhanced_c2_model(
+            config,
+            recipe=recipe,
+        )
+    else:
+        if not isinstance(recipe_payload, dict):
+            raise ValueError("2.5D CNN requires its frozen recipe")
+        recipe = CNN2p5DConfig(**recipe_payload)
+        if asdict(recipe) != recipe_payload:
+            raise ValueError("2.5D CNN recipe is not canonical")
+        config = TBP0Config(
+            feature_dim=768,
+            hidden_dim=256,
+            trainable_blocks=0,
+            backbone_learning_rate=3e-4,
+            head_learning_rate=3e-4,
+            epochs=epochs,
+            batch_size=batch_size,
+            gradient_accumulation_steps=4,
+            gradient_checkpointing=False,
+            seed=seed,
+        )
+        model_factory = lambda: create_cnn_2p5d_model(
+            config,
+            recipe=recipe,
+        )
     data_volume.reload()
     artifact_volume.reload()
     cache_base = (
@@ -2760,11 +2925,6 @@ def track_b_train_c2_fold(
         or manifest.get("studies") != 4407
     ):
         raise ValueError("full Track B C2 cache manifest is incompatible")
-    config = TBP0Config(
-        batch_size=batch_size,
-        epochs=epochs,
-        seed=seed,
-    )
     output = TRACK_B_ROOT / "runs" / run_name
     completed_metadata_path = output / f"fold-{fold}.metadata.json"
     if completed_metadata_path.is_file():
@@ -2777,6 +2937,22 @@ def track_b_train_c2_fold(
             or completed.get("coverage_arm") != "c2"
             or completed.get("git_revision") != git_revision
             or completed.get("config") != asdict(config)
+            or (
+                model_family == "dino-vits-c2"
+                and completed.get("training_recipe") is not None
+            )
+            or (
+                model_family != "dino-vits-c2"
+                and (
+                    not isinstance(completed.get("training_recipe"), dict)
+                    or completed["training_recipe"].get("model_family")
+                    != model_family
+                    or any(
+                        completed["training_recipe"].get(key) != value
+                        for key, value in recipe_payload.items()
+                    )
+                )
+            )
             or completed.get("competition_cache_fingerprint")
             != manifest.get("competition_cache_fingerprint")
             or not completed_checkpoint.is_file()
@@ -2787,6 +2963,13 @@ def track_b_train_c2_fold(
             != _sha256_file(completed_checkpoint)
             or completed.get("output_hashes", {}).get(completed_oof.name)
             != _sha256_file(completed_oof)
+            or any(
+                not (output / name).is_file()
+                or _sha256_file(output / name) != expected
+                for name, expected in completed.get(
+                    "output_hashes", {}
+                ).items()
+            )
         ):
             raise ValueError(f"completed C2 fold {fold} is incompatible")
         return {
@@ -2805,6 +2988,7 @@ def track_b_train_c2_fold(
                 "fold": fold,
                 "epochs": epochs,
                 "seed": seed,
+                "model_family": model_family,
                 "studies": manifest["studies"],
             },
             sort_keys=True,
@@ -2852,6 +3036,7 @@ def track_b_train_c2_fold(
         fold,
         run_name=run_name,
         config=config,
+        model_factory=model_factory,
         device="cuda",
         git_revision=git_revision,
         source_manifest_sha256=_sha256_file(manifest_path),
@@ -3178,6 +3363,263 @@ def track_b_register_c2_matrix(matrix_json: str) -> dict[str, object]:
         "members": len(members),
         "status": "registered",
     }
+
+
+@app.function(
+    image=image,
+    cpu=2,
+    memory=4096,
+    timeout=1800,
+    max_containers=1,
+    volumes={DATA_MOUNT: data_volume, ARTIFACT_MOUNT: artifact_volume},
+)
+def track_b_register_campaign(campaign_json: str) -> dict[str, object]:
+    """Register the immutable Modal-only Pack A/B/C campaign."""
+    import json
+
+    if not isinstance(campaign_json, str) or not campaign_json.strip():
+        raise ValueError("campaign_json must contain a campaign manifest")
+    payload = json.loads(campaign_json)
+    campaign_id = (
+        payload.get("campaign_id") if isinstance(payload, dict) else None
+    )
+    fingerprint = (
+        payload.get("campaign_fingerprint")
+        if isinstance(payload, dict)
+        else None
+    )
+    if not isinstance(campaign_id, str) or not isinstance(fingerprint, str):
+        raise ValueError("Track B campaign identifiers are missing")
+    jobs = _validate_track_b_campaign_manifest(
+        payload,
+        campaign_id=campaign_id,
+        campaign_fingerprint=fingerprint,
+    )
+    data_volume.reload()
+    artifact_volume.reload()
+    folds_path = DATA_MOUNT / "metadata" / "folds-v1.csv"
+    targets_path = DATA_MOUNT / "metadata" / "consensus-labels-v1.csv"
+    cache_manifest_path = (
+        TRACK_B_ROOT
+        / "cache"
+        / _window_cache_name(int(payload["crop_mm"]), 12, 3)
+        / "full"
+        / "manifest.json"
+    )
+    for path in (folds_path, targets_path, cache_manifest_path):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    cache_manifest = json.loads(
+        cache_manifest_path.read_text(encoding="utf-8")
+    )
+    if (
+        _sha256_file(folds_path) != payload["folds_sha256"]
+        or _sha256_file(targets_path) != payload["targets_sha256"]
+        or cache_manifest.get("competition_cache_fingerprint")
+        != payload["cache_fingerprint"]
+        or cache_manifest.get("studies") != 4407
+    ):
+        raise ValueError("Track B campaign inputs do not match Modal volumes")
+    existing_run = str(payload["existing_run_name"])
+    _validate_finalized_c2_run(
+        TRACK_B_ROOT / "runs" / existing_run,
+        run_name=existing_run,
+    )
+    campaign_root = TRACK_B_ROOT / "campaigns" / campaign_id
+    campaign_path = campaign_root / "campaign.json"
+    if campaign_path.exists():
+        existing = json.loads(campaign_path.read_text(encoding="utf-8"))
+        if existing != payload:
+            raise FileExistsError(
+                "a different Track B campaign is already registered"
+            )
+        return {
+            "campaign_id": campaign_id,
+            "campaign_fingerprint": fingerprint,
+            "jobs": len(jobs),
+            "status": "already_registered",
+        }
+    campaign_root.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(campaign_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, allow_nan=False)
+        handle.write("\n")
+    artifact_volume.commit()
+    return {
+        "campaign_id": campaign_id,
+        "campaign_fingerprint": fingerprint,
+        "jobs": len(jobs),
+        "status": "registered",
+    }
+
+
+@app.function(
+    image=image,
+    cpu=1,
+    memory=2048,
+    timeout=86400,
+    max_containers=40,
+    volumes={ARTIFACT_MOUNT: artifact_volume},
+)
+def track_b_train_campaign_job(
+    campaign_id: str,
+    campaign_fingerprint: str,
+    job_id: str,
+) -> dict[str, object]:
+    """Derive every GPU worker argument from the registered campaign."""
+    import json
+
+    artifact_volume.reload()
+    payload, jobs = _load_track_b_campaign_manifest(
+        campaign_id,
+        campaign_fingerprint,
+    )
+    selected = [job for job in jobs if job["job_id"] == job_id]
+    if len(selected) != 1:
+        raise ValueError("requested Track B campaign job is not registered")
+    job = selected[0]
+    packs = {
+        str(pack["pack_id"]): pack
+        for pack in payload["packs"]
+    }
+    pack = packs[str(job["pack_id"])]
+    config = pack["config"]
+    result = track_b_train_c2_fold.remote(
+        str(job["run_name"]),
+        str(payload["git_revision"]),
+        int(payload["crop_mm"]),
+        int(job["fold"]),
+        int(config["batch_size"]),
+        int(config["epochs"]),
+        int(pack["seed"]),
+        str(pack["model_family"]),
+        (
+            json.dumps(
+                pack["recipe"],
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            if pack["recipe"] is not None
+            else ""
+        ),
+    )
+    return {
+        **result,
+        "campaign_id": campaign_id,
+        "campaign_fingerprint": campaign_fingerprint,
+        "job_id": job_id,
+        "pack_id": job["pack_id"],
+    }
+
+
+@app.function(
+    image=image,
+    cpu=2,
+    memory=8192,
+    timeout=3600,
+    max_containers=1,
+    volumes={DATA_MOUNT: data_volume, ARTIFACT_MOUNT: artifact_volume},
+)
+def track_b_finalize_campaign_pack(
+    campaign_id: str,
+    campaign_fingerprint: str,
+    pack_id: str,
+) -> dict[str, object]:
+    """Finalize one complete five-fold campaign pack idempotently."""
+    artifact_volume.reload()
+    payload, _ = _load_track_b_campaign_manifest(
+        campaign_id,
+        campaign_fingerprint,
+    )
+    selected = [
+        pack for pack in payload["packs"] if pack["pack_id"] == pack_id
+    ]
+    if len(selected) != 1:
+        raise ValueError("requested Track B campaign pack is not registered")
+    run_name = f"{campaign_id}-{pack_id}"
+    run_root = TRACK_B_ROOT / "runs" / run_name
+    if (run_root / "metadata.json").is_file():
+        metadata = _validate_finalized_c2_run(run_root, run_name=run_name)
+        return {**metadata, "pack_id": pack_id, "status": "already_finalized"}
+    metadata = track_b_finalize_finetune.remote(run_name, "c2")
+    artifact_volume.reload()
+    _validate_finalized_c2_run(run_root, run_name=run_name)
+    return {**metadata, "pack_id": pack_id, "status": "finalized"}
+
+
+@app.function(
+    image=image,
+    cpu=2,
+    memory=8192,
+    timeout=3600,
+    max_containers=1,
+    volumes={DATA_MOUNT: data_volume, ARTIFACT_MOUNT: artifact_volume},
+)
+def track_b_finalize_campaign_ensemble(
+    campaign_id: str,
+    campaign_fingerprint: str,
+) -> dict[str, object]:
+    """Blend the existing verified C2 seed with all three campaign packs."""
+    import json
+
+    from rsna_knee.track_b_training import finalize_tb_c2_oof_ensemble
+
+    data_volume.reload()
+    artifact_volume.reload()
+    payload, _ = _load_track_b_campaign_manifest(
+        campaign_id,
+        campaign_fingerprint,
+    )
+    run_dirs = {
+        "existing-c2": (
+            TRACK_B_ROOT / "runs" / str(payload["existing_run_name"])
+        ),
+        **{
+            str(pack["pack_id"]): (
+                TRACK_B_ROOT
+                / "runs"
+                / f"{campaign_id}-{pack['pack_id']}"
+            )
+            for pack in payload["packs"]
+        },
+    }
+    for member_id, run_root in run_dirs.items():
+        run_name = (
+            str(payload["existing_run_name"])
+            if member_id == "existing-c2"
+            else run_root.name
+        )
+        _validate_finalized_c2_run(run_root, run_name=run_name)
+    output = TRACK_B_ROOT / "campaigns" / campaign_id / "ensemble"
+    metadata_path = output / "ensemble-metadata.json"
+    if metadata_path.is_file():
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if (
+            metadata.get("stage") != "TB-C2-OOF-ensemble"
+            or set(metadata.get("members", {})) != set(run_dirs)
+            or any(
+                not (output / name).is_file()
+                or _sha256_file(output / name) != expected
+                for name, expected in metadata.get("outputs", {}).items()
+            )
+        ):
+            raise ValueError("existing Track B campaign ensemble is incompatible")
+        return {**metadata, "status": "already_finalized"}
+    metadata = finalize_tb_c2_oof_ensemble(
+        output,
+        run_dirs,
+        DATA_MOUNT / "metadata" / "folds-v1.csv",
+        DATA_MOUNT / "metadata" / "consensus-labels-v1.csv",
+        ensemble_name=campaign_id,
+        expected_studies=4407,
+        provenance={
+            "campaign_id": campaign_id,
+            "campaign_fingerprint": campaign_fingerprint,
+        },
+    )
+    artifact_volume.commit()
+    return {**metadata, "status": "finalized"}
 
 
 @app.function(
@@ -3645,6 +4087,100 @@ def track_b_run_c2_matrix(
     max_containers=1,
     volumes={ARTIFACT_MOUNT: artifact_volume},
 )
+def track_b_run_campaign(
+    campaign_id: str,
+    campaign_fingerprint: str,
+    pack_ids: str = "",
+    folds: str = "0,1,2,3,4",
+) -> dict[str, object]:
+    """Run selected Modal campaign packs and finalize complete evidence."""
+    artifact_volume.reload()
+    payload, jobs = _load_track_b_campaign_manifest(
+        campaign_id,
+        campaign_fingerprint,
+    )
+    available = {
+        str(pack["pack_id"])
+        for pack in payload["packs"]
+    }
+    selected_packs = (
+        [item.strip() for item in pack_ids.split(",")]
+        if pack_ids.strip()
+        else sorted(available)
+    )
+    if (
+        not selected_packs
+        or len(selected_packs) != len(set(selected_packs))
+        or any(pack_id not in available for pack_id in selected_packs)
+    ):
+        raise ValueError("pack_ids must be unique registered campaign packs")
+    selected_folds = _parse_folds(folds)
+    selected_jobs = [
+        job
+        for job in jobs
+        if job["pack_id"] in selected_packs
+        and job["fold"] in selected_folds
+    ]
+    results = list(
+        track_b_train_campaign_job.starmap(
+            (
+                (
+                    campaign_id,
+                    campaign_fingerprint,
+                    str(job["job_id"]),
+                )
+                for job in selected_jobs
+            ),
+            order_outputs=False,
+        )
+    )
+    full_fold_set = (
+        len(selected_folds) == 5
+        and set(selected_folds) == set(range(5))
+    )
+    finalized = (
+        [
+            track_b_finalize_campaign_pack.remote(
+                campaign_id,
+                campaign_fingerprint,
+                pack_id,
+            )
+            for pack_id in selected_packs
+        ]
+        if full_fold_set
+        else []
+    )
+    ensemble = (
+        track_b_finalize_campaign_ensemble.remote(
+            campaign_id,
+            campaign_fingerprint,
+        )
+        if full_fold_set and set(selected_packs) == available
+        else None
+    )
+    return {
+        "campaign_id": campaign_id,
+        "campaign_fingerprint": campaign_fingerprint,
+        "folds": sorted(
+            results,
+            key=lambda item: (item["pack_id"], item["fold"]),
+        ),
+        "finalized_packs": sorted(
+            finalized,
+            key=lambda item: item["pack_id"],
+        ),
+        "ensemble": ensemble,
+    }
+
+
+@app.function(
+    image=image,
+    cpu=1,
+    memory=2048,
+    timeout=86400,
+    max_containers=1,
+    volumes={ARTIFACT_MOUNT: artifact_volume},
+)
 def track_b_finalize_c2_and_run_finetune(
     run_name: str,
     git_revision: str,
@@ -3874,6 +4410,49 @@ def c2_matrix_run(
                 matrix_id,
                 matrix_fingerprint,
                 member_ids,
+                ",".join(str(fold) for fold in selected_folds),
+            ),
+            indent=2,
+        )
+    )
+
+
+@app.local_entrypoint()
+def campaign_register(manifest_path: str) -> None:
+    """Register a frozen Pack A/B/C campaign in the active Modal workspace."""
+    import json
+
+    path = Path(manifest_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    print(
+        json.dumps(
+            track_b_register_campaign.remote(
+                json.dumps(payload, allow_nan=False)
+            ),
+            indent=2,
+        )
+    )
+
+
+@app.local_entrypoint()
+def campaign_run(
+    campaign_id: str,
+    campaign_fingerprint: str,
+    pack_ids: str = "",
+    folds: str = "0,1,2,3,4",
+) -> None:
+    """Launch the registered campaign on Modal with selective resume."""
+    import json
+
+    selected_folds = _parse_folds(folds)
+    print(
+        json.dumps(
+            track_b_run_campaign.remote(
+                campaign_id,
+                campaign_fingerprint,
+                pack_ids,
                 ",".join(str(fold) for fold in selected_folds),
             ),
             indent=2,
