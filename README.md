@@ -15,6 +15,9 @@ multi-seed and rank-ensemble differences before changing model families.
 
 Current planning documents:
 
+- [`RSNA_KNEE_095_CAMPAIGN_RUNBOOK.md`](RSNA_KNEE_095_CAMPAIGN_RUNBOOK.md): source of
+  truth for the active 15-job campaign, Modal resumability, ensemble experiments and
+  fallback plan.
 - [`RSNA_KNEE_COMPETITION_PLAN.md`](RSNA_KNEE_COMPETITION_PLAN.md): active execution
   state, Track A dense gate and experiment approvals.
 - [`RSNA_KNEE_TRACK_B_PLAN.md`](RSNA_KNEE_TRACK_B_PLAN.md): implementation handoff for
