@@ -20,6 +20,8 @@ from rsna_knee.track_b_data import (
 )
 from rsna_knee.track_b_training import (
     C2MatrixSpec,
+    CNN2p5DConfig,
+    CNN2p5DStudyEncoder,
     EnhancedC2Config,
     EnhancedC2StudyEncoder,
     MaskedPerLabelSlotAttention,
@@ -29,6 +31,7 @@ from rsna_knee.track_b_training import (
     TBP0CachedDataset,
     TBP0InferenceDataset,
     TBP0RigidAugmentation,
+    TorchvisionConvNeXtBackbone,
     align_tb_p0_cached_data,
     build_matched_coverage_schedule,
     build_c2_experiment_matrix,
@@ -266,6 +269,63 @@ def test_weighted_soft_focal_bce_is_finite_for_soft_targets(target):
     assert torch.isfinite(loss)
     loss.backward()
     assert torch.isfinite(logits.grad).all()
+
+
+def test_convnext_adapter_returns_pooled_three_slice_features():
+    backbone = nn.Module()
+    backbone.features = nn.Conv2d(3, 8, kernel_size=1)
+    backbone.avgpool = nn.AdaptiveAvgPool2d(1)
+    backbone.classifier = nn.Sequential(nn.Identity())
+    adapter = TorchvisionConvNeXtBackbone(backbone, output_dim=8)
+    features = adapter(torch.randn(3, 3, 16, 16))
+    assert features.shape == (3, 8)
+    assert torch.isfinite(features).all()
+
+
+def test_cnn_2p5d_model_preserves_sparse_slots_and_recipe_identity():
+    backbone = RecordingBackbone()
+    model = CNN2p5DStudyEncoder(
+        backbone,
+        feature_dim=8,
+        hidden_dim=6,
+        dropout=0,
+        recipe=CNN2p5DConfig(pretrained_weights=None),
+        backbone_version="test-version",
+    )
+    images, mask = encoder_inputs()
+    logits = model(images, mask)
+    assert logits.shape == (2, len(LABELS))
+    assert backbone.calls[0].shape[0] == int(mask.sum())
+    recipe = model.training_recipe_manifest()
+    assert recipe["model_family"] == "convnext-2p5d-c2"
+    assert recipe["input_semantics"] == "three-adjacent-slices-as-channels"
+    assert recipe["backbone_package_version"] == "test-version"
+
+
+def test_cnn_2p5d_grouped_inference_is_chunked_without_changing_mean():
+    torch.manual_seed(20)
+    model = CNN2p5DStudyEncoder(
+        RecordingBackbone(),
+        feature_dim=8,
+        hidden_dim=6,
+        dropout=0,
+        recipe=CNN2p5DConfig(
+            pretrained_weights=None,
+            inference_group_batch_size=2,
+        ),
+        backbone_version="test-version",
+    ).eval()
+    images = torch.randn(1, 6, 5, 3, 8, 8)
+    mask = torch.ones(1, 6, 5, dtype=torch.bool)
+    mask[:, 4:, 3:] = False
+    expected = torch.stack(
+        [
+            model(images[:, :, group], mask[:, :, group])
+            for group in range(images.shape[2])
+        ]
+    ).mean(dim=0)
+    actual = model(images, mask)
+    torch.testing.assert_close(actual, expected)
 
 
 def test_final_six_dino_blocks_and_norm_are_trainable():
@@ -706,6 +766,50 @@ def tiny_enhanced_model():
             auxiliary_loss_weight=0.1,
         ),
     )
+
+
+def tiny_cnn_model():
+    return CNN2p5DStudyEncoder(
+        RecordingBackbone(),
+        feature_dim=8,
+        hidden_dim=6,
+        dropout=0,
+        recipe=CNN2p5DConfig(pretrained_weights=None),
+        backbone_version="test-version",
+    )
+
+
+def test_cnn_2p5d_fold_records_recipe_and_primary_oof(tmp_path):
+    data = aligned_cache_fixture(tmp_path)
+    output = tmp_path / "cnn-2p5d"
+    metadata = train_tb_p0_fold(
+        data,
+        output,
+        0,
+        run_name="cnn-2p5d-test",
+        config=TBP0Config(
+            feature_dim=8,
+            hidden_dim=6,
+            epochs=1,
+            batch_size=2,
+            gradient_accumulation_steps=2,
+            backbone_learning_rate=3e-4,
+            head_learning_rate=3e-4,
+            seed=91,
+        ),
+        model_factory=tiny_cnn_model,
+        device="cpu",
+        git_revision="cnn-revision",
+        source_manifest_sha256="cnn-manifest",
+        competition_cache_fingerprint="cnn-cache",
+        coverage_arm="c2",
+    )
+    assert metadata["primary_stream"] == "primary"
+    assert metadata["prediction_streams"] == {
+        "primary": "fold-0.oof.csv"
+    }
+    assert metadata["training_recipe"]["model_family"] == "convnext-2p5d-c2"
+    assert metadata["training_recipe"]["gradient_clip_norm"] == 1.0
 
 
 def test_enhanced_fold_writes_all_hashed_oof_streams(tmp_path):

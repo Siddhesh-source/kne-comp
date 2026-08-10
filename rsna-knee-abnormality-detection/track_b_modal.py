@@ -23,6 +23,7 @@ image = (
         "pandas==2.3.1",
         "scikit-learn==1.7.1",
         "torch==2.7.1",
+        "torchvision==0.22.1",
         "xformers==0.0.31",
         "pydicom==3.0.1",
         "pillow==11.3.0",

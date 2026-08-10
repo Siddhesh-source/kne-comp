@@ -70,6 +70,18 @@ class EnhancedC2Config:
 
 
 @dataclass(frozen=True)
+class CNN2p5DConfig:
+    """Frozen controls for the architecture-diverse three-slice CNN pack."""
+
+    recipe_id: str = "convnext-tiny-2p5d-v1"
+    backbone_name: str = "convnext_tiny"
+    pretrained_weights: str | None = "IMAGENET1K_V1"
+    precision: Literal["auto", "bf16", "fp16"] = "auto"
+    gradient_clip_norm: float = 1.0
+    inference_group_batch_size: int = 4
+
+
+@dataclass(frozen=True)
 class C2MatrixSpec:
     matrix_id: str
     base_run_name: str
@@ -711,6 +723,161 @@ def create_enhanced_c2_model(
         hidden_dim=config.hidden_dim,
         dropout=config.dropout,
         recipe=recipe,
+    )
+
+
+class TorchvisionConvNeXtBackbone(nn.Module):
+    """Expose pooled ConvNeXt features for one three-slice pseudo-RGB window."""
+
+    def __init__(self, backbone: nn.Module, output_dim: int) -> None:
+        super().__init__()
+        if output_dim < 1:
+            raise ValueError("ConvNeXt output dimension must be positive")
+        for attribute in ("features", "avgpool", "classifier"):
+            if not hasattr(backbone, attribute):
+                raise ValueError("ConvNeXt backbone API is incompatible")
+        self.backbone = backbone
+        self.output_dim = output_dim
+
+    def forward(self, images: Tensor) -> Tensor:
+        features = self.backbone.features(images)
+        features = self.backbone.avgpool(features)
+        features = self.backbone.classifier[0](features)
+        features = torch.flatten(features, 1)
+        if features.shape != (images.shape[0], self.output_dim):
+            raise ValueError("ConvNeXt pooled feature shape is incompatible")
+        return features
+
+
+class CNN2p5DStudyEncoder(SixSlotStudyEncoder):
+    """Architecture-diverse study encoder over three adjacent MRI slices."""
+
+    def __init__(
+        self,
+        slice_backbone: nn.Module,
+        *,
+        feature_dim: int,
+        hidden_dim: int = 256,
+        dropout: float = 0.2,
+        recipe: CNN2p5DConfig | None = None,
+        backbone_version: str = "unknown",
+    ) -> None:
+        recipe = recipe or CNN2p5DConfig()
+        if (
+            not re.fullmatch(r"[a-z0-9][a-z0-9-]{2,63}", recipe.recipe_id)
+            or recipe.backbone_name != "convnext_tiny"
+            or recipe.pretrained_weights
+            not in (None, "IMAGENET1K_V1", "DEFAULT")
+            or recipe.precision not in ("auto", "bf16", "fp16")
+            or recipe.gradient_clip_norm <= 0
+            or type(recipe.inference_group_batch_size) is not int
+            or recipe.inference_group_batch_size < 1
+            or not backbone_version
+        ):
+            raise ValueError("2.5D CNN recipe is invalid")
+        super().__init__(
+            slice_backbone,
+            feature_dim=feature_dim,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+        )
+        self.recipe = recipe
+        self.backbone_version = backbone_version
+
+    def training_recipe_manifest(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "model_family": "convnext-2p5d-c2",
+            **asdict(self.recipe),
+            "primary_stream": "primary",
+            "prediction_streams": ["primary"],
+            "backbone_package_version": self.backbone_version,
+            "input_semantics": "three-adjacent-slices-as-channels",
+        }
+
+    def forward(self, images: Tensor, valid_mask: Tensor) -> Tensor:
+        if images.ndim == 5:
+            result = super().forward(images, valid_mask)
+            assert isinstance(result, Tensor)
+            return result
+        if (
+            images.ndim != 6
+            or images.shape[1] != len(TB_P0_SLOT_NAMES)
+            or valid_mask.shape != images.shape[:3]
+        ):
+            raise ValueError("CNN grouped inputs are incompatible")
+        group_images = images.transpose(1, 2)
+        group_mask = valid_mask.transpose(1, 2).bool()
+        view_mask = group_mask.any(dim=2)
+        if not view_mask.any(dim=1).all():
+            raise ValueError("every study must contain a valid group view")
+        flat_images = group_images.reshape(
+            -1, len(TB_P0_SLOT_NAMES), *images.shape[3:]
+        )
+        flat_mask = group_mask.reshape(-1, len(TB_P0_SLOT_NAMES))
+        selected = torch.where(view_mask.reshape(-1))[0]
+        chunks: list[Tensor] = []
+        size = self.recipe.inference_group_batch_size
+        for start in range(0, len(selected), size):
+            indices = selected[start : start + size]
+            chunks.append(super().forward(flat_images[indices], flat_mask[indices]))
+        valid_logits = torch.cat(chunks)
+        logits = valid_logits.new_zeros(
+            images.shape[0] * images.shape[2],
+            valid_logits.shape[-1],
+        )
+        logits[selected] = valid_logits
+        logits = logits.view(images.shape[0], images.shape[2], -1)
+        weights = view_mask.unsqueeze(-1).to(logits.dtype)
+        return (logits * weights).sum(dim=1) / weights.sum(dim=1)
+
+
+def create_cnn_2p5d_model(
+    config: TBP0Config | None = None,
+    *,
+    recipe: CNN2p5DConfig | None = None,
+) -> CNN2p5DStudyEncoder:
+    """Construct the pinned torchvision ConvNeXt-Tiny Pack C model."""
+    config = config or TBP0Config(
+        feature_dim=768,
+        hidden_dim=256,
+        trainable_blocks=0,
+        backbone_learning_rate=3e-4,
+        head_learning_rate=3e-4,
+        epochs=16,
+        batch_size=2,
+        gradient_accumulation_steps=4,
+        gradient_checkpointing=False,
+    )
+    recipe = recipe or CNN2p5DConfig()
+    try:
+        import torchvision
+        from torchvision.models import ConvNeXt_Tiny_Weights, convnext_tiny
+    except ImportError as exc:
+        raise ImportError(
+            "Pack C requires the optional torchvision package"
+        ) from exc
+    weights = None
+    if recipe.pretrained_weights is not None:
+        weights = (
+            ConvNeXt_Tiny_Weights.DEFAULT
+            if recipe.pretrained_weights == "DEFAULT"
+            else ConvNeXt_Tiny_Weights.IMAGENET1K_V1
+        )
+    backbone = convnext_tiny(weights=weights)
+    output_dim = int(backbone.classifier[2].in_features)
+    if config.feature_dim != output_dim:
+        raise ValueError(
+            f"configured feature_dim {config.feature_dim} does not match "
+            f"ConvNeXt output {output_dim}"
+        )
+    return CNN2p5DStudyEncoder(
+        TorchvisionConvNeXtBackbone(backbone, output_dim),
+        feature_dim=output_dim,
+        hidden_dim=config.hidden_dim,
+        dropout=config.dropout,
+        recipe=recipe,
+        backbone_version=str(torchvision.__version__),
     )
 
 
@@ -1702,6 +1869,19 @@ def predict_tb_p0_fold_cache(
                 }
             ),
         )
+    elif checkpoint.get("training_recipe", {}).get("model_family") == (
+        "convnext-2p5d-c2"
+    ):
+        recipe_payload = checkpoint["training_recipe"]
+        model = create_cnn_2p5d_model(
+            config,
+            recipe=CNN2p5DConfig(
+                **{
+                    key: recipe_payload[key]
+                    for key in asdict(CNN2p5DConfig())
+                }
+            ),
+        )
     else:
         model = create_tb_p0_model(config)
     model = model.to(torch_device)
@@ -2010,6 +2190,18 @@ def train_tb_p0_fold(
                 or batch_index + 1 == len(train_loader)
             )
             if update:
+                gradient_clip_norm = (
+                    float(training_recipe["gradient_clip_norm"])
+                    if training_recipe is not None
+                    and "gradient_clip_norm" in training_recipe
+                    else None
+                )
+                if gradient_clip_norm is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(),
+                        gradient_clip_norm,
+                    )
                 scale_before = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()

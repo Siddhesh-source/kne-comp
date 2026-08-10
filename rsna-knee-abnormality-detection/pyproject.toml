@@ -29,6 +29,7 @@ gpu = [
     "pylibjpeg-libjpeg==2.3.0",
     "pylibjpeg-openjpeg==2.4.0",
     "torch==2.7.1",
+    "torchvision==0.22.1",
 ]
 
 [project.scripts]
