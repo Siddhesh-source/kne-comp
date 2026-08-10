@@ -4084,7 +4084,7 @@ def track_b_run_c2_matrix(
     cpu=1,
     memory=2048,
     timeout=86400,
-    max_containers=1,
+    max_containers=5,
     volumes={ARTIFACT_MOUNT: artifact_volume},
 )
 def track_b_run_campaign(
@@ -4170,6 +4170,32 @@ def track_b_run_campaign(
             key=lambda item: item["pack_id"],
         ),
         "ensemble": ensemble,
+    }
+
+
+def _spawn_campaign_coordinator(
+    spawn_call,
+    campaign_id: str,
+    campaign_fingerprint: str,
+    pack_ids: str,
+    folds: str,
+) -> dict[str, object]:
+    """Submit a coordinator without retaining a client-owned remote call."""
+    selected_folds = _parse_folds(folds)
+    normalized_folds = ",".join(str(fold) for fold in selected_folds)
+    call = spawn_call(
+        campaign_id,
+        campaign_fingerprint,
+        pack_ids,
+        normalized_folds,
+    )
+    return {
+        "campaign_id": campaign_id,
+        "campaign_fingerprint": campaign_fingerprint,
+        "pack_ids": pack_ids,
+        "folds": selected_folds,
+        "function_call_id": call.object_id,
+        "status": "spawned",
     }
 
 
@@ -4454,6 +4480,34 @@ def campaign_run(
                 campaign_fingerprint,
                 pack_ids,
                 ",".join(str(fold) for fold in selected_folds),
+            ),
+            indent=2,
+        )
+    )
+
+
+@app.local_entrypoint()
+def campaign_spawn(
+    campaign_id: str,
+    campaign_fingerprint: str,
+    pack_ids: str = "",
+    folds: str = "0,1,2,3,4",
+) -> None:
+    """Spawn a coordinator in the separately deployed persistent app."""
+    import json
+
+    deployed_coordinator = modal.Function.from_name(
+        APP_NAME,
+        "track_b_run_campaign",
+    )
+    print(
+        json.dumps(
+            _spawn_campaign_coordinator(
+                deployed_coordinator.spawn,
+                campaign_id,
+                campaign_fingerprint,
+                pack_ids,
+                folds,
             ),
             indent=2,
         )

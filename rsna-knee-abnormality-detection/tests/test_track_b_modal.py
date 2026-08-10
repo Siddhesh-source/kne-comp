@@ -109,6 +109,43 @@ def test_c1_five_fold_parser_supports_parallel_and_selective_resume():
         module._parse_folds("5")
 
 
+def test_campaign_spawn_submits_normalized_server_side_coordinator():
+    module = load_track_b_modal()
+    submitted = []
+
+    class Call:
+        object_id = "fc-durable"
+
+    def spawn(*args):
+        submitted.append(args)
+        return Call()
+
+    result = module._spawn_campaign_coordinator(
+        spawn,
+        "tb-095-v1",
+        "f" * 64,
+        "pack-a-c2-seed",
+        " 2,0 ",
+    )
+
+    assert submitted == [
+        (
+            "tb-095-v1",
+            "f" * 64,
+            "pack-a-c2-seed",
+            "2,0",
+        )
+    ]
+    assert result == {
+        "campaign_id": "tb-095-v1",
+        "campaign_fingerprint": "f" * 64,
+        "pack_ids": "pack-a-c2-seed",
+        "folds": [2, 0],
+        "function_call_id": "fc-durable",
+        "status": "spawned",
+    }
+
+
 def test_stage_cache_locally_copies_exact_files(tmp_path):
     module = load_track_b_modal()
     source = tmp_path / "source"
