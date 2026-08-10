@@ -1,0 +1,188 @@
+{
+  "schema_version": 1,
+  "stage": "TB-Modal-campaign",
+  "campaign_id": "tb-095-v1",
+  "git_revision": "37a3a289b9638d91820d76d41672aeea97440c54",
+  "folds_sha256": "4910ec56fc86e3ce3878cf9bb98bdb84cbd2a563040345ce6678de7d9c703c1e",
+  "targets_sha256": "9edf77634f72986e4f8524172046e0c7db368261d9ce31fdbc65ff85a2be7e43",
+  "crop_mm": 130,
+  "cache_fingerprint": "da43ee227dd3de65ef467f5d6eebc37cc0131dcd4086ef18a4161ab248cf20fb",
+  "existing_run_name": "tb-c2-window-s20260828-e30-v1",
+  "packs": [
+    {
+      "pack_id": "pack-a-c2-seed",
+      "model_family": "dino-vits-c2",
+      "seed": 20260829,
+      "config": {
+        "image_size": 336,
+        "feature_dim": 768,
+        "hidden_dim": 256,
+        "trainable_blocks": 6,
+        "backbone_learning_rate": 8e-06,
+        "head_learning_rate": 0.001,
+        "weight_decay": 0.02,
+        "epochs": 30,
+        "batch_size": 8,
+        "gradient_accumulation_steps": 1,
+        "pct_start": 0.15,
+        "dropout": 0.2,
+        "gradient_checkpointing": false,
+        "seed": 20260829,
+        "num_workers": 0
+      },
+      "recipe": null
+    },
+    {
+      "pack_id": "pack-b-enhanced-c2",
+      "model_family": "enhanced-dino-c2",
+      "seed": 20260830,
+      "config": {
+        "image_size": 336,
+        "feature_dim": 768,
+        "hidden_dim": 256,
+        "trainable_blocks": 6,
+        "backbone_learning_rate": 8e-06,
+        "head_learning_rate": 0.001,
+        "weight_decay": 0.02,
+        "epochs": 30,
+        "batch_size": 8,
+        "gradient_accumulation_steps": 1,
+        "pct_start": 0.15,
+        "dropout": 0.2,
+        "gradient_checkpointing": false,
+        "seed": 20260830,
+        "num_workers": 0
+      },
+      "recipe": {
+        "recipe_id": "enhanced-c2-v1",
+        "ema_decay": 0.999,
+        "auxiliary_loss_weight": 0.15,
+        "focal_gamma": 2.0,
+        "precision": "auto"
+      }
+    },
+    {
+      "pack_id": "pack-c-convnext",
+      "model_family": "convnext-2p5d-c2",
+      "seed": 20260831,
+      "config": {
+        "image_size": 336,
+        "feature_dim": 768,
+        "hidden_dim": 256,
+        "trainable_blocks": 0,
+        "backbone_learning_rate": 0.0003,
+        "head_learning_rate": 0.0003,
+        "weight_decay": 0.02,
+        "epochs": 16,
+        "batch_size": 2,
+        "gradient_accumulation_steps": 4,
+        "pct_start": 0.15,
+        "dropout": 0.2,
+        "gradient_checkpointing": false,
+        "seed": 20260831,
+        "num_workers": 0
+      },
+      "recipe": {
+        "recipe_id": "convnext-tiny-2p5d-v1",
+        "backbone_name": "convnext_tiny",
+        "pretrained_weights": "IMAGENET1K_V1",
+        "precision": "auto",
+        "gradient_clip_norm": 1.0,
+        "inference_group_batch_size": 4
+      }
+    }
+  ],
+  "jobs": [
+    {
+      "job_id": "pack-a-c2-seed-f0",
+      "pack_id": "pack-a-c2-seed",
+      "run_name": "tb-095-v1-pack-a-c2-seed",
+      "fold": 0
+    },
+    {
+      "job_id": "pack-a-c2-seed-f1",
+      "pack_id": "pack-a-c2-seed",
+      "run_name": "tb-095-v1-pack-a-c2-seed",
+      "fold": 1
+    },
+    {
+      "job_id": "pack-a-c2-seed-f2",
+      "pack_id": "pack-a-c2-seed",
+      "run_name": "tb-095-v1-pack-a-c2-seed",
+      "fold": 2
+    },
+    {
+      "job_id": "pack-a-c2-seed-f3",
+      "pack_id": "pack-a-c2-seed",
+      "run_name": "tb-095-v1-pack-a-c2-seed",
+      "fold": 3
+    },
+    {
+      "job_id": "pack-a-c2-seed-f4",
+      "pack_id": "pack-a-c2-seed",
+      "run_name": "tb-095-v1-pack-a-c2-seed",
+      "fold": 4
+    },
+    {
+      "job_id": "pack-b-enhanced-c2-f0",
+      "pack_id": "pack-b-enhanced-c2",
+      "run_name": "tb-095-v1-pack-b-enhanced-c2",
+      "fold": 0
+    },
+    {
+      "job_id": "pack-b-enhanced-c2-f1",
+      "pack_id": "pack-b-enhanced-c2",
+      "run_name": "tb-095-v1-pack-b-enhanced-c2",
+      "fold": 1
+    },
+    {
+      "job_id": "pack-b-enhanced-c2-f2",
+      "pack_id": "pack-b-enhanced-c2",
+      "run_name": "tb-095-v1-pack-b-enhanced-c2",
+      "fold": 2
+    },
+    {
+      "job_id": "pack-b-enhanced-c2-f3",
+      "pack_id": "pack-b-enhanced-c2",
+      "run_name": "tb-095-v1-pack-b-enhanced-c2",
+      "fold": 3
+    },
+    {
+      "job_id": "pack-b-enhanced-c2-f4",
+      "pack_id": "pack-b-enhanced-c2",
+      "run_name": "tb-095-v1-pack-b-enhanced-c2",
+      "fold": 4
+    },
+    {
+      "job_id": "pack-c-convnext-f0",
+      "pack_id": "pack-c-convnext",
+      "run_name": "tb-095-v1-pack-c-convnext",
+      "fold": 0
+    },
+    {
+      "job_id": "pack-c-convnext-f1",
+      "pack_id": "pack-c-convnext",
+      "run_name": "tb-095-v1-pack-c-convnext",
+      "fold": 1
+    },
+    {
+      "job_id": "pack-c-convnext-f2",
+      "pack_id": "pack-c-convnext",
+      "run_name": "tb-095-v1-pack-c-convnext",
+      "fold": 2
+    },
+    {
+      "job_id": "pack-c-convnext-f3",
+      "pack_id": "pack-c-convnext",
+      "run_name": "tb-095-v1-pack-c-convnext",
+      "fold": 3
+    },
+    {
+      "job_id": "pack-c-convnext-f4",
+      "pack_id": "pack-c-convnext",
+      "run_name": "tb-095-v1-pack-c-convnext",
+      "fold": 4
+    }
+  ],
+  "campaign_fingerprint": "0291e9a0a087a51878fb4dd59e49924d7eee20f1d6af387a9345f8b788044e89"
+}
