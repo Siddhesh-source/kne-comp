@@ -1,55 +1,28 @@
-# Secrets
-.env
-.env.*
-!.env.example
-
 # Python
 __pycache__/
 *.py[cod]
 .pytest_cache/
-.mypy_cache/
-.ruff_cache/
 .venv/
 venv/
 
-# Jupyter
-.ipynb_checkpoints/
-
-# Local data and generated artifacts
+# Data, features and demo studies (medical images are never committed)
 data/*
 !data/.gitkeep
-!data/derived/
-data/derived/*
-!data/derived/.gitkeep
-references/
+
+# Trained model bundle (rebuild with python -m kneeml.train)
 artifacts/
-outputs/
-checkpoints/
-models/
-submissions/
 
-# Local Modal migration snapshots and runtime logs
-modal-*-transfer/
-kaggle-kernel-inspection/
-*.log
+# Frontend
+frontend/node_modules/
+frontend/dist/
 
-# Private Kaggle packaging and generated notebook assets
-rsna-knee-abnormality-detection/kaggle_hidden_assets/
-rsna-knee-abnormality-detection/kaggle_hidden_inference/heads/
-rsna-knee-abnormality-detection/kaggle_submission_probe/
-
-# Model weights and large arrays
-*.ckpt
-*.onnx
-*.pt
-*.pth
-*.safetensors
-*.npy
-*.npz
-*.parquet
-
-# Editors and operating systems
+# Editors / OS
 .idea/
 .vscode/
 .DS_Store
 Thumbs.db
+*.log
+
+# Held-out MRI slices for the upload demo (local only)
+inference_samples/
+.gstack/

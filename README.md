@@ -1,33 +1,50 @@
-# RSNA knee abnormality detection
+# KneeML — Knee MRI Abnormality Detection
 
-Competition workspace for the [RSNA Knee Abnormality Detection](https://www.kaggle.com/competitions/rsna-knee-abnormality-detection) challenge.
+Multi-label detection of 12 knee abnormalities (ACL, MCL, medial/lateral meniscus tears,
+medial/lateral/patellofemoral osteoarthritis, effusion, synovitis, Baker's cyst, bone contusion,
+fracture) from knee MRI, built with a frozen pretrained image encoder and **classical machine
+learning**: logistic regression, Naive Bayes, k-NN, linear and RBF SVMs, decision trees, Random
+Forest, gradient boosting and a feed-forward neural network, plus PCA/SVD, clustering and
+association-rule mining.
 
-Current verified result: submission `55351338`, a dynamic five-fold Track B C1 DINOv2
-ensemble, scored **0.849** public LB. The strongest audited score-bearing reference is
-Pilkwang V15 at **0.891**; the active plan tests its ordered-window, longer-training,
-multi-seed and rank-ensemble differences before changing model families.
+- **Results**: `results/metrics.json`, `results/unsupervised.json`, figures in `results/figures/`,
+  and the **Results** tab of the web app.
+- **Technical write-up**: [`technical.md`](technical.md)
+- **Assistant working notes**: [`prompt.md`](prompt.md)
 
-## Local setup
+## Quick start
 
-1. Copy `.env.example` to `.env`.
-2. Set `LLM_PROVIDER`, `LLM_MODEL`, and the matching API key.
-3. Keep `.env` local. It is ignored by Git.
+```bash
+pip install -r requirements.txt
+python -m pytest tests -q
 
-Current planning documents:
+# web app (needs artifacts/knee_model.joblib and data/demo from the pipeline below)
+cd frontend && npm install && npm run build && cd ..
+uvicorn backend.app:app --port 8010      # open http://localhost:8010
+```
 
-- [`RSNA_KNEE_COMPETITION_PLAN.md`](RSNA_KNEE_COMPETITION_PLAN.md): active execution
-  state, Track A dense gate and experiment approvals.
-- [`RSNA_KNEE_TRACK_B_PLAN.md`](RSNA_KNEE_TRACK_B_PLAN.md): implementation handoff for
-  the coverage-aware six-slot baseline, MRI SSL and report alignment.
-- [`RSNA_KNEE_090_STRATEGY.md`](RSNA_KNEE_090_STRATEGY.md): high-level route to the
-  0.90 stretch goal.
-- [`RSNA_KNEE_PUBLIC_NOTEBOOK_RESEARCH.md`](RSNA_KNEE_PUBLIC_NOTEBOOK_RESEARCH.md):
-  evidence from the Tony, prvsiyan, Pilkwang and wguesdon public notebooks.
+For frontend development run `npm run dev` in `frontend/` (proxies `/api` to port 8010).
+
+## Full pipeline
+
+```bash
+echo <kaggle-data-source-slug> > data/kaggle_source.txt
+python kaggle/push_extract.py --fetch-metadata   # metadata CSVs -> data/raw
+python kaggle/push_extract.py --shards 2         # DINOv2 features on Kaggle GPUs
+python kaggle/push_extract.py --download         # -> data/features
+python -m kneeml.train                           # supervised experiments + model bundle
+python -m kneeml.analysis                        # unsupervised + Apriori
+python -m kneeml.plots                           # static figures
+python -m kneeml.demo                            # held-out studies for the web demo
+```
 
 ## Layout
 
 ```text
-rsna-knee-abnormality-detection/  All implementation code and notebooks
-data/                            Local and derived data, ignored by Git
-references/                      Downloaded public notebook sources, ignored by Git
+kneeml/     Python package (labeler, data, models, training, analysis, inference)
+kaggle/     GPU feature-extraction kernel and Kaggle CLI helper
+backend/    FastAPI service
+frontend/   React + Vite web app (Inference | Results | Method)
+results/    Metrics JSON and figures
+tests/      pytest suite
 ```

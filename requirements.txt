@@ -1,0 +1,22 @@
+# Core ML (CPU)
+numpy>=1.26,<2
+pandas>=2.1
+scikit-learn>=1.4
+scipy>=1.11
+joblib>=1.3
+matplotlib>=3.8
+pillow>=10
+
+# Inference encoder (frozen DINOv2 ViT-S/14, CPU)
+torch>=2.1
+transformers>=4.35
+
+# Web backend
+fastapi>=0.110
+uvicorn>=0.29
+python-multipart>=0.0.6
+pydicom>=2.4        # optional: DICOM uploads
+
+# Tooling
+kaggle>=1.6         # GPU feature extraction + data access
+pytest>=8
