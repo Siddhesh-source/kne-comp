@@ -37,9 +37,17 @@ def _demo_index() -> list[dict]:
     return json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
 
 
+def _runs() -> list[dict]:
+    """Precomputed test-set inference results (results/inference_runs.json)."""
+    path = RESULTS / "inference_runs.json"
+    return json.loads(path.read_text())["runs"] if path.exists() else []
+
+
 @app.get("/api/health")
 def health() -> dict:
-    return {"ok": True, "model": (ROOT / "artifacts" / "knee_model.joblib").exists(), "samples": len(_demo_index())}
+    trained = (ROOT / "artifacts" / "knee_model.joblib").exists()
+    return {"ok": True, "model": trained or bool(_runs()), "precomputed": not trained,
+            "samples": len(_demo_index()) or len(_runs())}
 
 
 @app.get("/api/labels")
@@ -48,14 +56,14 @@ def labels() -> dict:
 
 
 def _run_scores() -> dict:
-    path = RESULTS / "inference_runs.json"
-    if not path.exists():
-        return {}
-    return {r["id"]: r["fused_correct"] for r in json.loads(path.read_text())["runs"]}
+    return {r["id"]: r["fused_correct"] for r in _runs()}
 
 
 @app.get("/api/samples")
 def samples() -> list[dict]:
+    if not _demo_index():  # no exported demo studies: list the precomputed runs instead
+        return [{"id": r["id"], "present": [True, True, True], "slices": 0, "truth": r["truth"],
+                 "agreement": r["fused_correct"]} for r in _runs()]
     scores = _run_scores()
     return [{**{k: s[k] for k in ("id", "present", "slices", "truth")}, "agreement": scores.get(s["id"])}
             for s in _demo_index()]
@@ -72,8 +80,13 @@ def sample_slice(sample: str, plane: str, k: int):
 @app.post("/api/predict/sample/{sample}")
 def predict_sample(sample: str, use_report: bool = True) -> dict:
     meta = next((s for s in _demo_index() if s["id"] == sample), None)
-    if meta is None:
-        raise HTTPException(404, "unknown sample")
+    if meta is None or not (ROOT / "artifacts" / "knee_model.joblib").exists():
+        run = next((r for r in _runs() if r["id"] == sample), None)
+        if run is None:
+            raise HTTPException(404, "unknown sample")
+        return {"image": run["image"], "fused": run["fused"], "calls": run["fused_calls"], "truth": run["truth"],
+                "image_correct": run["image_correct"], "seconds": run["seconds"], "precomputed": True,
+                "report": meta["report"] if meta and use_report else None}
     t0 = time.time()
     canvases = np.load(DEMO / sample / "slices.npz")["slices"]
     result = predict_canvases(canvases, np.array(meta["present"]), meta["report_scores"] if use_report else None)
@@ -148,6 +161,9 @@ def warm() -> None:
     if (ROOT / "artifacts" / "knee_model.joblib").exists():
         load_model()
 
+
+if (RESULTS / "figures").exists():
+    app.mount("/api/figures", StaticFiles(directory=RESULTS / "figures"), name="figures")
 
 if DIST.exists():
     app.mount("/", StaticFiles(directory=DIST, html=True), name="site")

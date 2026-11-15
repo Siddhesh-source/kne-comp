@@ -4,8 +4,9 @@ import { TipProvider } from './charts.jsx'
 import Inference from './pages/Inference.jsx'
 import Results from './pages/Results.jsx'
 import Method from './pages/Method.jsx'
+import Figures from './pages/Figures.jsx'
 
-const TABS = [['inference', 'Inference'], ['results', 'Results'], ['method', 'Method']]
+const TABS = [['inference', 'Inference'], ['results', 'Results'], ['figures', 'Figures'], ['method', 'Method']]
 
 function initialTab() {
   const h = window.location.hash.replace('#', '')
@@ -45,7 +46,7 @@ export default function App() {
         </div>
         <div className="status">
           <span className={`dot ${health?.ok && health?.model ? 'ok' : ''}`} />
-          {health == null ? 'connecting…' : health.ok ? (health.model ? 'model loaded' : 'model not trained') : 'backend offline'}
+          {health == null ? 'connecting…' : health.ok ? (health.model ? (health.precomputed ? 'precomputed results' : 'model loaded') : 'model not trained') : 'backend offline'}
           <button className="iconbtn" onClick={() => setTheme(dark ? 'light' : 'dark')} aria-label="Toggle theme">
             {dark ? 'Light' : 'Dark'}
           </button>
@@ -54,6 +55,7 @@ export default function App() {
       <main>
         {tab === 'inference' && <Inference />}
         {tab === 'results' && <Results />}
+        {tab === 'figures' && <Figures />}
         {tab === 'method' && <Method />}
       </main>
     </TipProvider>
